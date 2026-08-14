@@ -77,5 +77,20 @@ mobile/ios/bundle_id.local
 /dist/win/
 /.bazinga/
 
+#all my handicaps
+.claude/
+.vscode/
+baseroms/
+mods/
+reference-mods/
+portable.txt
+mod_option_schemas.json
+lua-error.logo
+saves/
+red/
+gold/
+cache/
+lua-error.log
+
 # Local options / preferences
 /options.lua*
