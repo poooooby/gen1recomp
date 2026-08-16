@@ -4,6 +4,7 @@ local SaveData = require("src.core.SaveData")
 local Data = require("src.core.Data")
 local GameVersion = require("src.core.GameVersion")
 local Version = require("src.core.Version")
+local RequiredImports = require("src.mods.RequiredImports")
 local Assets = require("src.render.Assets")
 local ModUI = require("src.ui.ModUI")
 local DateTime = require("src.core.DateTime")
@@ -19,8 +20,11 @@ local Semver = require("src.mods.Semver")
 local Events = require("src.mods.Events")
 local Gen2Compat = require("src.mods.Gen2Compat")
 local Hooks = require("src.mods.Hooks")
+local LegacyCompat = require("src.mods.LegacyCompat")
 local Runtime = require("src.mods.Runtime")
 local Steps = require("src.mods.Steps")
+local Net = require("src.mods.Net")
+local Job = require("src.mods.Job")
 
 local Loader = {}
 Loader.__index = Loader
@@ -565,7 +569,24 @@ function Loader:_validate()
     elseif manifest.assets_transforms
         and not self:_exists(mod.path .. "/" .. manifest.assets_transforms) then
       reason = "assets_transforms file missing: " .. manifest.assets_transforms
-    elseif manifest.game_version and not devEngine() then
+    end
+    if not reason and #(manifest.required_imports or {}) > 0 then
+      for _, import in ipairs(manifest.required_imports) do
+        local path = mod.path .. "/baseroms/" .. import.file
+        if not self:_exists(path) then
+          reason = "required import missing: " .. import.name
+          break
+        end
+        local valid, importErr = RequiredImports.validateStored(
+          manifest, import, self.fs)
+        if not valid then
+          reason = "required import invalid: " .. import.name
+            .. " (" .. tostring(importErr) .. ")"
+          break
+        end
+      end
+    end
+    if not reason and manifest.game_version and not devEngine() then
       local ok, err = Semver.satisfies(Version.engine, manifest.game_version)
       if not ok then
         reason = ("needs game version %s, engine is %s")
@@ -1051,6 +1072,68 @@ function Loader:_api(mod)
       return { available = function() return false end,
                sync = refuse, poll = refuse }
     end)(),
+    -- Background HTTP, behind the "network" permission the player already
+    -- sees.  This is what love.thread is NOT: the worker runs engine code in
+    -- an engine-owned pool, so a mod gets asynchrony without getting a Lua
+    -- state the sandbox cannot reach.  get() hands back an opaque handle;
+    -- poll() is non-blocking, so nothing here can hang a frame.
+    fetch = (function()
+      if mod.manifest.permissionSet.network then
+        return {
+          available = function() return Net.available() end,
+          get = function(_, url, opts) return Net.get(loader, modId, url, opts) end,
+          poll = function(_, handle) return Net.poll(loader, modId, handle) end,
+          release = function(_, handle) return Net.release(loader, modId, handle) end,
+          cancel = function(_, handle) return Net.cancel(loader, modId, handle) end,
+        }
+      end
+      local function refuse()
+        error(('[%s] mod.fetch needs the "network" permission in '
+          .. "manifest.json"):format(modId), 2)
+      end
+      return { available = function() return false end,
+               get = refuse, poll = refuse, release = refuse, cancel = refuse }
+    end)(),
+    -- One-way crash-log reporting to the https URL the manifest declares in
+    -- log_url.  The destination is reviewed at load, not chosen per call, so
+    -- a mod cannot aim this at arbitrary hosts; the response body is never
+    -- returned, and the worker pool bounds the transfer.  Same handle/poll/
+    -- release shape as mod.fetch, so mod.job's sibling patterns carry over.
+    postLog = (function()
+      if mod.manifest.permissionSet.network and mod.manifest.log_url then
+        return function(_, body, opts)
+          return Net.postLog(loader, modId, mod.manifest.log_url, body, opts)
+        end
+      end
+      local function refuse()
+        error(('[%s] mod.postLog needs the "network" permission and a '
+          .. "log_url in manifest.json"):format(modId), 2)
+      end
+      return refuse
+    end)(),
+    -- Background compute, behind the "background" permission.  The worker
+    -- rebuilds this mod's sandbox before loading the script, so a job is the
+    -- one thing love.thread is not: off the main thread without a Lua state
+    -- that escapes the sandbox.  Plain data in, plain data out.
+    job = (function()
+      if mod.manifest.permissionSet.background then
+        return {
+          available = function() return Job.available() end,
+          run = function(_, script, arg, opts)
+            return Job.run(loader, modId, mod.path, script, arg, opts)
+          end,
+          poll = function(_, handle) return Job.poll(loader, modId, handle) end,
+          release = function(_, handle) return Job.release(loader, modId, handle) end,
+          cancel = function(_, handle) return Job.cancel(loader, modId, handle) end,
+        }
+      end
+      local function refuse()
+        error(('[%s] mod.job needs the "background" permission in '
+          .. "manifest.json"):format(modId), 2)
+      end
+      return { available = function() return false end,
+               run = refuse, poll = refuse, release = refuse, cancel = refuse }
+    end)(),
     -- namespaced per mod; M11 backs these with save.modData /
     -- options.modOptions, the shape mods compile against is already final
     save = {
@@ -1069,7 +1152,8 @@ function Loader:_api(mod)
         bucket[key] = value
       end,
     },
-    -- Data-only state independent of the vanilla progress checkpoint. The
+    -- Data-only and opaque-byte state independent of the vanilla progress
+    -- checkpoint. The
     -- engine binds version/playthrough/mod scope and portable persistence;
     -- callers never receive paths or a raw filesystem handle.
     storage = {
@@ -1077,6 +1161,10 @@ function Loader:_api(mod)
       selected = function(_, game) return storage:selected(game) end,
       write = function(_, game, key, value) return storage:write(game, key, value) end,
       read = function(_, game, key) return storage:read(game, key) end,
+      writeBytes = function(_, game, key, bytes)
+        return storage:writeBytes(game, key, bytes)
+      end,
+      readBytes = function(_, game, key) return storage:readBytes(game, key) end,
       list = function(_, game, prefix) return storage:list(game, prefix) end,
       delete = function(_, game, key) return storage:delete(game, key) end,
     },
@@ -1158,6 +1246,39 @@ function Loader:_api(mod)
     api.content[alias] = self:_contentApi(mod, self.content[canonical],
       ("the %s registry is deprecated; use %s"):format(alias, canonical))
   end
+  -- A relative path inside this mod, or the mod root when relative is
+  -- omitted.  Empty is the one listing case SafePath.safe rejects on
+  -- purpose (it is not a file), so it is special-cased here.
+  local function ownPath(relative, what)
+    if relative == nil or relative == "" then return mod.path end
+    return SafePath.join(mod.path, relative, what)
+  end
+
+  -- Shallow directory listing, the sandboxed stand-in for
+  -- love.filesystem.getDirectoryItems.  Names only, sorted, never a host
+  -- path.  A missing directory is an empty list, not an error.
+  local function listOwn(_, relative)
+    local dir = ownPath(relative, "mod:list")
+    local fs = loader.fs
+    if not (fs and fs.getDirectoryItems) then return {} end
+    local items = fs.getDirectoryItems(dir) or {}
+    local out = {}
+    for i = 1, #items do out[i] = items[i] end
+    table.sort(out)
+    return out
+  end
+
+  -- love.filesystem.getInfo for a path inside this mod.  type is "file" or
+  -- "directory"; size is set for files.  nil when the path does not exist.
+  local function infoOwn(_, relative)
+    local path = ownPath(relative, "mod:info")
+    local fs = loader.fs
+    if not (fs and fs.getInfo) then return nil end
+    local info = fs.getInfo(path)
+    if not info then return nil end
+    return { type = info.type, size = info.size }
+  end
+
   -- assets keeps the v1 alias to the content accessors and adds the file
   -- helpers on top, so mod.assets.pokemon and mod.assets:image both resolve
   api.assets = setmetatable({
@@ -1174,16 +1295,20 @@ function Loader:_api(mod)
       loader.imageCache[full] = image
       return image
     end,
+    list = listOwn,
+    info = infoOwn,
   }, { __index = api.content })
   -- the mod's own directory and nothing above it: PhysFS already refuses a
   -- climb, but loader.fs is injectable and has no such floor
   function api:read(relative)
     return loader.fs.read(SafePath.join(self.path, relative, "mod:read"))
   end
+  api.list = listOwn
+  api.info = infoOwn
   -- mod.world materializes on first touch, like the image helper above: a
   -- headless load must not drag the world stack in, and the Game the facade
   -- acts on is still being wired when the entry chunk runs
-  local world
+  local world, battle
   setmetatable(api, { __index = function(_, key)
     -- mod.game is the live service owner, resolved per generation the way
     -- mod.world is: src/core/Game.lua's singleton under Gen 1, the Game2
@@ -1192,9 +1317,17 @@ function Loader:_api(mod)
     -- entry chunk runs.  This is what a mod should hold instead of requiring
     -- src.core.Game, which under Gold hands back a table nothing instantiated.
     if key == "game" then return loader:_game() end
+    local game = loader:_game()
+    if key == "battle" then
+      if battle then return battle end
+      local module = game and engineRequire(loader.generation == 2
+        and "src.battle.gen2.BattleAPI" or "src.battle.BattleAPI")
+      if not module then return nil end
+      battle = module.new(game)
+      return battle
+    end
     if key ~= "world" then return nil end
     if world then return world end
-    local game = loader:_game()
     -- one facade name, one arm per generation: Gold's world is not a stack
     -- state and its flags are a bitfield, so the resolution differs even
     -- where the method set does not (src/world/gen2/WorldAPI.lua)
@@ -1228,10 +1361,22 @@ function Loader:_modEnv(mod)
   local id = mod.manifest.id
   local env = self.modEnv[id]
   if not env then
-    env = Sandbox.envFor({ modId = id, permissions = mod.manifest.permissionSet })
+    local loader = self
+    local compat = LegacyCompat.new({
+      modId = id, modPath = mod.path, fs = self.fs,
+      game = function() return loader:_game() end,
+    })
+    env = Sandbox.envFor({ modId = id, permissions = mod.manifest.permissionSet,
+      compat = compat })
     self.modEnv[id] = env
   end
   return env
+end
+
+-- Which pre-sandbox calls each loaded mod actually took, for the manager's
+-- "needs updating" badge; nil id answers for every mod.
+function Loader:legacyReport(modId)
+  return LegacyCompat.report(modId)
 end
 
 function Loader:_loadMod(mod)
@@ -1269,6 +1414,8 @@ function Loader:_rollback(modId)
   self.migrations[modId] = nil
   self.modSave[modId] = nil
   self.stepsQueues[modId] = nil
+  Net.releaseAll(self, modId)
+  Job.releaseAll(self, modId)
 end
 
 -- a mod that explicitly swears it stays link-compatible while writing into a

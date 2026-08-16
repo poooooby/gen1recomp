@@ -230,6 +230,7 @@ function OverworldState:enter(mapId, x, y, facing, opts)
   -- a fresh entry, or a stale flag can freeze player input forever
   self.engaging = false
   self.emote = nil
+  self.cancelledTrainerSight = nil
   -- volatile WRAM state in pokered; never serialize across save/load
   self.wildEncounterGraceSteps = 0
   -- survives save/load: a loaded game may start inside a building whose
@@ -760,6 +761,70 @@ function OverworldState:bikeAllowed(mapId)
     if t == self.map.def.tileset then return true end
   end
   return false
+end
+
+-- Field-item entry points keep presentation and state transitions in the
+-- owning world instead of asking a supported facade to reproduce either one.
+function OverworldState:useBicycle()
+  local name = Game.save.player.name
+  if Game.save.onBike then
+    if Game.save.forcedBike then return false end
+    Game.save.onBike = false
+    require("src.core.Music").playMap(Game.data, self.map.id, false)
+    Game.stack:push(TextBox.new(Game,
+      Strings("%s got off\nthe BICYCLE.", name)))
+  elseif self:bikeAllowed(self.map.id) and not self.player.surfing then
+    Game.save.onBike = true
+    require("src.core.Music").playMap(Game.data, self.map.id, true)
+    Game.stack:push(TextBox.new(Game,
+      Strings("%s got on\nthe BICYCLE!", name)))
+  else
+    return false
+  end
+  return true
+end
+
+-- Field-move entry points keep presentation and state transitions in the
+-- overworld.  The party menu and supported mod facade both call these, so a
+-- shortcut cannot drift from the game's own move flow.
+function OverworldState:useFlashFieldMove(onClose)
+  -- A FLASH used in daylight must not carry into the next dark map.  Lighting
+  -- also happens before the blink: setDark may rebake an ADVANCED atlas, and
+  -- putting that work in WhiteFlash:onDone caused the frozen white frame in
+  -- #610.
+  local wasDark = self.dark
+  if wasDark then Game.save.flashLit = true end
+  Game.stack:push(TextBox.new(Game,
+    Game.data.text._FlashLightsAreaText
+      or Strings("A blinding FLASH\nlights the area!"), function()
+      if onClose then onClose() end
+      if wasDark then self:setDark(false) end
+      Game.stack:push(Transition.whiteFlash(Game))
+    end))
+  return true
+end
+
+function OverworldState:useStrengthFieldMove(mon, onClose)
+  mon = mon or self:partyKnows("STRENGTH")
+  if not mon then return false end
+  local def = Game.data.pokemon[mon.species]
+  local name = mon.nickname or def.name
+  self.strengthActive = true
+  local first = (Game.data.text._UsedStrengthText
+    or Strings("{RAM:wNameBuffer} used\nSTRENGTH."))
+    :gsub("{RAM:wNameBuffer}", name)
+  local second = (Game.data.text._CanMoveBouldersText
+    or Strings("{RAM:wNameBuffer} can\nmove boulders."))
+    :gsub("{RAM:wNameBuffer}", name)
+  Game.stack:push(TextBox.new(Game, first, function()
+    Game.stack:push(TextBox.new(Game, second, function()
+      if onClose then onClose() end
+      Game.stack:push(Transition.whiteFlash(Game))
+    end))
+  end, { auto = { sound = function()
+    return require("src.core.Sound").playCry(Game.data, mon.species)
+  end } }))
+  return true
 end
 
 -- The battle transition's dungeon wipe uses the explicit map lists in
@@ -1725,6 +1790,12 @@ function OverworldState:goFishing(rod)
   end))
 end
 
+function OverworldState:useFishingRod(rod)
+  if self.player.surfing or not self:facingIsShoreOrWater() then return false end
+  self:goFishing(rod)
+  return true
+end
+
 -- Fly to a visited town (called from the party menu).
 function OverworldState:flyTo(mapId)
   local spot = Game.data.field.flyWarps[mapId]
@@ -2472,6 +2543,15 @@ function OverworldState:trySurf(fx, fy, onClose)
   end))
 end
 
+function OverworldState:stopSurfing(onClose)
+  if onClose then onClose() end
+  self.player.surfing = false
+  require("src.core.Music").setSurfing(Game.data, false)
+  Game.stack:push(Transition.whiteFlash(Game, nil, function()
+    self:stepForwardOrCrossEdge(self.player.facing)
+  end))
+end
+
 function OverworldState:tryCut(fx, fy)
   -- UsedCut (engine/overworld/cut.asm) gates on the TILESET before
   -- anything else: only OVERWORLD (tree tile $3d) and GYM (plant tile
@@ -3092,6 +3172,32 @@ local function meetTrainerTheme(cls)
          or "Music_MeetMaleTrainer"
 end
 
+-- Public pre-trainer gate. A mod may retain continueBattle while a registered
+-- preparation screen is on top, then resume once with an optional ordered
+-- save-party index scope. The hook is cold on a no-mod boot.
+function OverworldState.prepareTrainerBattle(game, context, startBattle,
+    cancelBattle)
+  if not Runtime.wantsHook("trainer.before_battle") then
+    startBattle()
+    return false
+  end
+  local started = false
+  local function continueBattle(options)
+    if started then return false end
+    started = true
+    if type(options) == "table" and options.cancel == true then
+      if cancelBattle then cancelBattle() end
+    else
+      startBattle(options)
+    end
+    return true
+  end
+  local deferred = Runtime.call("trainer.before_battle",
+    function() return false end, game, context, continueBattle)
+  if deferred ~= true and not started then continueBattle() end
+  return deferred == true
+end
+
 -- Run the pre-battle text -> battle -> won text -> flags sequence.
 -- skipBattleText is for map scripts shaped like SilphCo11FDefaultScript
 -- (scripts/SilphCo11F.asm), which DisplayTextID the challenge line BEFORE
@@ -3119,7 +3225,8 @@ function OverworldState:engageTrainer(npc, onDone, endBattleText, skipBattleText
                   or (header and header.won and Game.data.text[header.won])
 
   local BattleState = require("src.battle.BattleState")
-  local function startBattle()
+  local function startBattle(options)
+    self.cancelledTrainerSight = nil
     -- TalkToTrainer (home/trainers.asm:88) prints the before-battle text
     -- FIRST and only then runs `call EngageMapTrainer` / `jp
     -- StartTrainerBattle`, so a trainer challenged on foot gets the sting
@@ -3134,7 +3241,8 @@ function OverworldState:engageTrainer(npc, onDone, endBattleText, skipBattleText
       local theme = meetTrainerTheme(d.trainerClass)
       if theme then require("src.core.Music").play(Game.data, theme) end
     end
-    local battle = BattleState.newTrainer(Game, d.trainerClass, d.trainerParty)
+    local battle = BattleState.newTrainer(Game, d.trainerClass, d.trainerParty,
+      options)
     battle.checkpointOrigin = {
       kind = "trainer_encounter",
       map = self.map.id,
@@ -3171,10 +3279,31 @@ function OverworldState:engageTrainer(npc, onDone, endBattleText, skipBattleText
     end
     self:pushBattle(battle)
   end
+  local function prepareBattle()
+    if not Runtime.wantsHook("trainer.before_battle") then
+      startBattle()
+      return
+    end
+    OverworldState.prepareTrainerBattle(Game, {
+      trainerClass = d.trainerClass,
+      partyIndex = d.trainerParty or 1,
+      mapId = self.map.id,
+      npcId = npc.id,
+    }, startBattle, function()
+      if self.player then
+        self.cancelledTrainerSight = {
+          npcId = npc.id,
+          playerX = self.player.cellX,
+          playerY = self.player.cellY,
+        }
+      end
+      if onDone then onDone() end
+    end)
+  end
   if skipBattleText then
-    startBattle()
+    prepareBattle()
   else
-    Game.stack:push(TextBox.new(Game, battleText, startBattle))
+    Game.stack:push(TextBox.new(Game, battleText, prepareBattle))
   end
 end
 
@@ -3372,11 +3501,18 @@ function OverworldState:checkTrainerSight()
   if self.player.moving or self.engaging then return end
   if Game.stack:top() ~= self then return end
   local p = self.player
+  local cancelled = self.cancelledTrainerSight
+  if cancelled and (cancelled.playerX ~= p.cellX
+      or cancelled.playerY ~= p.cellY) then
+    self.cancelledTrainerSight = nil
+    cancelled = nil
+  end
   for _, npc in ipairs(self.npcs) do
     local d = npc.def
     -- CheckFightingMapTrainers engages ANY aligned trainer sprite,
     -- walkers included (they sight between steps)
     if d.trainerClass and not npc.moving
+       and not (cancelled and cancelled.npcId == npc.id)
        and not self:trainerDefeated(npc)
        and not mapScripts.talkScript(self.map.id, d.text)
        and trainerSpriteOnScreen(npc, p) then

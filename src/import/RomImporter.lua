@@ -316,18 +316,6 @@ function RomImporter.isReady(version)
 end
 
 -- Load the import manifest for a version and confirm it matches that ROM.
-local function decodeManifest(version)
-  local path = GameVersion.info(version).manifest
-  local raw, readError = love.filesystem.read(path)
-  if not raw then error("ROM import metadata is missing: " .. tostring(readError)) end
-  local Json = require("src.link.Json")
-  local manifest, decodeError = Json.decode(raw)
-  if not manifest then error("ROM import metadata is invalid: " .. tostring(decodeError)) end
-  assert(manifest.romSha1 == GameVersion.info(version).sha1,
-    "ROM import metadata version mismatch")
-  return manifest
-end
-
 local function sha1(data)
   local digest = love.data.hash("sha1", data)
   if type(digest) == "userdata" and digest.getString then
@@ -342,6 +330,14 @@ local function readExternalPath(path)
   local data = file:read("*a")
   file:close()
   return data
+end
+
+local function externalFileSize(path)
+  local file = io.open(path, "rb")
+  if not file then return nil end
+  local size = file:seek("end")
+  file:close()
+  return size
 end
 
 local function readDroppedFile(file)
@@ -981,6 +977,25 @@ local function findPendingSav(preferAny, skip)
   return nil
 end
 
+local function pickerHasKind(kind)
+  local fn = love.system.pickFileKinds
+  if type(fn) ~= "function" then return false end
+  local ok, kinds = pcall(fn)
+  if not ok or type(kinds) ~= "string" then return false end
+  for token in kinds:gmatch("[^,%s]+") do
+    if token == kind then return true end
+  end
+  return false
+end
+
+local function findPendingRequiredImport()
+  local names = { "picked_required_import.bin", "picked_stadium.z64" }
+  for _, name in ipairs(names) do
+    if love.filesystem.getInfo(name, "file") then return name end
+  end
+  return nil
+end
+
 -- Retire an Android pick once it has been through the installer / importer,
 -- whether or not it worked: a pick left on disk wins the scans above forever,
 -- so the next tap re-runs the same failing file and the picker never reopens
@@ -1112,6 +1127,39 @@ local function chooseSav()
   return nil
 end
 
+-- Generic user-supplied dependency picker. Keep the native prompt entirely
+-- engine-owned: manifest labels are untrusted and must never enter shell
+-- command templates. The LÖVE modal already shows the specific import name.
+local function chooseRequiredFile()
+  local prompt = shellSafe(Strings("Choose required mod file"))
+  local platform = love.system.getOS()
+  if platform == "OS X" then
+    return commandOutput(
+      ([[osascript -e 'POSIX path of (choose file with prompt "%s")' 2>/dev/null]])
+        :format(prompt))
+  elseif platform == "Windows" then
+    local script = table.concat({
+      "Add-Type -AssemblyName System.Windows.Forms;",
+      "$d=New-Object System.Windows.Forms.OpenFileDialog;",
+      "$d.Title='" .. prompt .. "';",
+      "$d.Filter='All files (*.*)|*.*';",
+      "if($d.ShowDialog() -eq 'OK'){",
+      "$t=Join-Path $env:TEMP 'pokeport_required_import.bin';",
+      "Copy-Item -LiteralPath $d.FileName -Destination $t -Force;",
+      "[Console]::OutputEncoding=[Text.Encoding]::UTF8;",
+      "[Console]::Write($t)}",
+    })
+    return commandOutput(
+      'powershell -NoProfile -STA -Command "' .. script .. '"')
+  elseif platform == "Linux" then
+    local path = commandOutput(
+      ([[zenity --file-selection --title="%s" 2>/dev/null]]):format(prompt))
+    if path then return path end
+    return commandOutput([[kdialog --getopenfilename "$HOME" 2>/dev/null]])
+  end
+  return nil
+end
+
 -- The self-updater only surfaces on the real distributed build: a fused,
 -- interactive launcher with no scripted-run override.  A dev / source checkout
 -- (unfused, where Boot.run already no-ops) or an autopilot / driver /
@@ -1230,7 +1278,9 @@ function RomImporter.new(onComplete, opts)
     -- (refreshed lazily on first draw and after any toggle/install/delete);
     -- modScroll is the current paged list's inner scroll offset (px, clamped
     -- in draw); modNotice is the last install/delete result { ok, text }.
-    mods = nil, modScroll = 0, modNotice = nil,
+    -- requiredImportNotice stays inside the imported-files modal so validation
+    -- failures are visible beside the file picker that caused them.
+    mods = nil, modScroll = 0, modNotice = nil, requiredImportNotice = nil,
     -- Which game the MODS panel is answering for (a GameVersion id, nil =
     -- every game).  Rows resolve their enable-state and their "runs here"
     -- verdict against it (src/mods/ModTargets.lua).
@@ -1420,7 +1470,13 @@ function RomImporter:focus(f)
     local text = "Could not read the picked file. Reopen the picker and choose "
       .. "it with the Files (Documents) app, or copy it into: "
       .. love.filesystem.getSaveDirectory()
-    if pickError:find("picked_mod", 1, true) then
+    if pickError:find("picked_required_import", 1, true)
+        or pickError:find("picked_stadium", 1, true) then
+      self.modNotice = { ok = false, text = text }
+      self.pickerPendingKind = nil
+      self.pickerPendingModId = nil
+      self.pickerPendingImportId = nil
+    elseif pickError:find("picked_mod", 1, true) then
       self.modNotice = { ok = false, text = text }
     elseif pickError:find("picked_save", 1, true) then
       local version = self.androidPendingVersion or self:_savedropTarget()
@@ -1428,6 +1484,20 @@ function RomImporter:focus(f)
       self.saveNotice[version] = { ok = false, text = text }
     else
       self:setError(text)
+    end
+    return
+  end
+  local requiredName = findPendingRequiredImport()
+  if requiredName then
+    local modId, importId = self.pickerPendingModId, self.pickerPendingImportId
+    self.pickerPendingKind = nil
+    self.pickerPendingModId, self.pickerPendingImportId = nil, nil
+    local imported = modId and importId
+      and self:_importRequiredSource(modId, importId, requiredName)
+    consumePick(self, requiredName, requiredName, imported)
+    if not modId or not importId then
+      self.modNotice = { ok = false,
+        text = "A picked dependency file had no pending mod request and was discarded." }
     end
     return
   end
@@ -1470,6 +1540,8 @@ function RomImporter:setError(message, version)
   self.detail = tostring(message)
   self.progress = 0
   self.worker = nil
+  -- Dropping the job stops collection; the next import clears the channels.
+  self._extract = nil
   self.romData = nil
   -- A headless import has no launcher to read this off: POKEPORT_IMPORT_ONLY
   -- only ever quits from onComplete, so an import that fails here would sit in
@@ -1536,23 +1608,65 @@ function RomImporter:startData(data, displayName)
   self.detail = displayName or info.displayName
   self.progress = 0
   self.romData = data
-  self.worker = coroutine.create(function()
-    self.status = "Preparing private game data"
-    coroutine.yield()
-    -- Redirect every cache write to this version's subtree, then clear only
-    -- that version's previous cache from both homes (save directory and, for
-    -- a portable install, the game folder).  The other version is untouched.
-    local CacheFs = require("src.import.CacheFs")
-    local prefix = info.cachePrefix
-    CacheFs.prefix = prefix
+  self.status = "Preparing private game data"
+
+  -- Clear this version's previous cache from both homes before anything
+  -- writes.  Stays on the main thread so delete-then-fill-then-mark keeps one
+  -- owner; the prefix is restored at once because the worker sets its own.
+  local CacheFs = require("src.import.CacheFs")
+  local prefix = info.cachePrefix
+  local savedPrefix = CacheFs.prefix
+  CacheFs.prefix = prefix
+  local cleared, clearError = pcall(function()
     removeTree(prefix .. "data/generated")
     removeTree(prefix .. "assets/generated")
     love.filesystem.remove(prefix .. MARKER_PATH)
     CacheFs.removeTree("data/generated")
     CacheFs.removeTree("assets/generated")
     CacheFs.remove(MARKER_PATH)
+  end)
+  CacheFs.prefix = savedPrefix
+  if not cleared then
+    self:setError(tostring(clearError), version)
+    return
+  end
 
-    local manifest = decodeManifest(version)
+  if self:_startExtractThread(version, prefix, data, displayName) then return end
+  self:_startExtractCoroutine(version, info, prefix, displayName)
+end
+
+-- False when threads are unavailable, so the coroutine path still covers
+-- that host.  POKEPORT_NO_THREAD=1 forces it, which is the only way to
+-- exercise the fallback on a desktop.
+function RomImporter:_startExtractThread(version, prefix, data, displayName)
+  if os.getenv("POKEPORT_NO_THREAD") == "1" then return false end
+  if not (love.thread and love.thread.newThread) then return false end
+  local ok, thread = pcall(love.thread.newThread, "src/import/ExtractThread.lua")
+  if not ok or not thread then return false end
+  local progressName = "rom_import_progress"
+  local resultName = "rom_import_result"
+  love.thread.getChannel(progressName):clear()
+  love.thread.getChannel(resultName):clear()
+  local started = pcall(thread.start, thread, version, prefix, data,
+    progressName, resultName)
+  if not started then return false end
+  self._extract = {
+    thread = thread, version = version, prefix = prefix,
+    displayName = displayName,
+    progress = love.thread.getChannel(progressName),
+    result = love.thread.getChannel(resultName),
+  }
+  -- The worker owns the bytes now; drop ours so the 1-2 MiB string can go.
+  self.romData = nil
+  return true
+end
+
+function RomImporter:_startExtractCoroutine(version, info, prefix, displayName)
+  self.worker = coroutine.create(function()
+    coroutine.yield()
+    local CacheFs = require("src.import.CacheFs")
+    CacheFs.prefix = prefix
+    local manifest = require("src.import.RomManifest").decode(version)
     local RomExtractor = version == "gold"
       and require("src.import.RomExtractorGen2")
       or require("src.import.RomExtractor")
@@ -1565,45 +1679,91 @@ function RomImporter:startData(data, displayName)
         coroutine.yield()
       end)
     extractor:run()
+    CacheFs.prefix = ""   -- restore the default so later writes stay at the root
     self.romData = nil
     collectgarbage("collect")
-    -- Written last: the marker is what isReady() checks, so it must only
-    -- appear once every required file is in place.
-    local ok, writeError = CacheFs.write(MARKER_PATH, markerFor(version))
-    CacheFs.prefix = ""   -- restore the default so later writes stay at the root
-    if not ok then error("could not finish the private cache: " .. tostring(writeError)) end
-    self.ready[version] = true
-    self.returning[version] = false
-    self.romName[version] = (displayName
-      and (displayName:match("[^/\\]+$") or displayName)) or self.romName[version]
-    -- Android: drop the consumed save-dir .gb/.gbc (picked_rom.gb or a USB copy)
-    -- so the next Choose / focus cannot treat it as a fresh pending ROM.
-    if self.mobileFileBridge and type(displayName) == "string"
-        and not displayName:find("[/\\]") then
-      love.filesystem.remove(displayName)
-    end
-    self.importing = nil
-    self.workState = "complete"
-    self.completeVersion = version
-    self.status = "Ready"
-    -- NX launcher stays put: keep the imports/ cleanup hint instead of
-    -- overwriting it with a "Starting…" line that never boots from here.
-    if self.launcher and self.isNX and type(displayName) == "string" then
-      self.detail = Strings("%s imported. You may delete the copy from "
-        .. "imports/ when finished.", displayName)
-    else
-      self.detail = "Starting " .. info.displayName .. "..."
-    end
-    self.progress = 1
-    if self.launcher then
-      -- Stay on the launcher; the player presses Play to boot the new game.
-      return
-    end
-    self._handedOff = true
-    resetPointerCursor(self)
-    if self._flex then require("src.import.LauncherView").detach(self) end
-    if self.onComplete then self.onComplete(version) end
+    self:_completeImport(version, prefix, displayName)
   end)
+end
+
+-- Everything after the tree is filled, shared by both worker paths.  Raises
+-- on a failed marker write; the thread path calls it inside a pcall.
+function RomImporter:_completeImport(version, prefix, displayName)
+  local info = GameVersion.info(version)
+  local CacheFs = require("src.import.CacheFs")
+  -- Written last: the marker is what isReady() checks, so it must only
+  -- appear once every required file is in place.
+  local savedPrefix = CacheFs.prefix
+  CacheFs.prefix = prefix
+  local ok, writeError = CacheFs.write(MARKER_PATH, markerFor(version))
+  CacheFs.prefix = savedPrefix
+  if not ok then
+    error("could not finish the private cache: " .. tostring(writeError))
+  end
+  self.ready[version] = true
+  self.returning[version] = false
+  self.romName[version] = (displayName
+    and (displayName:match("[^/\\]+$") or displayName)) or self.romName[version]
+  -- Android: drop the consumed save-dir .gb/.gbc (picked_rom.gb or a USB copy)
+  -- so the next Choose / focus cannot treat it as a fresh pending ROM.
+  if self.mobileFileBridge and type(displayName) == "string"
+      and not displayName:find("[/\\]") then
+    love.filesystem.remove(displayName)
+  end
+  self.importing = nil
+  self.workState = "complete"
+  self.completeVersion = version
+  self.status = "Ready"
+  -- NX launcher stays put: keep the imports/ cleanup hint instead of
+  -- overwriting it with a "Starting…" line that never boots from here.
+  if self.launcher and self.isNX and type(displayName) == "string" then
+    self.detail = Strings("%s imported. You may delete the copy from "
+      .. "imports/ when finished.", displayName)
+  else
+    self.detail = "Starting " .. info.displayName .. "..."
+  end
+  self.progress = 1
+  if self.launcher then
+    -- Stay on the launcher; the player presses Play to boot the new game.
+    return
+  end
+  self._handedOff = true
+  resetPointerCursor(self)
+  if self._flex then require("src.import.LauncherView").detach(self) end
+  if self.onComplete then self.onComplete(version) end
+end
+
+-- Drain the worker's progress and finish when it reports done.  One
+-- non-blocking poll per frame, like the other _pump* collectors above.
+function RomImporter:_pumpExtract()
+  local job = self._extract
+  if not job then return end
+  local msg = job.progress:pop()
+  while msg do
+    self.status = msg.stage
+    self.progress = msg.progress / msg.total
+    self.stageCurrent = msg.current
+    self.stageTotal = msg.stageTotal
+    msg = job.progress:pop()
+  end
+  local res = job.result:pop()
+  if not res then
+    -- A thread that died before pushing a result would strand the loader.
+    local threadError = job.thread.getError and job.thread:getError()
+    if threadError then
+      self._extract = nil
+      self:setError(tostring(threadError), job.version)
+    end
+    return
+  end
+  self._extract = nil
+  if not res.ok then
+    self:setError(tostring(res.error), job.version)
+    return
+  end
+  local ok, err = pcall(self._completeImport, self, job.version, job.prefix,
+    job.displayName)
+  if not ok then self:setError(tostring(err), job.version) end
 end
 
 function RomImporter:startPath(path)
@@ -1736,6 +1896,152 @@ function RomImporter:chooseMod()
   end
   local path = chooseZip()
   if path then self:_installMod(path) end
+end
+
+local function requiredManifest(self, modId)
+  for _, row in ipairs(self.mods or {}) do
+    if row.id == modId then return row.manifest, row end
+  end
+  return nil
+end
+
+local function requiredSpec(manifest, importId)
+  for _, candidate in ipairs(require("src.mods.RequiredImports").specs(manifest)) do
+    if candidate.id == importId then return candidate end
+  end
+  return nil
+end
+
+local function requiredImportNotice(self, modId, importId, text)
+  self.requiredImportNotice = {
+    modId = modId,
+    importId = importId,
+    text = tostring(text),
+  }
+end
+
+function RomImporter:_importRequiredData(modId, importId, data)
+  local manifest = requiredManifest(self, modId)
+  if not manifest then
+    self.modNotice = { ok = false, text = "Required import failed: mod not found." }
+    return nil
+  end
+  local ok, result = require("src.mods.RequiredImports")
+    .importData(manifest, importId, data)
+  if ok then
+    self.requiredImportNotice = nil
+    self.modNotice = { ok = true, text = "Imported " .. tostring(importId)
+      .. " for " .. tostring(manifest.name or manifest.id) .. "." }
+    self:_refreshMods()
+    return true
+  end
+  -- Keep validation feedback on the imported-files page.  A general Mods-page
+  -- notice is hidden by this modal and made MD5 failures especially easy to miss.
+  requiredImportNotice(self, modId, importId, result)
+  self.modNotice = nil
+  return nil
+end
+
+function RomImporter:_importRequiredSource(modId, importId, source)
+  local manifest = requiredManifest(self, modId)
+  local spec = manifest and requiredSpec(manifest, importId)
+  if not spec then
+    requiredImportNotice(self, modId, importId, "Import declaration was not found.")
+    self.modNotice = nil
+    return nil
+  end
+  local info = love.filesystem.getInfo(source, "file")
+  local size = info and info.size or externalFileSize(source)
+  local sizeErr = require("src.mods.RequiredImports").sizeError(spec, size, false)
+  if sizeErr then
+    requiredImportNotice(self, modId, importId, sizeErr)
+    self.modNotice = nil
+    return nil
+  end
+  local data = love.filesystem.read(source)
+  if not data then data = readExternalPath(source) end
+  if not data then
+    requiredImportNotice(self, modId, importId, "Could not read the selected file.")
+    self.modNotice = nil
+    return nil
+  end
+  return self:_importRequiredData(modId, importId, data)
+end
+
+function RomImporter:_removeRequiredImport(modId, importId)
+  local manifest = requiredManifest(self, modId)
+  if not manifest then return end
+  local ok, err = require("src.mods.RequiredImports").remove(manifest, importId)
+  if ok then
+    self.requiredImportNotice = nil
+    self.modNotice = { ok = true, text = "Deleted " .. tostring(importId) .. "." }
+    self:_refreshMods()
+  else
+    requiredImportNotice(self, modId, importId, err)
+    self.modNotice = nil
+  end
+end
+
+-- Select and validate one manifest-declared file.  NX has no host picker, so
+-- its equivalent is an engine-owned imports/baseroms inbox that can be filled
+-- over MTP; every other native/mobile picker lands on the same validation path.
+function RomImporter:chooseRequiredImport(modId, importId)
+  if self.workState == "working" then return end
+  local manifest = requiredManifest(self, modId)
+  if not manifest then return end
+  local spec = requiredSpec(manifest, importId)
+  if not spec then return end
+
+  if self.isNX then
+    local inbox = "imports/baseroms"
+    love.filesystem.createDirectory(inbox)
+    local lastError
+    for _, name in ipairs(love.filesystem.getDirectoryItems(inbox) or {}) do
+      if name:sub(1, 1) ~= "." then
+        local path = inbox .. "/" .. name
+        local info = love.filesystem.getInfo(path, "file")
+        local sizeErr = info and require("src.mods.RequiredImports")
+          .sizeError(spec, info.size, false)
+        local data = not sizeErr and love.filesystem.read(path) or nil
+        if data and self:_importRequiredData(modId, importId, data) then return end
+        if sizeErr then lastError = sizeErr
+        elseif self.requiredImportNotice
+            and self.requiredImportNotice.modId == modId
+            and self.requiredImportNotice.importId == importId then
+          lastError = self.requiredImportNotice.text
+        end
+      end
+    end
+    requiredImportNotice(self, modId, importId, lastError
+      or "No matching file in imports/baseroms/. Copy it there over MTP, then try again.")
+    self.modNotice = nil
+    return
+  end
+  if self.nativePicker then
+    if self.mobileFileBridge and not pickerHasKind("required_import") then
+      requiredImportNotice(self, modId, importId,
+        "This app build cannot pick required mod files yet. Update the app and try again.")
+      self.modNotice = nil
+      return
+    end
+    self.pickerPendingKind = "required_import"
+    self.pickerPendingModId = modId
+    self.pickerPendingImportId = importId
+    if not pickFile("required_import") then
+      self.pickerPendingKind = nil
+      self.pickerPendingModId = nil
+      self.pickerPendingImportId = nil
+      requiredImportNotice(self, modId, importId, "Could not open the file picker.")
+      self.modNotice = nil
+    elseif self.android then
+      self.pickPending = true
+      self.pickTimer = 0
+    end
+    return
+  end
+
+  local path = chooseRequiredFile()
+  if path then self:_importRequiredSource(modId, importId, path) end
 end
 
 -- Which game a dropped .sav imports into: a .sav has no version signature of
@@ -2045,7 +2351,8 @@ function RomImporter:_pollPickedFiles(dt)
   if not found then
     for _, name in ipairs(love.filesystem.getDirectoryItems("")) do
       local n = name:lower()
-      if n:match("%.gbc?$") or n == "picked_mod.zip" or n == "picked_save.sav" then
+      if n:match("%.gbc?$") or n == "picked_mod.zip" or n == "picked_save.sav"
+          or n == "picked_required_import.bin" or n == "picked_stadium.z64" then
         found = true
         break
       end
@@ -2087,6 +2394,7 @@ function RomImporter:update(dt)
   self:_pumpFindThumbs()
   self:_pumpModCheck()
   self:_pumpModInstall()
+  self:_pumpExtract()
   -- Dev harness: POKEPORT_LAUNCHER_SHOT=/path.png resizes the window from
   -- POKEPORT_WIN=WxH, lets the view settle, then captures one frame and
   -- quits, so a scripted run can see the real launcher at any window shape
@@ -2174,7 +2482,12 @@ function RomImporter:update(dt)
       local version = self.pickerPendingVersion
       self.pickerPendingKind = nil
       self.pickerPendingVersion = nil
-      if kind == "mod" then
+      if kind == "required_import" then
+        local modId, importId = self.pickerPendingModId, self.pickerPendingImportId
+        self.pickerPendingModId, self.pickerPendingImportId = nil, nil
+        if modId and importId then self:_importRequiredSource(modId, importId, path) end
+        if Platform.isUWP() then os.remove(path) end
+      elseif kind == "mod" then
         self:_installMod(path)
         if Platform.isUWP() and self.modNotice and self.modNotice.ok then
           os.remove(path)
@@ -2196,7 +2509,10 @@ function RomImporter:update(dt)
         local version = self.pickerPendingVersion or self:_savedropTarget()
         self.pickerPendingKind = nil
         self.pickerPendingVersion = nil
-        if kind == "mod" then
+        if kind == "required_import" then
+          self.modNotice = { ok = false, text = errorText }
+          self.pickerPendingModId, self.pickerPendingImportId = nil, nil
+        elseif kind == "mod" then
           self.modNotice = { ok = false, text = errorText }
         elseif kind == "sav" then
           self.saveNotice[version] = { ok = false, text = errorText }
@@ -2356,6 +2672,20 @@ function RomImporter:_updatePadCursor(dt)
     local ny = self._padCursor.y + dy * speed * dt
     self._padCursor.x = math.max(ox, math.min(ox + w, nx))
     self._padCursor.y = math.max(oy, math.min(oy + h, ny))
+    -- Pushing INTO the top/bottom edge scrolls the page instead of stalling.
+    -- The cursor is clamped to the safe area above, so on a short window the
+    -- rows below the fold are unreachable on a stickless handheld: no mouse
+    -- wheel, no touchscreen, and no right stick to feed the existing wheel
+    -- path.  Only the OVERSHOOT scrolls -- parking the cursor at the edge does
+    -- nothing, it has to be actively pushed -- and this block only runs on pad
+    -- input, so a real mouse is unaffected.  /48 matches the pixels-per-notch
+    -- LauncherView.draw multiplies back out.
+    local overY = 0
+    if ny > oy + h then overY = ny - (oy + h)
+    elseif ny < oy then overY = ny - oy end
+    if overY ~= 0 and self._flex then
+      require("src.import.LauncherView").wheelmoved(self, 0, -overY / 48)
+    end
     -- Desktop: FlexLove polls the real mouse, so warp it with the pad pointer.
     -- NX: the getPosition bridge already returns pad coords — skip setPosition.
     if not self.isNX and love.mouse.setPosition then
@@ -2806,7 +3136,7 @@ function RomImporter:keypressed(key)
     return
   end
   if self._modConfirm or self._modVersions or self._modReleaseNotes
-      or self._findDetails then
+      or self._findDetails or self._appPatchNotes then
     -- Focus navigation belongs to the visible modal as well as the launcher
     -- beneath it. Route arrows and an already-armed confirm before this guard
     -- returns; unarmed Enter still falls through to the modal guard. Keep this
@@ -2819,6 +3149,8 @@ function RomImporter:keypressed(key)
         self._findDetails = nil
       elseif self._modReleaseNotes then
         self._modReleaseNotes = nil
+      elseif self._appPatchNotes then
+        self._appPatchNotes = nil
       else
         self._modConfirm = nil
         self._modVersions = nil
@@ -3837,11 +4169,19 @@ end
 
 -- Turn finished thumbnail downloads into images.  Called from update(), so
 -- love.graphics.newImage runs on the render thread where it belongs.
+-- love.graphics.newImage decodes the PNG and uploads it, both on the render
+-- thread.  A page's worth of thumbnails landing in the same frame did that
+-- many times back to back and dropped the frame, so only this many are
+-- decoded per pass; the rest keep their spinner one frame longer.
+local THUMB_DECODES_PER_FRAME = 2
+
 function RomImporter:_pumpFindThumbs()
   local pending = self._findThumbFetch
   if not pending then return end
   local Fetch = require("src.net.Fetch")
+  local decoded = 0
   for id, item in pairs(pending) do
+    if decoded >= THUMB_DECODES_PER_FRAME then break end
     local st = Fetch.poll(item.job)
     if st.status ~= "pending" then
       Fetch.release(item.job)
@@ -3850,6 +4190,7 @@ function RomImporter:_pumpFindThumbs()
       if st.status == "ok" and st.path then
         local ok, img = pcall(love.graphics.newImage, st.path)
         image = ok and img or nil
+        decoded = decoded + 1
       end
       self._findThumbs = self._findThumbs or {}
       self._findThumbs[id] = image or false
@@ -3866,14 +4207,21 @@ end
 -- entry per frame so opening the tab cannot stall for the whole listing.
 -- The result is memoized per id for the session; a repo with no releases
 -- or a failed fetch resolves to an empty table so it is tried once.
-function RomImporter:_findStats(entry)
+-- PURE read: whatever is already known for a row, or nil.  Resolving a
+-- feed-published stat or a repo-less entry is memoization, not network, so it
+-- stays here; nothing in this function can start a fetch.  That matters
+-- because the sort comparator calls it for EVERY entry -- when queueing lived
+-- in here, sorting a 500-mod index by Popularity queued 500 GitHub requests
+-- on the first frame, blew the hourly rate limit, and the failures then
+-- re-queued together every 60s for as long as the tab was open.
+function RomImporter:_findStatsCached(entry)
   self._findStatsCache = self._findStatsCache or {}
   local cached = self._findStatsCache[entry.id]
   if cached then
     if cached.done or (cached.retryAt and os.time() < cached.retryAt) then
       return cached
     end
-    self._findStatsCache[entry.id] = nil  -- retry window open, refetch
+    return nil   -- retry window open; _requestFindStats decides what to do
   end
   if entry.downloads ~= nil or entry.first_release or entry.last_release then
     cached = { total = entry.downloads, first = entry.first_release,
@@ -3886,20 +4234,52 @@ function RomImporter:_findStats(entry)
     self._findStatsCache[entry.id] = cached
     return cached
   end
-  -- ASYNC (was a blocking fetch, one row per frame).  "One per frame" bounded
-  -- how many stalls happened at once, not how long each one lasted: every
-  -- frame that started a fetch blocked for the whole round trip, so scrolling
-  -- a listing juddered once per row.  Rows now queue a handle and fill in
-  -- when it lands; until then the row simply has no stats line.
-  self._findStatsPending = self._findStatsPending or {}
-  if not self._findStatsPending[entry.id] then
-    local ModUpdate = require("src.mods.ModUpdate")
-    self._findStatsPending[entry.id] = {
-      id = entry.id,
-      h = ModUpdate.beginFetchReleases(entry.github, entry.id, {}),
-    }
-  end
   return nil
+end
+
+-- Queue one row's release fetch.  Only rows actually on the page call this --
+-- the rule _findThumb already follows -- so the fan-out is a page, not the
+-- whole index.
+function RomImporter:_requestFindStats(entry)
+  if self:_findStatsCached(entry) then return end
+  if not entry.github or entry.github == "" then return end
+  local cached = self._findStatsCache[entry.id]
+  if cached then
+    if cached.retryAt and os.time() >= cached.retryAt then
+      self._findStatsCache[entry.id] = nil   -- retry window open, refetch
+    else
+      return
+    end
+  end
+  self._findStatsPending = self._findStatsPending or {}
+  if self._findStatsPending[entry.id] then return end
+  local ModUpdate = require("src.mods.ModUpdate")
+  self._findStatsPending[entry.id] = {
+    id = entry.id,
+    h = ModUpdate.beginFetchReleases(entry.github, entry.id, {}),
+  }
+end
+
+-- Request-and-read, for a row that is being drawn and for the detail modal.
+function RomImporter:_findStats(entry)
+  self:_requestFindStats(entry)
+  return self:_findStatsCached(entry)
+end
+
+-- How many rows are still waiting on a release check, for the panel's
+-- progress line.
+function RomImporter:_findStatsPendingCount()
+  local n = 0
+  for _ in pairs(self._findStatsPending or {}) do n = n + 1 end
+  return n
+end
+
+function RomImporter:_findStatsPendingFor(id)
+  return (self._findStatsPending and self._findStatsPending[id]) ~= nil
+end
+
+function RomImporter:_findThumbPending(id)
+  return (self._findThumbFetch and self._findThumbFetch[id]) ~= nil
 end
 
 -- Drive in-flight FIND MODS stats lookups.  Called from update().

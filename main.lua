@@ -76,15 +76,6 @@ end
 local editorHost, editorVersion, editorWindow
 local closeEditor  -- forward declaration: openEditor hands it to the editor
 
--- tools/save-editor/ models the Gen 1 save and nothing else: a Gen 2 party row
--- carries fields its MonOps and panels have no idea about (dvs, statExp,
--- happiness, pokerus, caughtLevel), and SaveIO.save writes the WHOLE table
--- back, so a Gold slot opened here comes out in a shape src/core/gen2/Save.lua
--- then has to quarantine on the next boot.  Refuse by name, the same way the
--- .sav paths do (src/save_convert/SaveConvert.lua GEN2_SAV_UNSUPPORTED), so
--- Red/Blue/Yellow slots are untouched.
-local GEN2_NO_EDITOR = { gold = "Pokemon Gold" }
-
 -- The editor's modules use flat names (require("Kit"), require("Party")), so
 -- their directories have to be on the require path.  It must be
 -- love.filesystem's path, not package.path: in a packaged build these files
@@ -137,11 +128,6 @@ local function openEditor(version, slotId)
     Importer.saveNotice = Importer.saveNotice or {}
     Importer.saveNotice[version] = { ok = false, text = text }
   end
-  local gen2Name = GEN2_NO_EDITOR[version]
-  if gen2Name then
-    refuse(gen2Name .. " uses a Gen 2 save; the save editor does not read one yet.")
-    return
-  end
   local SaveData = require("src.core.SaveData")
   local path = SaveData.slotDiskPath(version, slotId)
   if not path then
@@ -162,9 +148,44 @@ local function openEditor(version, slotId)
   editorMode = true
   resizeForEditor()
   addEditorRequirePath()
-  EditorApp = require("App")
-  EditorApp.load(path, { version = version, slotId = slotId, embedded = true,
-                         onClose = function() closeEditor() end })
+  local okReq, appOrErr = pcall(require, "App")
+  if not okReq then
+    editorMode = false
+    if version then
+      require("src.import.CacheFs").unmountVersion(version)
+    end
+    restoreWindow()
+    Importer = editorHost
+    editorHost = nil
+    editorVersion = nil
+    if Importer and Importer.resumeAfterOverlay then
+      Importer:resumeAfterOverlay()
+    end
+    refuse("Could not open the save editor (" .. tostring(appOrErr) .. ").")
+    return
+  end
+  EditorApp = appOrErr
+  local okLoad, loadErr = pcall(EditorApp.load, path, {
+    version = version, slotId = slotId, embedded = true,
+    onClose = function() closeEditor() end,
+  })
+  if not okLoad then
+    editorMode = false
+    if EditorApp.unload then pcall(EditorApp.unload) end
+    EditorApp = nil
+    if version then
+      require("src.import.CacheFs").unmountVersion(version)
+      require("src.core.Data"):unloadGenerated()
+    end
+    restoreWindow()
+    Importer = editorHost
+    editorHost = nil
+    editorVersion = nil
+    if Importer and Importer.resumeAfterOverlay then
+      Importer:resumeAfterOverlay()
+    end
+    refuse("Could not open the save editor (" .. tostring(loadErr) .. ").")
+  end
 end
 
 -- Back to the launcher.  Everything the editor mounted or cached has to come
@@ -179,6 +200,11 @@ function closeEditor()
   if version then
     require("src.import.CacheFs").unmountVersion(version)
     require("src.core.Data"):unloadGenerated()
+  end
+  for k in pairs(package.loaded) do
+    if type(k) == "string" and (k:find("save%-editor") or k == "App" or k == "Kit" or k == "State" or k == "Catalog" or k == "SaveIO" or k == "Ops" or k == "MonOps" or k == "ItemOps" or k == "PadInput" or k == "Gen" or k == "Theme") then
+      package.loaded[k] = nil
+    end
   end
   editorVersion = nil
   restoreWindow()
@@ -277,6 +303,11 @@ function love.load(args)
   -- of each flashing their own cmd.exe window (#606).  No-op elsewhere.
   require("src.core.HostShell").hideHostConsole()
 
+  -- Hang gen1tls on love.system before mods boot.  Android already has tls*
+  -- from JNI; this is the desktop half.  No DLL / no FFI is fine -- ws://
+  -- rooms still work, wss:// just won't.
+  pcall(function() require("src.net.Gen1Tls").install() end)
+
   -- NX fused mounts are unreliable for the blue|yellow cache overlay: wrap
   -- the love loaders once so every generated-asset read falls back to the
   -- versioned save-dir copy.  Never installed on desktop/Android/iOS.
@@ -320,14 +351,6 @@ function love.load(args)
   -- cache has to be mounted before the editor's Data:load.
   if editorMode then
     local version = os.getenv("POKEPORT_VERSION") or "red"
-    local gen2Name = GEN2_NO_EDITOR[version]
-    if gen2Name then
-      -- No launcher behind this run to carry a notice, so say it and stop
-      -- rather than open a Gen 2 slot on Gen 1 panels.
-      print(gen2Name .. " uses a Gen 2 save; the save editor does not read one yet.")
-      love.event.quit(1)
-      return
-    end
     require("src.core.GameVersion").set(version)
     require("src.import.CacheFs").mountVersion(version)
     addEditorRequirePath()
