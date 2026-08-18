@@ -35,6 +35,7 @@ local World = require("src.world.gen2.World")
 -- The mod event/hook buses.  Gold reaches them through Runtime like every
 -- other engine file, so a call site here is the same call site Gen 1 has.
 local ModRuntime = require("src.mods.Runtime")
+local GameViewport = require("src.render.GameViewport")
 -- Only for the mod-supplied save migrations and the mods-changed report, which
 -- are keyed off save.meta and know nothing about a generation; Gold's own save
 -- IO is src/core/gen2/Save.lua.
@@ -73,8 +74,8 @@ end
 --
 -- Gold composites its own frame (Game2:draw / drawScene) and pumps its own pad
 -- (the FixedStep callback in Game2:load), so none of it goes through
--- src/render/Renderer.lua or src/core/Game.lua.  That explains why the eight
--- hooks below never used to fire here; it is not a reason they should not.  A
+-- src/render/Renderer.lua or src/core/Game.lua.  That explains why the hooks
+-- below never used to fire here; it is not a reason they should not.  A
 -- hook is a contract about a MOMENT in the frame, and Gold has every one of
 -- these moments -- so each is raised under the Gen 1 NAME with the Gen 1
 -- PAYLOAD, at the Gen 1 point in the order:
@@ -86,6 +87,8 @@ end
 --   render.output*   the normal composed frame       (Renderer.lua:1063)
 --   render.letterbox the void around the 160x144 blit (Renderer.lua:840)
 --   render.hud       screen-space UI over the frame  (src/core/Game.lua:521)
+--   render.viewport  the game's OS-window rectangle  (GameViewport.lua:52)
+--   render.window    final OS-window composition     (GameViewport.lua:145)
 --
 -- Where Gold genuinely cannot tell two Gen 1 things apart -- it composites the
 -- world pass and the UI into ONE canvas, not two -- the call site says so and
@@ -117,11 +120,11 @@ local function visibleBaseState(stack)
 end
 
 local function loadGenerated(path)
-  local chunk = love.filesystem.load(path)
-  if not chunk then return nil end
-  local ok, data = pcall(chunk)
-  if ok then return data end
-  return nil
+  -- CacheFs.loadActive, not love.filesystem.load: Gold's cache lives under
+  -- gold/ and fused NX often cannot mount that tree onto data/generated/.
+  local CacheFs = require("src.import.CacheFs")
+  local data = CacheFs.loadActive(path)
+  return data
 end
 
 -- NewGame (engine/menus/intro_menu.asm) calls OakSpeech, and OakSpeech's first
@@ -680,7 +683,10 @@ end
 -- .SelectMon / PPRestoreItem_Cancel carry path: nothing spent.
 function Game2:usePartyItem(itemId)
   local ItemEffects = require("src.core.gen2.ItemEffects")
-  local action = ItemEffects.partyAction(itemId)
+  -- without the merged dataset this can only ever see RECORDS, the
+  -- module's own built-ins, so a mod's field item resolves to no action
+  -- at all and never gets past the .Oak refusal below
+  local action = ItemEffects.partyAction(itemId, self.data)
   if not action then return end
   local party = (self.save and self.save.party) or {}
   if #party == 0 then
@@ -730,7 +736,7 @@ function Game2:usePartyItem(itemId)
       local row = ItemEffects.RESTORE_PP[itemId] or {}
       if row.each or mon.isEgg then
         self.stack:pop()
-        finish(ItemEffects.usePpItem(itemId, mon), mon)
+        finish(ItemEffects.usePpItem(itemId, mon, nil, self.data), mon)
         return
       end
       Screens.push(self, "Gen2MoveDeleter", {
@@ -740,7 +746,7 @@ function Game2:usePartyItem(itemId)
         onChoose = function(slot)
           self.stack:pop() -- the move list
           self.stack:pop() -- the party list
-          finish(ItemEffects.usePpItem(itemId, mon, slot), mon)
+          finish(ItemEffects.usePpItem(itemId, mon, slot, self.data), mon)
         end,
       })
     end,
@@ -888,6 +894,12 @@ function Game2:load()
   self.data.items = loadGenerated("data/generated/items.lua") or {}
   self.data.moves = loadGenerated("data/generated/moves.lua") or {}
   self.data.type_chart = loadGenerated("data/generated/type_chart.lua") or {}
+  -- data/types/type_matchups.asm:112-116: the rows after the `db -2` marker
+  -- apply by default; Foresight is what cuts the table short at it.
+  local chart = self.data.type_chart
+  for _, row in ipairs(chart.foresightMatchups or {}) do
+    chart.matchups[#chart.matchups + 1] = row
+  end
   -- The `held_items` registry's merge target: ItemAttributes' last two columns
   -- as their own table, so a mod can give an item a held behaviour without
   -- owning the whole item record.  Built BEFORE mods:load so the registry
@@ -927,6 +939,8 @@ function Game2:load()
   self.data.gen2Maps = loadGenerated("data/generated/maps.lua")
   self.data.gen2Tilesets = loadGenerated("data/generated/tilesets.lua")
   self.data.gen2Roofs = loadGenerated("data/generated/roofs.lua")
+  -- engine/events/magnet_train.asm:165 DrawMagnetTrain
+  self.data.gen2Field = loadGenerated("data/generated/field.lua")
   self.data.gen2Marts = loadGenerated("data/generated/marts.lua")
   self.data.gen2Scripts = loadGenerated("data/generated/scripts.lua")
   self.data.gen2StdScripts = loadGenerated("data/generated/std_scripts.lua")
@@ -1191,9 +1205,7 @@ function Game2:frameFit(w, h)
     dpi = tonumber(love.window.getDPIScale()) or 1
   end
   local pw, ph = w * dpi, h * dpi
-  if love.graphics.getPixelDimensions then
-    pw, ph = love.graphics.getPixelDimensions()
-  end
+  pw, ph = GameViewport.pixelDimensions()
   return scale, ox, oy, dpi, pw, ph
 end
 
@@ -1211,18 +1223,15 @@ function Game2:viewport(w, h)
   }
 end
 
--- The screen-space layer, in the Gen 1 order: render.hud and then the
--- on-screen pad (src/core/Game.lua:521 and :524, either side of
--- Renderer:endFrame).  Both are window-space, both sit over the finished
--- frame -- post passes, letterbox and all -- and neither ever enters the game
--- canvas.  Every exit path of Game2:draw ends here, which is what makes that
--- true of the composed frame a mod owns as well as of the plain one.
+-- The render.hud layer, in Gen 1's order over the finished game frame. The
+-- on-screen pad is drawn separately after GameViewport.finish, because it is
+-- OS-window chrome and must not be captured or scaled with this canvas.
 --
 -- render.hud: persistent tool status.  The call is fenced with
 -- push("all")/pop for the reason src/render/Pipelines.lua:guardRender fences a
 -- mod render callback: a subscriber that returns cleanly but leaves a shader
 -- bound, the canvas redirected or the colour changed must not corrupt the next
--- frame -- or, now, the pad drawn immediately after it.
+-- frame.
 function Game2:drawHud(w, h)
   if ModRuntime.wantsHook("render.hud") then
     local G = love.graphics
@@ -1230,10 +1239,6 @@ function Game2:drawHud(w, h)
     ModRuntime.call("render.hud", noop, self, self:viewport(w, h))
     G.pop()
   end
-  -- The pad LAST, so a HUD mod cannot draw over the controls the player is
-  -- pressing.  It draws nothing at all off Android/iOS unless POKEPORT_TOUCH=1
-  -- forces it, and nothing ever while a controller is in use.
-  TouchControls:draw()
 end
 
 -- render.letterbox: SGB borders and custom void art in the bars around the
@@ -1357,9 +1362,9 @@ end
 -- is being shown on.  Mod post-processes fold in between the two, where
 -- Renderer.lua:1058 folds them -- a blur or a colour grade is what the LCD grid
 -- is then drawn over, rather than something that smears the grid itself.
-function Game2:draw()
+function Game2:drawViewportFrame()
   local G = love.graphics
-  local w, h = G.getDimensions()
+  local w, h = GameViewport.dimensions()
   local GBCFX = require("src.render.GBCFX")
   local GbcPalette = require("src.render.GbcPalette")
   local Pipelines = require("src.render.Pipelines")
@@ -1469,6 +1474,16 @@ function Game2:draw()
   G.pop()
   G.setColor(1, 1, 1, 1)
   self:drawHud(w, h)
+end
+
+function Game2:draw()
+  GameViewport.begin(2)
+  GameViewport.setTarget()
+  self:drawViewportFrame()
+  GameViewport.finish(self)
+  -- OS-window chrome: draw after companion composition so viewport layouts
+  -- neither shrink nor cover the touch pad.
+  TouchControls:draw()
 end
 
 -- The paper a pushed TextBox has to sit on.  A textbox is built entirely from
@@ -1797,8 +1812,10 @@ end
 
 -- coordinates are LOVE window units, the same space render.hud's viewport is in
 function Game2:pointerEvent(phase, source, id, x, y, dx, dy, pressure, button)
+  local gameX, gameY, insideGame = GameViewport.toLocal(x, y)
   return ModRuntime.call("input.pointer", pointerUnclaimed, self, {
     phase = phase, source = source, id = id, x = x, y = y,
+    gameX = gameX, gameY = gameY, insideGame = insideGame,
     dx = dx or 0, dy = dy or 0, pressure = pressure, button = button,
   })
 end
@@ -1949,6 +1966,9 @@ function Game2:applyOptions()
     touchControls = options.touchControls,
     haptics = options.haptics,
   })
+  require("src.core.VideoMode").applyOptions(options)
+  require("src.core.FrameCap").applyOptions(options)
+  require("src.world.gen2.BorderFill").applyOptions(options)
   local GBCFX = require("src.render.GBCFX")
   if GBCFX.applyOptions(options) and self.save then
     -- applyOptions returns true when it had to clear an unsupported level.

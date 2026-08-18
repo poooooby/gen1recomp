@@ -313,6 +313,9 @@ function PartyMenu.new(game, opts)
   -- TM/HM display (ABLE / NOT ABLE per mon instead of the HP bar, and the
   -- "Use TM on which POKeMON?" prompt). Set by BagMenu.pickTargetAndUse. #210
   self.tmhm = opts.tmhm
+  -- Evolution stones: opts.evoStone = item id gives Gen 1's
+  -- EVO_STONE_PARTY_MENU ABLE / NOT ABLE display (party_menu.asm:114). #1411
+  self.evoStone = opts.evoStone
   self.forceSwitch = opts.forceSwitch
   self.battle = opts.battle
   self.party = party -- link/scoped battles pass their local party view
@@ -628,22 +631,8 @@ function PartyMenu:update(dt)
     end
     if self.softboiledFrom then
       local user = party[self.softboiledFrom]
-      local heal = math.floor(user.stats.hp / 5)
-      if mon == user or mon.hp <= 0 or mon.hp >= mon.stats.hp
-         or user.hp <= heal then
-        self.softboiledFrom = nil
-        local TextBox = require("src.render.TextBox")
-        self.game.stack:push(TextBox.new(self.game, Strings("It won't have\nany effect.")))
-      else
-        user.hp = user.hp - heal
-        mon.hp = math.min(mon.stats.hp, mon.hp + heal)
-        self.softboiledFrom = nil
-        require("src.core.Sound").play(self.game.data, "Heal_HP")
-        local def = self.game.data.pokemon[mon.species]
-        local TextBox = require("src.render.TextBox")
-        self.game.stack:push(TextBox.new(self.game,
-          Strings("%s's HP\nwas restored!", mon.nickname or def.name)))
-      end
+      self.softboiledFrom = nil
+      self.game.overworld:useSoftboiledFieldMove(user, mon)
     elseif self.swapFrom then
       if self.swapFrom ~= self.index then
         party[self.swapFrom], party[self.index] = party[self.index], party[self.swapFrom]
@@ -809,6 +798,20 @@ function PartyMenu:draw()
         if m == self.tmhm.move then can = true break end
       end
       -- right-aligned so the shorter "ABLE" shares "NOT ABLE"'s right edge
+      if can then
+        Font.draw(Strings("ABLE"), 120, y + 8)
+      else
+        Font.draw(Strings("NOT ABLE"), 88, y + 8)
+      end
+    elseif self.evoStone then
+      -- party_menu.asm:114 .evolutionStoneMenu: an EVOLVE_ITEM row matching
+      -- wEvoStoneItemID, printed in the TM/HM strings' row+1 column+9 slot
+      local can = false
+      for _, evo in ipairs(def.evolutions or {}) do
+        if evo.method == "ITEM" and evo.item == self.evoStone then
+          can = true break
+        end
+      end
       if can then
         Font.draw(Strings("ABLE"), 120, y + 8)
       else

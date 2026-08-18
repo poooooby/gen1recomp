@@ -56,10 +56,6 @@ local CARDS = {
 -- card over.  One row, so `#self.cards` stays 1 and nothing pages.
 local FLY_MAP_CARD = { id = "map", label = "FLY" }
 
-local DAYS = {
-  "SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY",
-}
-
 -- ---------------------------------------------------------------- the radio
 --
 -- engine/pokegear/radio.asm is not a text table: it is a jumptable of code.
@@ -1878,7 +1874,7 @@ function Pokegear:drawClock()
   -- Pokegear_UpdateClock: ClearBox(3,5) 5x14, the day at (6,6) and
   -- PrintHoursMins at (6,8) -- two digits, ':', two more, then AM/PM at
   -- column 12.
-  self:text(DAYS[weekday] or "", 6, 6)
+  self:text(Clock.weekdayName(weekday) or "", 6, 6)
   local display = hour % 12
   if display == 0 then display = 12 end
   self:text(Chrome.number(display, 2), 6, 8)
@@ -2100,10 +2096,23 @@ function Pokegear:mapCursorSprite(x, y)
   Chrome.cursor(math.floor(x / 8), math.floor(y / 8))
 end
 
+-- PokegearRadio_Init's tile $08 at `depixel 4, 10, 4, 4`, three rows deep
+-- (data/sprite_anims/oam.asm:588), x = knob (pokegear.asm:1355).
+function Pokegear:drawTuningKnob()
+  self:loadArrowSheet()
+  if not (self.arrow and self.arrow:available()) then return end
+  local row = self:currentStation()
+  local tx = (72 + (row and row.knob or 0)) / 8
+  self.arrow:draw(0x08, tx, 1)
+  self.arrow:draw(0x08, tx, 2)
+  self.arrow:draw(0x08, tx, 3)
+end
+
 function Pokegear:drawRadio()
   self:ensureTuned()
   self:drawTilemap(self.gfx and self.gfx.cards and self.gfx.cards.radio)
   self:drawStrip()
+  self:drawTuningKnob()
   local station = self:currentStation()
   -- UpdateRadioStation prints the tuned channel's name at (2,9).  Dead air
   -- prints nothing: NoRadioStation clears the box and leaves it clear.
@@ -2203,13 +2212,13 @@ function Pokegear:drawPlain()
   if id == "clock" then
     local hour, minute, weekday = self:clockParts()
     Chrome.box(1, 5, 18, 7)
-    Chrome.print(DAYS[weekday] or "DAY", 3, 7)
+    Chrome.print(Clock.weekdayName(weekday) or "DAY", 3, 7)
     local display = hour % 12
     if display == 0 then display = 12 end
     Chrome.print(("%s:%s %s"):format(
       Chrome.number(display, 2), Chrome.number(minute, 2, true),
       hour < 12 and "AM" or "PM"), 5, 9)
-    Chrome.print(Palettes.clockDaytime(hour), 5, 11)
+    Chrome.print(Clock.daytimeLabel(hour), 5, 11)
   elseif id == "radio" then
     -- Without the gear sheet there is no dial art, so the frequencies go down
     -- the screen as a list.  A frequency whose test failed still gets a row:

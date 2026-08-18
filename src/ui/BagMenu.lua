@@ -4,6 +4,7 @@
 
 local ItemEffects = require("src.inventory.ItemEffects")
 local ListMenu = require("src.ui.ListMenu")
+local Runtime = require("src.mods.Runtime")
 local TextBox = require("src.render.TextBox")
 
 local BagMenu = {}
@@ -46,7 +47,16 @@ end
 -- the stack, so every exit that prints has to close it afterwards.  For
 -- every other item the picker popped itself first and closePicker's identity
 -- check makes it a no-op (#252).
-local function useOn(game, battle, id, target, list, moveIndex, picker)
+--
+-- Every result string used to fall through to this one unconditional
+-- function with no seam around it: a mod could not suppress a message,
+-- delay it behind a screen of its own, or replace the outcome for one item
+-- id.  The "item.use" hook wraps the whole dispatch (not a name per
+-- result -- a mod deciding what a Poké Doll or a stone does needs the
+-- SAME reach a vanilla `if result == ...` branch has, not a narrower one),
+-- the way "battle.overlay" and "ui.party.submenu" already wrap a
+-- screen's own default behavior elsewhere in src/ui.
+local function vanillaUseOn(game, battle, id, target, list, moveIndex, picker)
   local result, payload, extra = ItemEffects.use(game.data, game.save, id, target,
                                                  battle, moveIndex, game.overworld)
   local function closePicker()
@@ -290,7 +300,7 @@ local function useOn(game, battle, id, target, list, moveIndex, picker)
     end
     list.index = math.min(list.index, math.max(1, #list.items))
     if extra and extra.evolveTo then
-      list:close()
+      -- engine/menus/start_sub_menus.asm:408 .useItem_partyMenu
       local Evolution = require("src.pokemon.Evolution")
       -- item_effects.asm ItemUseEvoStone sets wForceEvolution before
       -- TryEvolvingMon, so a stone evolution's B press is read and
@@ -375,6 +385,11 @@ local function useOn(game, battle, id, target, list, moveIndex, picker)
   showMessages(game, payload, closePicker) -- failed
 end
 
+local function useOn(game, battle, id, target, list, moveIndex, picker)
+  return Runtime.call("item.use", vanillaUseOn,
+    game, battle, id, target, list, moveIndex, picker)
+end
+
 local function pickTargetAndUse(game, battle, id, list)
   -- pick a target from the party
   -- the ETHERs and PP UP open the move menu after picking a mon
@@ -413,11 +428,12 @@ local function pickTargetAndUse(game, battle, id, list)
   -- TM/HM: open the party menu in Gen 1's TM/HM display mode so each mon
   -- shows ABLE / NOT ABLE from its learnset and the prompt reads "Use TM on
   -- which POKeMON?" (engine/items/item_effects.asm ItemUseTMHM ->
-  -- party_menu.asm TM/HM type). Stones and other pickOnly items keep the
-  -- plain HP layout (Gen 1 shows no ABLE/NOT ABLE for them), so gate
-  -- strictly on def.machine. #210
+  -- party_menu.asm TM/HM type). #210  Stones get the same ABLE / NOT ABLE
+  -- column: ItemUseEvoStone sets EVO_STONE_PARTY_MENU (party_menu.asm:114).
   if def and def.machine then
     opts.tmhm = { move = def.machine.move, kind = def.machine.kind }
+  elseif ItemEffects.isStone(id) then
+    opts.evoStone = id
   end
   require("src.ui.Screens").push(game, "PartyMenu", opts)
 end

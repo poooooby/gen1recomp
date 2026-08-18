@@ -26,6 +26,7 @@ local NAME_DELAYS = { FAST = 1, MID = 3, SLOW = 5 }
 -- up over the still-visible text (YesNoChoicePokeCenter and friends);
 -- the box then closes and choice(yes) runs instead of onDone.
 -- opts.defaultNo starts the cursor on NO.
+-- opts.choiceLabels / opts.choiceBox: data/yes_no_menu_strings.asm:16
 -- opts.auto: texts with no `prompt` (a text_asm/text_end tail, like
 -- _UsedStrengthText) never wait for a button: once the last page has
 -- typed out, auto.sound() runs (returning an audio source blocks like
@@ -51,6 +52,9 @@ function TextBox.new(game, text, onDone, opts)
   self.choice = opts and opts.choice
   self.defaultNo = opts and opts.defaultNo
   self.choiceNoSound = opts and opts.noSound
+  self.choiceLabels = opts and opts.choiceLabels
+  self.choiceBox = opts and opts.choiceBox
+  self.money = opts and opts.money
   self.auto = opts and opts.auto
   self.stay = opts and opts.stay
   -- opts.instant: put the LAST page up already typed, with no typewriter and
@@ -339,6 +343,7 @@ function TextBox:update(dt)
           self.game.stack:pop() -- this text box, under the choice
           self.choice(yes)
         end, { defaultNo = self.defaultNo, noSound = self.choiceNoSound,
+               labels = self.choiceLabels, box = self.choiceBox,
                -- this box is anchored below it; the pair moves together
                anchor = "bottom" }))
       end
@@ -466,6 +471,14 @@ function TextBox:draw()
       Font.drawCode(code, pen, y)
       pen = pen + Font.advanceOf(code)
     end
+  end
+  if self.money then
+    -- money box (engine/menus/text_box.asm:130): DisplayMoneyBox at
+    -- hlcoord 11,0, the amount right-aligned on its middle row
+    Font.drawBox(11, 0, 9, 3)
+    love.graphics.setColor(0, 0, 0, 1)
+    local money = ("¥%d"):format(self.money() or 0)
+    Font.draw(money, 152 - Font.width(money), 8)
   end
   if (self.waiting or (self.done and not self.choice and not self.auto
                        and not self.stay))

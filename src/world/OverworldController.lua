@@ -9,6 +9,7 @@ local Collision = require("src.world.Collision")
 local Encounter = require("src.world.Encounter")
 local FieldDefaults = require("src.world.FieldDefaults")
 local GameVersion = require("src.core.GameVersion")
+local GameViewport = require("src.render.GameViewport")
 local Logger = require("src.core.Logger")
 local Map = require("src.world.Map")
 local MapLoader = require("src.world.MapLoader")
@@ -19,6 +20,7 @@ local Player = require("src.world.Player")
 local Runtime = require("src.mods.Runtime")
 local Screens = require("src.ui.Screens")
 local ScriptRunner = require("src.script.ScriptRunner")
+local Theme = require("src.ui.Theme")
 local Tilt = require("src.render.Tilt")
 local TextBox = require("src.render.TextBox")
 local Transition = require("src.render.Transition")
@@ -327,6 +329,10 @@ function OverworldState:setMap(mapId, x, y, facing, opts)
     MapLoader.invalidateAll()
   end
   self.map = MapLoader.load(Game.data, mapId)
+  -- EnterMap -> ClearVariablesOnEnterMap zeroes wStepCounter
+  -- (engine/overworld/clear_variables.asm:7), but a connection crossing
+  -- never reaches EnterMap (home/overworld.asm:675 .loadNewMap)
+  if not (opts and opts.seamless) then Game.save.poisonSteps = 0 end
   -- STRENGTH deactivates on every real map load (home/overworld.asm
   -- EnterMap -> ResetUsingStrengthOutOfBattleBit clears BIT_STRENGTH_ACTIVE
   -- of wStatusFlags1).  setMap is the single choke point for every map-id
@@ -827,6 +833,23 @@ function OverworldState:useStrengthFieldMove(mon, onClose)
   return true
 end
 
+function OverworldState:useSoftboiledFieldMove(user, target)
+  local heal = user and user.stats and math.floor(user.stats.hp / 5) or 0
+  if not user or not user.stats or not target or not target.stats
+      or target == user or target.hp <= 0
+      or target.hp >= target.stats.hp or user.hp <= heal then
+    Game.stack:push(TextBox.new(Game, Strings("It won't have\nany effect.")))
+    return false
+  end
+  user.hp = user.hp - heal
+  target.hp = math.min(target.stats.hp, target.hp + heal)
+  require("src.core.Sound").play(Game.data, "Heal_HP")
+  local def = Game.data.pokemon[target.species]
+  Game.stack:push(TextBox.new(Game,
+    Strings("%s's HP\nwas restored!", target.nickname or def.name)))
+  return true
+end
+
 -- The battle transition's dungeon wipe uses the explicit map lists in
 -- data/maps/dungeon_maps.asm (field.dungeonTransitionMaps): singles plus
 -- inclusive map-id ranges -- faithful to the original's omissions
@@ -1091,6 +1114,13 @@ function OverworldState:update(dt)
     end
   end
 
+  -- EnterMapAnim's .done tail re-enables the companion once the swoop or the
+  -- spin-down has landed (player_animations.asm:40)
+  if self.pikachuWarpHidden and not (self.flyAnim or self.flyArrive
+      or self.teleportOut or self.transitioning or self.player.spinning) then
+    self:showPikachuAfterWarp()
+  end
+
   -- Dig/Teleport/Escape-Rope departure spin (beginTeleportOut).  The sprite
   -- spins UP out of the map before the fade (player_animations.asm
   -- _LeaveMapAnim -> PlayerSpinWhileMovingUp + SFX_TELEPORT_EXIT_1), the
@@ -1172,7 +1202,9 @@ function OverworldState:update(dt)
                or self.engaging or self.emote or self.teleportOut
                or self.flyAnim or self.flyArrive
   end
-  if not scripted and not self.transitioning then
+  -- a scriptMove's onDone can push a text box on the frame it retires, and
+  -- DisplayTextID owns the loop from there (home/text_script.asm:3)
+  if not scripted and not self.transitioning and Game.stack:top() == self then
     self:handleInput()
   end
 
@@ -1698,6 +1730,28 @@ function OverworldState:syncSurfingPikachu()
   p.surfingPikachu = mon ~= nil and mon.species == "PIKACHU" or false
 end
 
+-- _LeaveMapAnim drops the companion's sprite before the animation starts and
+-- EnterMapAnim only puts it back once landed -- home/pikachu.asm:1, :10
+function OverworldState:hidePikachuForWarp()
+  self.pikachuWarpHidden = true
+  require("src.world.PikachuFollower").setVisible(self, false)
+end
+
+function OverworldState:showPikachuAfterWarp()
+  self.pikachuWarpHidden = nil
+  self.pikachuTrail = { x = self.player.cellX, y = self.player.cellY }
+  local Follower = require("src.world.PikachuFollower")
+  local npc = Follower.current(self)
+  if npc then
+    npc.cellX, npc.cellY = self.player.cellX, self.player.cellY
+    npc.px, npc.py = npc.cellX * 16, npc.cellY * 16
+    npc.targetX, npc.targetY = nil, nil
+    npc.goalX, npc.goalY = nil, nil
+    npc.moving = false
+  end
+  Follower.setVisible(self, true)
+end
+
 -- The rejection loop shared by the Good and Super Rods
 -- (item_effects.asm ItemUseGoodRod .RandomLoop / ReadSuperRodData): an
 -- odd random byte is no bite; otherwise a 2-bit pick rerolls until it
@@ -1804,6 +1858,7 @@ function OverworldState:flyTo(mapId)
   Game.save.forcedBike = nil -- HandleFlyWarpOrDungeonWarp res BIT_ALWAYS_ON_BIKE
   self.player.surfing = false
   self:syncSurfingPikachu()
+  self:hidePikachuForWarp()
   -- _LeaveMapAnim .flyAnimation: the bird flaps in place (8 x Delay3),
   -- then SFX_FLY and the up-right path, a 40-frame beat off screen, and
   -- the exit over the top-left -- the warp fades only once the bird is
@@ -1834,6 +1889,7 @@ function OverworldState:beginTeleportOut(onDone)
   require("src.core.Sound").play(Game.data, "Teleport_Exit1")
   self.player.surfing = false
   self:syncSurfingPikachu()
+  self:hidePikachuForWarp()
   self.player.inputLocked = true
   -- rising spin: the mirror of the arrival spin-drop set in startWarpTo, so
   -- spinRise lifts the sprite (Player:pose) while spinFrames counts down
@@ -1969,8 +2025,11 @@ function OverworldState:tryBookshelf(fx, fy)
     return true
   end
   if entry.screen then
-    -- Blue's house shelf opens the TOWN MAP (TownMapText)
-    pcall(Screens.push, Game, entry.screen)
+    -- engine/events/hidden_events/town_map.asm:1
+    Game.stack:push(TextBox.new(Game,
+      t[entry.text] or t._TownMapText
+      or romText(Game.data, "_TownMapText", "A TOWN MAP."),
+      function() pcall(Screens.push, Game, entry.screen) end))
     return true
   end
   local kind = entry.kind
@@ -2136,14 +2195,17 @@ function OverworldState:tryHiddenObject(fx, fy)
   for _, h in ipairs(extras.pcTiles[self.map.id] or {}) do
     if h.x == fx and h.y == fy and (not h.facing or h.facing == facing) then
       if self.map.id == "REDS_HOUSE_2F" then
-        -- The player's bedroom PC is the one location in Red/Blue whose PC
-        -- callback is OpenRedsPC (engine/events/hidden_objects/players_pc.asm),
-        -- which runs the PlayerPC predef directly -- item storage, no
-        -- SOMEONE'S/BILL'S PC main menu (DisplayPCMainMenu).  Every other
-        -- pcTile is a Pokémon Center-style PC that shows the multi-PC menu. (#228)
+        -- OpenRedsPC (engine/events/hidden_objects/players_pc.asm) runs the
+        -- PlayerPC predef directly, no DisplayPCMainMenu (#228)
         require("src.core.Sound").play(Game.data, "Turn_On_PC")
-        -- direct access: ExitPlayerPC rings SFX_TURN_OFF_PC (players_pc.asm, #960)
-        Screens.push(Game, "PlayerPC", { direct = true })
+        -- engine/menus/players_pc.asm:16
+        Game.stack:push(TextBox.new(Game,
+          (Game.data.text or {})._TurnedOnPC2Text
+          or romText(Game.data, "_TurnedOnPC2Text", "{PLAYER} turned on\nthe PC."),
+          function()
+            -- direct access: ExitPlayerPC rings SFX_TURN_OFF_PC (players_pc.asm, #960)
+            Screens.push(Game, "PlayerPC", { direct = true })
+          end, { instant = true }))
       else
         self:openPC()
       end
@@ -2892,13 +2954,16 @@ function OverworldState:openPC(onDone)
     done()
   end
   table.insert(items, { label = Strings("LOG OFF"), onSelect = logOff })
-  -- pokered sets BIT_NO_MENU_BUTTON_SOUND for the whole PC session
-  -- (engine/overworld/pokecenter_pc.asm / player_pc.asm); DisplayPCMainMenu
-  -- calls TextBoxBorder with c=14 (interior width, +2 for the border), so
-  -- tw here (total width) is 16
-  Game.stack:push(Menu.new(Game, items,
+  -- BIT_NO_MENU_BUTTON_SOUND for the whole PC session; DisplayPCMainMenu's
+  -- TextBoxBorder c=14 interior -> tw 16 (engine/overworld/pokecenter_pc.asm)
+  local menu = Menu.new(Game, items,
     { tx = 0, ty = 0, tw = 16, th = #items * 2 + 2, onCancel = logOff,
-      noSound = true }))
+      noSound = true })
+  -- engine/menus/pc.asm:5
+  Game.stack:push(TextBox.new(Game,
+    (Game.data.text or {})._TurnedOnPC1Text
+    or romText(Game.data, "_TurnedOnPC1Text", "{PLAYER} turned on\nthe PC."),
+    function() Game.stack:push(menu) end))
 end
 
 -- The PROF. OAK's PC session (engine/menus/oaks_pc.asm OpenOaksPC): the
@@ -3018,6 +3083,7 @@ function OverworldState:nurseHeal(onDone, npc)
   end
   -- Yellow's companion has its own beat threaded through this sequence
   local Follower = require("src.world.PikachuFollower")
+  -- YesNoChoicePokeCenter draws HEAL/CANCEL, not YES/NO (home/yes_no.asm:21)
   Game.stack:push(TextBox.new(Game, hello, nil, { choice = function(yes)
     if not yes then
       Game.stack:push(TextBox.new(Game, bye, onDone))
@@ -3066,7 +3132,7 @@ function OverworldState:nurseHeal(onDone, npc)
         end
       end))
     end)
-  end }))
+  end, choiceLabels = { "HEAL", "CANCEL" }, choiceBox = Theme.healCancelBox }))
 end
 
 -- pokecenter.asm bows the nurse between the two PrintText calls (#995)
@@ -3081,9 +3147,12 @@ function OverworldState:finishNurseHeal(bye, onDone, npc)
       end))
     end
     if not npc then farewell() return end
-    npc.frameOverride = 3
+    -- engine/events/pokecenter.asm:36-39; Yellow's walk-down pose when the
+    -- sheet has it (pokeyellow engine/events/pokecenter.asm:82-88)
+    local yellow = GameVersion.isYellow()
+    npc.frameOverride = (yellow and npc.sprite.frames[3]) and 3 or 1
     -- bubble = false is the silent world hold, this port's DelayFrames
-    self.emote = { npc = npc, frames = 20, bubble = false, onDone = function()
+    self.emote = { npc = npc, frames = yellow and 40 or 20, bubble = false, onDone = function()
       npc.frameOverride = nil
       npc:facePlayer(self.player)
       farewell()
@@ -4231,6 +4300,9 @@ end
 -- battle is optional; when given, Oak's Lab OPP_RIVAL1 losses skip the
 -- blackout (pret HandlePlayerBlackOut) so the map script can HealParty.
 function OverworldState:afterBattle(result, battle)
+  -- .battleOccurred tail-jumps to EnterMap (home/overworld.asm:353), so
+  -- ClearVariablesOnEnterMap zeroes wStepCounter on every battle return
+  Game.save.poisonSteps = 0
   if battle and battle.kind == "wild" then
     self.wildEncounterGraceSteps = WILD_ENCOUNTER_GRACE_STEPS
   end
@@ -4496,6 +4568,11 @@ function OverworldState:startWarpTo(mapId, x, y, facing, onDone, opts)
     -- down, so the player is never drawable mid-fade nor standing bare on the
     -- landing frame (#916)
     self.playerHidden = false
+    -- setMap respawned a follower under the player; _LeaveMapAnim's Func_1510
+    -- suppression runs until EnterMapAnim lands (home/pikachu.asm:1)
+    if self.pikachuWarpHidden then
+      require("src.world.PikachuFollower").setVisible(self, false)
+    end
     -- The warp we land ON stays inert for the completed-step check until we
     -- physically step off it, so a warp whose destination cell is itself a
     -- warp cannot bounce us straight back (elevator cars, stacked stair/door
@@ -5119,7 +5196,7 @@ function OverworldState:drawWorld()
     -- point projects under the pipeline's own camera.  That is the direct
     -- analogue of what :billboard does for tilt, and it keeps exactly one
     -- copy of every effect: the closures above are the ones that run.
-    local pw, ph = love.graphics.getDimensions()
+    local pw, ph = GameViewport.dimensions()
     local pscale = Zoom.scale(Game.renderer:fitScale())
     local ctx = {
       state = self, cam = cam, vw = vw, vh = vh, bgY = bgY,

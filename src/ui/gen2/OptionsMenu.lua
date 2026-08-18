@@ -134,6 +134,19 @@ local ROWS = {
     text = function(options)
       return require("src.render.Zoom").offsetLabel(options.zoom or 0)
     end },
+  -- VOID FILL: FADE is each map's own border block with the dissolve across
+  -- a boundary; WATER / TREES force one outdoor block; BLACK is a flat void.
+  -- #1418.  Same key the Gen 1 OPTION screen uses, different ladder (FADE
+  -- is Gold's default because that is already what the maps call for).
+  { label = "VOID FILL", key = "voidFill", port = true,
+    cycle = function(options, delta)
+      local BorderFill = require("src.world.gen2.BorderFill")
+      BorderFill.setVoidFill(options.voidFill or "fade")
+      options.voidFill = BorderFill.cycle(delta)
+    end,
+    text = function(options)
+      return require("src.world.gen2.BorderFill").voidFillLabel(options.voidFill)
+    end },
   { label = "TILT", key = "tilt", port = true,
     cycle = function(options, delta)
       local Tilt = require("src.render.Tilt")
@@ -172,6 +185,17 @@ local ROWS = {
     text = function(options)
       return require("src.render.GBCFX").levelLabel(options.gbcfx or 0)
     end },
+  { label = "VIDEO MODE", key = "videoMode", port = true,
+    cycle = function(options, delta)
+      local VideoMode = require("src.core.VideoMode")
+      options.videoMode = VideoMode.cycle(options.videoMode, delta)
+      VideoMode.apply(options.videoMode)
+    end,
+    text = function(options)
+      local VideoMode = require("src.core.VideoMode")
+      return VideoMode.normalize(options.videoMode) == "borderless"
+        and "FULL" or "WINDOWED"
+    end },
   { id = "touchControls", label = "TOUCH PAD", port = true,
     text = function(options)
       local tc = options.touchControls
@@ -199,6 +223,15 @@ local ROWS = {
       TC:applyOptions(options)
       TC.buzz(options.haptics)
       if game and game.persistOptions then game:persistOptions() end
+    end },
+  { label = "MAX FPS", key = "fpsCap", port = true,
+    cycle = function(options, delta)
+      local FrameCap = require("src.core.FrameCap")
+      options.fpsCap = FrameCap.cycle(options.fpsCap, delta)
+      FrameCap.apply(options.fpsCap)
+    end,
+    text = function(options)
+      return require("src.core.FrameCap").label(options.fpsCap)
     end },
   { label = "CANCEL", cancel = true },
 }

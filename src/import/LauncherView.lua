@@ -776,6 +776,26 @@ end
 
 -- A hand-drawn X / check: the UI font has no guaranteed glyph for either,
 -- and the launcher ships no icon asset for them.
+-- Skins tab glyph: a bezel with a screen cutout and two face buttons, drawn
+-- rather than shipped as art so the tab needs no new asset.
+local function drawSkinGlyph(x, y, w, h, hot)
+  local box = math.min(w, h)
+  local bx = x + (w - box) / 2
+  local by = y + (h - box) / 2
+  local pad = math.floor(box * 0.22)
+  local ow, oh = box - 2 * pad, box - 2 * pad
+  local ink = hot and PAL.inverse or PAL.ink
+  local a = 1
+  Theme.strokeRounded(bx + pad, by + pad, ow, oh, ink, a,
+    math.max(1, math.floor(Kit.scale)), math.floor(oh * 0.22))
+  local sw, sh = ow * 0.58, oh * 0.40
+  Theme.fillRounded(bx + pad + ow * 0.10, by + pad + oh * 0.14, sw, sh, ink, a,
+    math.max(1, math.floor(sh * 0.2)))
+  local r = math.max(1, oh * 0.09)
+  Theme.fillRounded(bx + pad + ow * 0.60, by + pad + oh * 0.64, r * 2, r * 2, ink, a, r)
+  Theme.fillRounded(bx + pad + ow * 0.80, by + pad + oh * 0.50, r * 2, r * 2, ink, a, r)
+end
+
 local function drawCross(x, y, size, color)
   love.graphics.push("all")
   love.graphics.setColor(color)
@@ -807,17 +827,45 @@ end
 -- frame.  Their tab rows, opts tables and action closures are built once
 -- instead of 60 times a second -- only `active`, `image` and the queued
 -- action are written per frame.
+-- The four cartridges used to be four tabs of their own.  They are one
+-- dropdown now: the tab row was seven controls wide and wrapped to two rows on
+-- anything narrow, and only ever one game is being looked at.
+local GAME_TABS = {
+  { id = "red",    key = "tab-red",    letter = "R", color = PAL.railRed,
+    label = "Red" },
+  { id = "blue",   key = "tab-blue",   letter = "B", color = PAL.railBlue,
+    label = "Blue" },
+  { id = "yellow", key = "tab-yellow", letter = "Y", color = PAL.railGold,
+    label = "Yellow" },
+  { id = "gold",   key = "tab-gold",   letter = "G", color = PAL.railAmber,
+    label = "Gold" },
+}
+
 local HEADER_TABS = {
-  { id = "red",    key = "tab-red",    letter = "R", color = PAL.railRed },
-  { id = "blue",   key = "tab-blue",   letter = "B", color = PAL.railBlue },
-  { id = "yellow", key = "tab-yellow", letter = "Y", color = PAL.railGold },
-  { id = "gold",   key = "tab-gold",   letter = "G", color = PAL.railAmber },
   { id = "mods",   key = "tab-mods" },
   { id = "find",   key = "tab-find" },
+  { id = "skins",  key = "tab-skins", glyph = true },
 }
 for _, t in ipairs(HEADER_TABS) do
   t.opts = { face = "tab", font = "tab", color = t.color, letter = t.letter }
+  if t.glyph then t.opts.drawFn = drawSkinGlyph end
 end
+
+-- Which cartridge the dropdown is showing: the open game tab, else the last
+-- one visited, else Red.  Kept as a function so the mods/find/skins panels
+-- still answer "for which game" without a game tab being open.
+local function currentGame(imp)
+  for _, g in ipairs(GAME_TABS) do
+    if imp.tab == g.id then return g end
+  end
+  for _, g in ipairs(GAME_TABS) do
+    if imp.modScope == g.id then return g end
+  end
+  return GAME_TABS[1]
+end
+
+LauncherView.GAME_TABS = GAME_TABS
+LauncherView.currentGame = currentGame
 
 local QUIT_INK_HOT = { 0, 0, 0, 1 }
 local QUIT_INK_REST = { 1, 1, 1, 0.85 }
@@ -837,10 +885,26 @@ local function headerChrome(imp)
           hot and QUIT_INK_HOT or QUIT_INK_REST)
       end },
     tab = {},
+    game = { face = "tab", font = "tab",
+      action = function()
+        local g = currentGame(imp)
+        if imp.tab == g.id then
+          imp._gamePopup = true
+        else
+          imp:_switchTab(g.id)
+        end
+      end },
   }
   for _, t in ipairs(HEADER_TABS) do
     local id = t.id
     c.tab[id] = function() imp:_switchTab(id) end
+  end
+  for _, g in ipairs(GAME_TABS) do
+    local id = g.id
+    c.tab[id] = function()
+      imp._gamePopup = nil
+      imp:_switchTab(id)
+    end
   end
   imp._headerChrome = c
   return c
@@ -927,7 +991,10 @@ local function buildHeader(imp, m)
   -- bright cart gold; Gold (Gen 2) uses the deeper amber so the two do not
   -- collide.
   local tabs = HEADER_TABS
-  tabs[5].icon, tabs[6].icon = imp._modsIcon, imp._findIcon
+  for _, t in ipairs(tabs) do
+    if t.id == "mods" then t.icon = imp._modsIcon end
+    if t.id == "find" then t.icon = imp._findIcon end
+  end
   local tabH = m.chip
   local tx = m.x + m.pad
   local ty = y + math.floor(6 * m.s)
@@ -935,6 +1002,40 @@ local function buildHeader(imp, m)
   local tabRight = m.x + m.w - m.pad
   local tabGap = math.floor(6 * m.s)
   local tabRowGap = math.floor(4 * m.s)
+
+  -- the cartridge dropdown, sized to its longest label so switching games
+  -- never reflows the row
+  local chrome0 = headerChrome(imp)
+  local game = currentGame(imp)
+  local labelW = 0
+  for _, g in ipairs(GAME_TABS) do
+    labelW = math.max(labelW, Kit.textWidth("tab", Strings(g.label)))
+  end
+  local dropW = math.min(tabRight - tabLeft,
+    tabH + labelW + math.floor(34 * m.s))
+  chrome0.game.color = game.color
+  chrome0.game.letter = game.letter
+  chrome0.game.active = imp.tab == game.id
+  local gameHot = Kit.hover(tx, ty, dropW, tabH)
+  local gameDown = gameHot and Kit.mouseDown
+  -- face "tab" inverts on hover as well as when active, so the caret has to
+  -- flip with it or it vanishes into the cartridge colour
+  local gameInvert = chrome0.game.active or gameHot
+  chrome0.game.ring = gameHot and not chrome0.game.active or nil
+  btn(imp, tx, ty, dropW, tabH, "tab-game", Strings(game.label), chrome0.game)
+  do
+    local cw = math.floor(7 * m.s)
+    local ccx = tx + dropW - math.floor(14 * m.s)
+    local ccy = ty + tabH / 2 + (gameDown and math.floor(1 * m.s) or 0)
+    if love.graphics.polygon then
+      Theme.col(gameInvert and PAL.inverse or PAL.ink, gameDown and 1 or 0.9)
+      love.graphics.polygon("fill",
+        ccx - cw, ccy - cw * 0.5, ccx + cw, ccy - cw * 0.5, ccx, ccy + cw * 0.8)
+      love.graphics.setColor(1, 1, 1, 1)
+    end
+  end
+  tx = tx + dropW + tabGap
+
   for _, t in ipairs(tabs) do
     local w = tabH
     if tx > tabLeft and tx + w > tabRight then
@@ -979,7 +1080,7 @@ function LauncherView._updateControl(imp)
   end
   -- idle / uptodate / error: offer a manual check, with no glow.
   return status, Strings("Check for updates"),
-    function() pcall(imp.Check.start) end, false
+    function() pcall(imp.Check.start, true) end, false
 end
 
 -- ------------------------------------------------------------ game panel
@@ -1525,13 +1626,17 @@ end
 -- The persisted sort choice both mod panels share.  The chooser itself is a
 -- popup (buildSortModal); panels just read the current key and offer a
 -- "Sort" button, which is what freed the chip row's two lines of space.
-local function sortDefs()
-  return {
+local function sortDefs(scope)
+  local defs = {
     { key = "name", label = Strings("Name") },
-    { key = "popularity", label = Strings("Popularity") },
-    { key = "release", label = Strings("Release date") },
-    { key = "updated", label = Strings("Last updated") },
+    { key = "popularity", label = Strings("Most downloaded") },
   }
+  if scope == "find" then
+    defs[#defs + 1] = { key = "trending", label = Strings("Trending") }
+  end
+  defs[#defs + 1] = { key = "release", label = Strings("Release date") }
+  defs[#defs + 1] = { key = "updated", label = Strings("Last updated") }
+  return defs
 end
 
 -- Sorting is decorate-sort-undecorate: the key is computed once per entry
@@ -1583,7 +1688,7 @@ local function sortCacheOk(cache, src, key, rev, pending)
   return pending and (Kit.time - (cache.at or 0)) < RESORT_DEBOUNCE
 end
 
-local function currentSort(imp)
+local function currentSort(imp, scope)
   local sortKey = imp.modSort
   if sortKey == nil then
     local ok, opts = pcall(require("src.core.SaveData").loadOptions)
@@ -1593,6 +1698,7 @@ local function currentSort(imp)
     sortKey = sortKey or "popularity"
     imp.modSort = sortKey
   end
+  if sortKey == "trending" and scope ~= "find" then return "popularity" end
   return sortKey
 end
 
@@ -1659,7 +1765,7 @@ local function buildModsPanel(imp, x, y, w, availH, m)
         action = function() imp:_syncModUpdateInfo(true) end })
       btn(imp, place(sortW), cy, sortW, bh, "mods-sort", Strings("Sort"), {
         font = "small",
-        action = function() imp._sortPopup = true end })
+        action = function() imp._sortPopup = "mods" end })
     elseif medReq <= w then
       -- Tier 2 (Medium / Compact): Surface Import, Updates, and Sort directly
       btn(imp, place(importW), cy, importW, bh, "mods-import", importLabel, {
@@ -1670,7 +1776,7 @@ local function buildModsPanel(imp, x, y, w, availH, m)
         action = function() imp:_syncModUpdateInfo(true) end })
       btn(imp, place(sortW), cy, sortW, bh, "mods-sort", Strings("Sort"), {
         font = "small",
-        action = function() imp._sortPopup = true end })
+        action = function() imp._sortPopup = "mods" end })
       btn(imp, place(moreW), cy, moreW, bh, "mods-more-actions", Strings("More..."), {
         font = "small",
         action = function() imp._modHeaderActionsPopup = true end })
@@ -1686,7 +1792,7 @@ local function buildModsPanel(imp, x, y, w, availH, m)
         action = function() imp:chooseMod() end })
       btn(imp, place(sortW), cy, sortW, bh, "mods-sort", Strings("Sort"), {
         font = "small",
-        action = function() imp._sortPopup = true end })
+        action = function() imp._sortPopup = "mods" end })
       btn(imp, place(moreW), cy, moreW, bh, "mods-more-actions", Strings("More..."), {
         font = "small",
         action = function() imp._modHeaderActionsPopup = true end })
@@ -1718,7 +1824,7 @@ local function buildModsPanel(imp, x, y, w, availH, m)
     return
   end
 
-  local sortKey = currentSort(imp)
+  local sortKey = currentSort(imp, "mods")
 
   -- Immediate mode paints this panel every frame; re-sorting the whole list
   -- per frame (with lowercased-string allocations in the comparator) fed the
@@ -1909,6 +2015,157 @@ end
 
 -- ---------------------------------------------------------- find mods panel
 
+-- SKINS tab: pick the on-screen skin, import one, or open the desktop studio.
+local function buildSkinsPanel(imp, x, y, w, availH, m)
+  local skins = imp:_ensureSkins()
+  local active = imp:_activeSkin()
+  local gap = m.gap
+  local cy = y
+
+  local title = Strings("Skins/Borders")
+  local bh = m.btnH
+  local importLabel = imp:_skinsImportButtonLabel()
+  local importW = Kit.textWidth("small", importLabel) + math.floor(24 * m.s)
+  if Kit.textWidth("button", title) + importW + math.floor(24 * m.s) > w then
+    importLabel = Strings("Import")
+    importW = Kit.textWidth("small", importLabel) + math.floor(20 * m.s)
+  end
+  local place = Layout.rightCluster(x, w, math.floor(6 * m.s))
+  btn(imp, place(importW), cy, importW, bh, "skins-import", importLabel, {
+    kind = "accent", font = "small",
+    action = function() imp:chooseSkin() end })
+  Kit.text("button", Kit.ellipsize("button", title,
+    math.max(0, w - importW - math.floor(12 * m.s))), x,
+    cy + math.floor((bh - Kit.textHeight("button")) / 2), PAL.heading)
+  cy = cy + bh + math.floor(8 * m.s)
+
+  if imp._skinNotice then
+    cy = cy + Kit.textWrapped("small", imp._skinNotice.text, x, cy, w,
+      imp._skinNotice.ok and PAL.green or PAL.red, 2) + math.floor(8 * m.s)
+  end
+
+  -- Studio button.  Desktop only: the host supplies the hook nowhere else.
+  if imp.onOpenSkinStudio then
+    local label = Strings("Open Skin Studio")
+    local bw = math.min(w, Kit.textWidth("small", label) + math.floor(40 * m.s))
+    btn(imp, x, cy, bw, m.btnH, "skins-studio", label, {
+      kind = "accent", font = "small",
+      action = function()
+        -- the studio boots the game on Play, so hand it a real cartridge
+        imp.onOpenSkinStudio(imp.modScope or "red")
+      end })
+    local hint = Strings("Design bezels and button layouts, then test them.")
+    Kit.text("small", Kit.ellipsize("small", hint,
+      w - bw - math.floor(12 * m.s)), x + bw + math.floor(12 * m.s),
+      cy + math.floor((m.btnH - Kit.textHeight("small")) / 2), PAL.muted)
+    cy = cy + m.btnH + gap
+  end
+
+  Kit.caption(x, cy, Strings("INSTALLED"))
+  cy = cy + Kit.textHeight("small") + math.floor(6 * m.s)
+
+  local rowH = math.max(Kit.tapMin(), math.floor(44 * m.s))
+  imp._skinGear = imp._skinGear
+    or love.graphics.newImage("assets/launcher/gear.png")
+
+  -- The row itself is "use this skin"; the gear beside it configures that
+  -- entry -- the built-in pad opens the drag-a-button layout editor, a skin
+  -- opens the studio, so neither lands on a screen that cannot edit it.
+  local function skinRow(key, id, title, detail, selected, configure)
+    local gearW = configure and rowH or 0
+    local rowW = w - (gearW > 0 and (gearW + math.floor(6 * m.s)) or 0)
+    local ink = rowHit(imp, x, cy, rowW, rowH, selected, key,
+      function() imp:_useSkin(id) end)
+    local tagW = selected
+      and (Kit.textWidth("small", Strings("IN USE")) + math.floor(20 * m.s))
+      or math.floor(12 * m.s)
+    local textW = rowW - math.floor(24 * m.s) - tagW
+    local tx = x + math.floor(12 * m.s)
+    local ty = cy + math.floor(7 * m.s)
+    Kit.text("mono", Kit.ellipsize("mono", title, textW), tx, ty,
+      ink or PAL.heading)
+    Kit.text("small", Kit.ellipsize("small", detail, textW),
+      tx, ty + Kit.textHeight("mono"), ink or PAL.muted)
+    if selected then
+      Kit.textRight("small", Strings("IN USE"), x + rowW - math.floor(12 * m.s),
+        cy + math.floor((rowH - Kit.textHeight("small")) / 2), ink or PAL.green)
+    end
+    if configure then
+      btn(imp, x + w - gearW, cy, gearW, gearW, key .. "-cfg", "", {
+        face = "invert", image = imp._skinGear, action = configure })
+    end
+    cy = cy + rowH + math.floor(4 * m.s)
+  end
+
+  local entries = { false }
+  for _, entry in ipairs(skins) do entries[#entries + 1] = entry end
+
+  local TouchSkin = require("src.core.TouchSkin")
+  local hint = Strings(
+    "You can also drop a skin .zip on this window, or put a folder in %s/ of your save directory. RetroArch overlay .cfg files work as-is.",
+    TouchSkin.USER_ROOT)
+  local hintH = Kit.wrapHeight("small", hint, w, 3)
+  local importH = math.floor(10 * m.s) + hintH
+
+  local rowGap = math.floor(4 * m.s)
+  local pagerH = math.max(Kit.tapMin(), math.floor(30 * m.s))
+  local listTop = cy
+  local listH = availH - (cy - y) - importH
+  local perPage = Kit.rowsThatFit(listH, rowH, rowGap, 1, 20)
+  if #entries > perPage then
+    perPage = Kit.rowsThatFit(listH - pagerH - gap, rowH, rowGap, 1, 20)
+  end
+  local first, last, cur, pages = Kit.pageBounds(page(imp, "skins"),
+    #entries, perPage)
+  setPage(imp, "skins", cur)
+  setPage(imp, "skins",
+    Kit.wheelPage(x, listTop, w, listH, cur, #entries, perPage))
+
+  for i = first, last do
+    local entry = entries[i]
+    if not entry then
+      skinRow("skin-none", nil, Strings("Built-in pad"),
+        Strings("The default on-screen buttons."), active == nil,
+        imp.onEditTouchControls and function()
+          imp.onEditTouchControls(imp.modScope or "red")
+        end or nil)
+    else
+      local bits = {}
+      bits[#bits + 1] = entry.source == "user" and Strings("installed")
+        or Strings("bundled")
+      if entry.controls > 0 then
+        bits[#bits + 1] = entry.controls .. " " .. Strings("buttons")
+      else
+        bits[#bits + 1] = Strings("bezel only")
+      end
+      if entry.pages > 1 then
+        bits[#bits + 1] = entry.pages .. " " .. Strings("pages")
+      end
+      if entry.screen then bits[#bits + 1] = Strings("screen cutout") end
+      local configure = imp.onOpenSkinStudio and function()
+        imp.onOpenSkinStudio(imp.modScope or "red", entry.id)
+      end or nil
+      skinRow("skin-" .. entry.id, entry.id, entry.id,
+        table.concat(bits, "  \194\183  "), active == entry.id, configure)
+    end
+  end
+
+  if #skins == 0 then
+    Kit.emptyBox(x, cy, w, math.floor(72 * m.s),
+      Strings("No skins installed yet."))
+    cy = cy + math.floor(72 * m.s) + gap
+  end
+
+  if pages > 1 then
+    setPage(imp, "skins",
+      Kit.pager(x, cy, w, cur, #entries, perPage, "skins"))
+    cy = cy + pagerH + gap
+  end
+
+  cy = cy + math.floor(10 * m.s)
+  Kit.textWrapped("small", hint, x, cy, w, PAL.muted, 3)
+end
+
 local function buildFindPanel(imp, x, y, w, availH, m)
   imp:_ensureFind()
   imp:_ensureMods()
@@ -1958,7 +2215,7 @@ local function buildFindPanel(imp, x, y, w, availH, m)
   local sw = Kit.textWidth("small", Strings("Sort")) + math.floor(20 * m.s)
   btn(imp, place(sw), cy, sw, fieldH, "find-sort", Strings("Sort"), {
     font = "small",
-    action = function() imp._sortPopup = true end })
+    action = function() imp._sortPopup = "find" end })
   -- The Filter button carries its state: blue while a category is active,
   -- so a filtered-down list never reads as "the index shrank".
   local fw = Kit.textWidth("small", Strings("Filter")) + math.floor(20 * m.s)
@@ -1978,7 +2235,7 @@ local function buildFindPanel(imp, x, y, w, availH, m)
     return
   end
 
-  local sortKey = currentSort(imp)
+  local sortKey = currentSort(imp, "find")
 
   -- Same caching rule as the MODS tab: the comparator allocates, so only
   -- re-sort when the inputs actually change.
@@ -1997,6 +2254,7 @@ local function buildFindPanel(imp, x, y, w, availH, m)
         -- fetch for every entry in the index (see _findStatsCached).
         local stats = imp:_findStatsCached(entry)
         if sortKey == "popularity" then return stats and stats.total or -1 end
+        if sortKey == "trending" then return stats and stats.recent or -1 end
         if sortKey == "release" then return stats and stats.first or "0000-00-00" end
         return stats and stats.latest or "0000-00-00"
       end,
@@ -2084,13 +2342,14 @@ local function buildFindPanel(imp, x, y, w, availH, m)
       bx, ly, PAL.heading)
     local by2 = ly + Kit.textHeight("button") + math.floor(4 * m.s)
     -- meta and stats on one line, the download count first (and green)
-    -- because it is what the default Popularity sort is ordering by: a
+    -- because it is what the default Most-downloaded sort is ordering by: a
     -- narrow window ellipsizes the tail, and the count must survive that.
     local stats = imp:_findStats(entry)
     local baseCol = note and PAL.green or PAL.detail
     local lead = "v" .. tostring(ModIndex.displayVersion(entry))
     if note then lead = lead .. "  -  " .. note end
-    local dl = stats and ModUpdate.downloadsLine(stats.total) or nil
+    local dl = stats and ModUpdate.downloadsShort(stats.total) or nil
+    local hasCount = stats ~= nil and stats.total ~= nil
     local dates = stats and ModUpdate.datesLine(stats.first, stats.latest)
       or nil
     local rest = {}
@@ -2100,11 +2359,13 @@ local function buildFindPanel(imp, x, y, w, availH, m)
     end
     if dates then
       rest[#rest + 1] = dates
-    elseif not dl and (entry.summary or "") ~= "" then
+    elseif not hasCount and (entry.summary or "") ~= "" then
       rest[#rest + 1] = entry.summary
     end
     local segs = { { lead, baseCol } }
-    if dl then segs[#segs + 1] = { "  -  " .. dl, PAL.green } end
+    if dl then
+      segs[#segs + 1] = { "  -  " .. dl, hasCount and PAL.green or PAL.faint }
+    end
     if #rest > 0 then
       segs[#segs + 1] = { "  -  " .. table.concat(rest, "  -  "), baseCol }
     end
@@ -2692,7 +2953,7 @@ local function buildModHeaderActionsModal(imp, m)
     { label = Strings("Check for updates"), action = function() imp:_syncModUpdateInfo(true) end },
     { label = Strings("Enable all mods"), kind = "good", action = function() imp:_setAllMods(true) end },
     { label = Strings("Disable all mods"), kind = "warn", action = function() imp:_setAllMods(false) end },
-    { label = Strings("Sort mods..."), action = function() imp._sortPopup = true end },
+    { label = Strings("Sort mods..."), action = function() imp._sortPopup = "mods" end },
   }
   local h = pad + Kit.textHeight("button") + math.floor(12 * m.s)
     + #btns * (m.btnH + gap) + m.btnH + pad
@@ -2720,7 +2981,8 @@ end
 -- Sort chooser, shared by the MODS and FIND MODS tabs (they share the
 -- persisted key, so one popup serves both).
 local function buildSortModal(imp, m)
-  local defs = sortDefs()
+  local scope = imp._sortPopup
+  local defs = sortDefs(scope)
   local pad = math.floor(18 * m.s)
   local w = math.floor(360 * m.s)
   local gap = math.floor(8 * m.s)
@@ -2730,7 +2992,7 @@ local function buildSortModal(imp, m)
   local cy = py + pad
   Kit.text("button", Strings("Sort by"), px + pad, cy, PAL.heading)
   cy = cy + Kit.textHeight("button") + math.floor(12 * m.s)
-  local cur = currentSort(imp)
+  local cur = currentSort(imp, scope)
   for _, s in ipairs(defs) do
     local key = s.key
     btn(imp, px + pad, cy, pw - 2 * pad, m.btnH, "sortpop-" .. key, s.label, {
@@ -2778,6 +3040,32 @@ local function buildModScopeModal(imp, m)
   btn(imp, px + pad, cy, pw - 2 * pad, m.btnH, "scopepop-close",
     Strings("Close"), { font = "small",
       action = function() imp._modScopePopup = nil end })
+end
+
+-- The cartridge dropdown's list.  Replaces the four R/B/Y/G tabs, so it is
+-- also what a controller reaches after the tab row.
+local function buildGameModal(imp, m)
+  local pad = math.floor(18 * m.s)
+  local gap = math.floor(8 * m.s)
+  local w = math.floor(360 * m.s)
+  local h = pad + Kit.textHeight("button") + math.floor(12 * m.s)
+    + #GAME_TABS * (m.btnH + gap) + m.btnH + pad
+  local px, py, pw = modalPanel(m, w, h)
+  local cy = py + pad
+  Kit.text("button", Strings("Choose game"), px + pad, cy, PAL.heading)
+  cy = cy + Kit.textHeight("button") + math.floor(12 * m.s)
+  local chrome = headerChrome(imp)
+  for _, g in ipairs(GAME_TABS) do
+    btn(imp, px + pad, cy, pw - 2 * pad, m.btnH, "gamepop-" .. g.id,
+      Strings(g.label), {
+        face = "tab", font = "small", letter = g.letter, color = g.color,
+        active = imp.tab == g.id,
+        action = chrome.tab[g.id] })
+    cy = cy + m.btnH + gap
+  end
+  btn(imp, px + pad, cy, pw - 2 * pad, m.btnH, "gamepop-close",
+    Strings("Close"), { font = "small",
+      action = function() imp._gamePopup = nil end })
 end
 
 -- Category filter for FIND MODS.  Two columns, because an index can list
@@ -3084,25 +3372,43 @@ local function buildFindEntryModal(imp, m)
   local gap = math.floor(8 * m.s)
   local nBtns = 3  -- install row, details/source row, close row
   local noteH = note and (Kit.textHeight("small") + math.floor(4 * m.s)) or 0
+  local stats = imp:_findStats(entry)
+  local trend = {}
+  local trendLine = stats and ModUpdate.trendingLine(stats.recent, stats.windowDays)
+  if trendLine then trend[#trend + 1] = trendLine end
+  if stats and stats.asOf then
+    trend[#trend + 1] = Strings("counts approximate, as of %s",
+      tostring(stats.asOf):match("^%d%d%d%d%-%d%d%-%d%d") or stats.asOf)
+  end
+  trend = (#trend > 0) and table.concat(trend, "  -  ") or nil
+  local trendH = trend and (Kit.textHeight("small") + math.floor(2 * m.s)) or 0
   local h = pad + Kit.textHeight("button") + math.floor(4 * m.s)
-    + Kit.textHeight("small") + noteH + math.floor(12 * m.s)
+    + Kit.textHeight("small") + trendH + noteH + math.floor(12 * m.s)
     + nBtns * (m.btnH + gap) - gap + pad
   local px, py, pw = modalPanel(m, w, h)
   local cy = py + pad
   Kit.text("button", Kit.ellipsize("button", entry.title or entry.id,
     pw - 2 * pad), px + pad, cy, PAL.heading)
   cy = cy + Kit.textHeight("button") + math.floor(4 * m.s)
-  local stats = imp:_findStats(entry)
   local lead = "v" .. tostring(ModIndex.displayVersion(entry))
   if entry.author then lead = lead .. "  -  " .. entry.author end
   if entry.categories and entry.categories[1] then
     lead = lead .. "  -  " .. entry.categories[1]
   end
-  local dl = stats and ModUpdate.downloadsLine(stats.total) or nil
+  local dl = stats and ModUpdate.downloadsShort(stats.total) or nil
+  local hasCount = stats ~= nil and stats.total ~= nil
   local segs = { { lead, PAL.detail } }
-  if dl then segs[#segs + 1] = { "  -  " .. dl, PAL.green } end
+  if dl then
+    segs[#segs + 1] = { "  -  " .. dl, hasCount and PAL.green or PAL.faint }
+  end
   segLine("small", segs, px + pad, cy, pw - 2 * pad)
   cy = cy + Kit.textHeight("small")
+  if trend then
+    cy = cy + math.floor(2 * m.s)
+    Kit.text("small", Kit.ellipsize("small", trend, pw - 2 * pad),
+      px + pad, cy, PAL.muted)
+    cy = cy + Kit.textHeight("small")
+  end
   if note then
     cy = cy + math.floor(4 * m.s)
     Kit.text("small", note, px + pad, cy, PAL.green)
@@ -3612,6 +3918,7 @@ local function modalUp(imp)
     or imp._appPatchNotes
     or imp._findDetails or imp._modVersions or imp._modDepResolver or imp._sortPopup
     or imp._filterPopup or imp._modScopePopup or imp._indexManage
+    or imp._gamePopup
     or imp._modActions or imp._modImports
     or imp._modHeaderActionsPopup or imp._profilesPopup or imp._singleProfileActions or imp._profileSavePrompt
     or imp._profileRenamePrompt or imp._findEntry or imp._gameManage) ~= nil
@@ -3753,6 +4060,7 @@ local function buildModals(imp, m)
   if imp._profilesPopup then buildProfilesModal(imp, m) return true end
   if imp._modHeaderActionsPopup then buildModHeaderActionsModal(imp, m) return true end
   if imp._sortPopup then buildSortModal(imp, m) return true end
+  if imp._gamePopup then buildGameModal(imp, m) return true end
   if imp._modScopePopup then buildModScopeModal(imp, m) return true end
   if imp._filterPopup then buildFilterModal(imp, m) return true end
   if imp._indexManage then buildIndexesModal(imp, m) return true end
@@ -3906,6 +4214,8 @@ function LauncherView.draw(imp)
     buildModsPanel(imp, x, contentY, w, availH, m)
   elseif imp.tab == "find" then
     buildFindPanel(imp, x, contentY, w, availH, m)
+  elseif imp.tab == "skins" then
+    buildSkinsPanel(imp, x, contentY, w, availH, m)
   else
     buildGamePanel(imp, x, contentY, w, availH, m, imp.tab)
   end

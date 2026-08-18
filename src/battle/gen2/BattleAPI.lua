@@ -39,6 +39,21 @@ local function messageCopy(screen)
   return #lines > 0 and lines or nil
 end
 
+local function itemCopies(game, screen, catchable)
+  local out = {}
+  for id, count in pairs((game.save and game.save.inventory) or {}) do
+    local def = game.data.items and game.data.items[id]
+    if count > 0 and def and def.pocket == "BALL" then
+      out[#out + 1] = { id = id, name = def.name or id, count = count,
+        ball = true, needsTarget = false,
+        catchChance = catchable and screen.catchChance
+          and screen:catchChance(id) or nil }
+    end
+  end
+  table.sort(out, function(a, b) return a.name < b.name end)
+  return out
+end
+
 local function signature(game, screen, top)
   if not screen then return "none" end
   local battle = screen.battle or {}
@@ -55,6 +70,9 @@ local function signature(game, screen, top)
     parts[#parts + 1] = tostring(mon)
     parts[#parts + 1] = tostring(mon.hp)
     parts[#parts + 1] = tostring(mon.status)
+  end
+  for _, item in ipairs(itemCopies(game, screen, false)) do
+    parts[#parts + 1] = item.id .. "=" .. tostring(item.count)
   end
   return table.concat(parts, "|")
 end
@@ -111,9 +129,62 @@ function BattleAPI:snapshot()
     player = monCopy(game.data, battle.player, true),
     enemy = monCopy(game.data, battle.enemy, true),
     party = party, moves = moveCopies(game, battle),
-    -- Gold's PACK is pocketed and target selection is screen-owned.  Omit it
-    -- until the engine can expose the same semantic item records as Gen 1.
-    items = {} }
+    -- Targeted medicine remains screen-owned, but balls are complete semantic
+    -- records and can safely expose the same read-only preview as Gen 1.
+    items = itemCopies(game, screen, battle.wild and not screen.tutorial) }
+end
+
+local MENU_CHOICES = { fight = true, party = true, item = true, run = true }
+
+local function validSlot(slot)
+  return type(slot) == "number" and slot % 1 == 0 and slot >= 1
+end
+
+function BattleAPI:submit(intent)
+  if type(intent) ~= "table" then return nil, "intent must be a table" end
+  if type(intent.id) ~= "number" or intent.id % 1 ~= 0 or intent.id < 1 then
+    return nil, "intent id must be a positive integer"
+  end
+  if self.lastIntentId and intent.id <= self.lastIntentId then
+    return nil, "replayed intent"
+  end
+
+  local screen, top = activeBattle(self.game)
+  if not screen or not screen.battle then return nil, "no battle" end
+  if intent.revision ~= self:_revision(screen, top) then
+    return nil, "stale battle context"
+  end
+  if screen.tutorial then return nil, "battle kind is not controllable" end
+  if top ~= screen then return nil, "battle menu is covered" end
+
+  local battle = screen.battle
+  local ok, err
+  if intent.kind == "menu" then
+    if screen.phase ~= "menu" then return nil, "battle menu is not active" end
+    if not MENU_CHOICES[intent.choice] then
+      return nil, "unknown battle menu choice"
+    end
+    ok, err = screen:chooseMenu(intent.choice)
+  elseif intent.kind == "move" then
+    if screen.phase ~= "moves" then return nil, "move menu is not active" end
+    if screen.moveSwapIndex then return nil, "move reorder is active" end
+    local move = validSlot(intent.slot) and battle.player
+      and battle.player.moves and battle.player.moves[intent.slot]
+    if not move then return nil, "invalid move slot" end
+    if (move.pp or 0) <= 0 then return nil, "move has no PP" end
+    if battle:moveDisabled(battle.player, move.id) then
+      return nil, "move is disabled"
+    end
+    ok, err = screen:chooseMove(intent.slot)
+  elseif intent.kind == "back" then
+    ok, err = screen:cancelMove()
+  else
+    return nil, "unknown battle intent"
+  end
+  if not ok then return nil, err end
+  self.lastIntentId = intent.id
+  self.signature = nil
+  return true
 end
 
 return BattleAPI

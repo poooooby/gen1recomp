@@ -122,6 +122,17 @@ local function addTouchRows(rows, add, opts, hooks)
       end,
     }
   end
+
+  if hooks and hooks.openSkinStudio then
+    rows[#rows + 1] = {
+      label = Strings("SKIN STUDIO"),
+      actionLabel = Strings("Open"),
+      action = function()
+        hooks.openSkinStudio()
+        return false
+      end,
+    }
+  end
 end
 
 local function coreRows(opts, hooks)
@@ -138,15 +149,72 @@ local function coreRows(opts, hooks)
     ladder(opts, "battleStyle",
       { { "shift", "SHIFT" }, { "set", "SET" } }, "shift"))
   add(Strings("BATTLE LAYOUT"),
-    ladder(opts, "battleLayout",
-      { { "og", "OG" }, { "wide", "WIDE" } }, "og"))
+    function()
+      return opts.battleLayout == "wide" and Strings("WIDE") or Strings("OG")
+    end,
+    function()
+      opts.battleLayout = opts.battleLayout == "wide" and "og" or "wide"
+      if opts.battleLayout ~= "wide" then
+        opts.battleHud = "standard"
+      elseif opts.battleFit == "fill" and opts.battleHud == "extended" then
+        opts.battleBg = "white"
+      end
+      return true
+    end)
   add(Strings("BATTLE SIZE"),
-    ladder(opts, "battleFit",
-      { { "fixed", "FIXED" }, { "fill", "FILL" } }, "fixed"))
+    function()
+      return opts.battleFit == "fill" and Strings("FILL") or Strings("FIXED")
+    end,
+    function()
+      opts.battleFit = opts.battleFit == "fill" and "fixed" or "fill"
+      if opts.battleFit == "fill" and opts.battleLayout == "wide"
+         and opts.battleHud == "extended" then
+        opts.battleBg = "white"
+      end
+      return true
+    end)
+  add(Strings("BATTLE HUD"),
+    function()
+      return opts.battleLayout == "wide" and opts.battleHud == "extended"
+             and Strings("EXTENDED")
+             or Strings("STANDARD")
+    end,
+    function()
+      if opts.battleLayout ~= "wide" then
+        opts.battleHud = "standard"
+        return false
+      end
+      opts.battleHud = opts.battleHud == "extended" and "standard" or "extended"
+      if opts.battleHud == "extended" and opts.battleFit == "fill" then
+        opts.battleBg = "white"
+      end
+      return true
+    end)
   add(Strings("BATTLE BG"),
-    ladder(opts, "battleBg",
-      { { "white", "WHITE" }, { "black", "BLACK" }, { "world", "WORLD" } },
-      "white"))
+    function()
+      if opts.battleLayout == "wide" and opts.battleFit == "fill"
+         and opts.battleHud == "extended" then
+        opts.battleBg = "white"
+        return Strings("AUTO")
+      end
+      if opts.battleBg == "black" then return Strings("BLACK") end
+      if opts.battleBg == "world" then return Strings("WORLD") end
+      return Strings("WHITE")
+    end,
+    function(dir)
+      if opts.battleLayout == "wide" and opts.battleFit == "fill"
+         and opts.battleHud == "extended" then
+        opts.battleBg = "white"
+        return false
+      end
+      local order = { "white", "black", "world" }
+      local cur = 1
+      for i, mode in ipairs(order) do
+        if opts.battleBg == mode then cur = i break end
+      end
+      opts.battleBg = order[wrapIndex(cur - 1 + (dir or 1), #order) + 1]
+      return true
+    end)
   add(Strings("UI LAYOUT"),
     ladder(opts, "uiLayout",
       { { "centered", "CENTERED" }, { "dynamic", "DYNAMIC" } }, "centered"))
@@ -461,9 +529,9 @@ end
 -- Gold reads NONE of the rows above.  Its OPTION screen writes a different
 -- set of names, several of which collide with Gen 1's at a different TYPE
 -- (battleStyle "SHIFT" vs "shift", textSpeed a label vs a frame delay), and
--- its renderer has no battle layout, no SGB palette packs and no void fill --
--- so a gear opened on the Gold tab used to offer a dozen controls that did
--- nothing and hide the seven that the cart itself has.
+-- its renderer has no battle layout and no SGB palette packs -- so a gear
+-- opened on the Gold tab used to offer a dozen controls that did nothing
+-- and hide the seven that the cart itself has.
 --
 -- The block lives in options.lua under `gold`, which is exactly where
 -- src/core/gen2/Save.lua loadOptions reads it, so an edit here is live on the
@@ -549,6 +617,21 @@ local function gen2Rows(opts, hooks)
       end)
   end
 
+  local okFill, BorderFill = pcall(require, "src.world.gen2.BorderFill")
+  if okFill and BorderFill.VOID_FILLS then
+    add(Strings("VOID FILL"),
+      function() return BorderFill.voidFillLabel(opts.voidFill) end,
+      function(dir)
+        local modes = BorderFill.VOID_FILLS
+        local cur, idx = opts.voidFill or "fade", 1
+        for i, m in ipairs(modes) do
+          if m == cur then idx = i break end
+        end
+        opts.voidFill = modes[wrapIndex(idx - 1 + dir, #modes) + 1]
+        return true
+      end)
+  end
+
   -- Same #136 gate as the Gen 1 row and the in-game one.
   local okFx, GBCFX = pcall(require, "src.render.GBCFX")
   if okFx and GBCFX.isSupported() then
@@ -556,6 +639,26 @@ local function gen2Rows(opts, hooks)
       function() return GBCFX.levelLabel(opts.gbcfx or 0) end,
       function(dir)
         opts.gbcfx = wrapIndex((opts.gbcfx or 0) + dir, 5)
+        return true
+      end)
+  end
+
+  local okVm, VideoMode = pcall(require, "src.core.VideoMode")
+  if okVm then
+    add(Strings("VIDEO MODE"),
+      function() return VideoMode.modeLabel(opts.videoMode) end,
+      function(dir)
+        opts.videoMode = VideoMode.cycle(opts.videoMode, dir)
+        return true
+      end)
+  end
+
+  local okCap, FrameCap = pcall(require, "src.core.FrameCap")
+  if okCap then
+    add(Strings("MAX FPS"),
+      function() return FrameCap.label(opts.fpsCap) end,
+      function(dir)
+        opts.fpsCap = FrameCap.cycle(opts.fpsCap, dir)
         return true
       end)
   end
@@ -571,6 +674,7 @@ end
 -- writes options while a modal covers it, so the cached table stays true.
 -- `hooks` carries the host actions a row cannot perform itself:
 --   editTouchControls()  -- hand the screen to the touch-overlay editor
+--   openSkinStudio()     -- hand the screen to the desktop skin studio
 --
 -- `version` is the game the gear was opened on.  It picks the row set, and
 -- for Gold it also picks WHICH table the rows edit: the `gold` block inside
