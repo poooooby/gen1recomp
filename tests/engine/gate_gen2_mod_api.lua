@@ -23,6 +23,7 @@ T.eq(GameVersion.generation("red"), 1, "Red is Gen 1")
 T.eq(GameVersion.generation("blue"), 1, "Blue is Gen 1")
 T.eq(GameVersion.generation("yellow"), 1, "Yellow is Gen 1")
 T.eq(GameVersion.generation("gold"), 2, "Gold is Gen 2")
+T.eq(GameVersion.generation("silver"), 2, "Silver is Gen 2")
 
 -- ------- 2. manifest: gen2compat is opt-in and defaults off
 
@@ -397,7 +398,8 @@ local GEN2_HOOKS = {
   "world.tod", "map.palette", "fieldmove.eligibility",
   -- menus and the battle intro
   "ui.start_menu.items", "ui.title_menu.items", "ui.options.rows",
-  "ui.party.submenu", "ui.naming.grid", "ui.pc.items", "ui.list_menu",
+  "ui.party.submenu", "ui.party.grid_navigation", "ui.naming.grid",
+  "ui.pc.items", "ui.list_menu",
   "transition.style",
   -- battle
   "battle.damage", "battle.crit", "battle.accuracy", "battle.turn_order",

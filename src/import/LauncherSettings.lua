@@ -422,7 +422,7 @@ local function discoverModSchemas(opts)
         -- except experimental mods, which stay off until opted in.
         local flag = require("src.core.SaveData").modEnabled(opts, m.id)
         local enabled = flag == true or (flag == nil and not m.experimental)
-        if enabled then
+        if enabled and not SaveData.isSafeMode(opts) then
           local chunk = fs.load(path .. "/" .. m.options_schema)
           if chunk then
             local okR, schema = pcall(chunk)
@@ -521,6 +521,23 @@ local function modRows(opts, mod)
         return true
       end }
   end
+  for _, row in ipairs(rows) do
+    row.safeModeBlocked = true
+    if row.step then
+      local step = row.step
+      row.step = function(dir)
+        if SaveData.isSafeMode(opts) then return false end
+        return step(dir)
+      end
+    end
+    if row.setText then
+      local setText = row.setText
+      row.setText = function(text)
+        if SaveData.isSafeMode(opts) then return false end
+        return setText(text)
+      end
+    end
+  end
   return rows
 end
 
@@ -533,9 +550,10 @@ end
 -- opened on the Gold tab used to offer a dozen controls that did nothing
 -- and hide the seven that the cart itself has.
 --
--- The block lives in options.lua under `gold`, which is exactly where
--- src/core/gen2/Save.lua loadOptions reads it, so an edit here is live on the
--- next boot the same way a Gen 1 edit is.  Ladders mirror
+-- The block lives in options.lua under `gold` (the historical key; Gold and
+-- Silver share it the way the Gen 1 games share the flat namespace), which is
+-- exactly where src/core/gen2/Save.lua loadOptions reads it, so an edit here
+-- is live on the next boot the same way a Gen 1 edit is.  Ladders mirror
 -- src/ui/gen2/OptionsMenu.lua's ROWS; when editing one, keep the two in sync.
 local GEN2_KEY = "gold"
 
@@ -682,7 +700,9 @@ end
 function LauncherSettings.open(hooks, version)
   local opts = SaveData.loadOptions()
   local sections
-  if version == "gold" then
+  local GameVersion = require("src.core.GameVersion")
+  if GameVersion.VERSIONS[version]
+      and GameVersion.generation(version) == 2 then
     local block = opts[GEN2_KEY]
     if type(block) ~= "table" then
       block = {}

@@ -11,11 +11,11 @@ Features intentionally added beyond the original Pokémon Red, Blue, and Yellow 
 * **Persistent custom options** stored separately from game saves
 * **Optional widescreen battle layout**
 * **Mobile touch controls** with editable layouts, vibration, and orientation settings
-* **Touch skins** in RetroArch overlay format, with bezel art, per-button press states, and Super Game Boy borders
+* **Touch skins** in RetroArch overlay format and Delta `.deltaskin` (including PDF-wrapped bezel art), with per-button press states and Super Game Boy borders
 * **Pokédex diploma and printer image exports**
-* **Mod download counts** from the index feed, with Most-downloaded and Trending sorts
 
 ## Gen 2 Specifics
 
+* **Pokémon Silver** as an importable, launcher-selectable version alongside Gold
 * **Mod manager** with Gen 1 mod adapters, per-game targeting, and `modkit gen2check`
 * **Followers** for mods, plus Gen 2-only registries and hooks

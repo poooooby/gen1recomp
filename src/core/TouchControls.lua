@@ -218,7 +218,7 @@ function TouchControls.defaultLayout(ww, wh, ox, oy, scale)
   local ssW = dpadW * 0.30
   local margin = dpadW * 0.12
   local ok, GameVersion = pcall(require, "src.core.GameVersion")
-  if ok and GameVersion.isGold and GameVersion.isGold() then
+  if ok and GameVersion.generation and GameVersion.generation() == 2 then
     margin = math.max(margin, math.min(ww * 0.10, 72))
   end
   return {
@@ -616,13 +616,15 @@ local function exitControl(self, ctl)
   for _, action in ipairs(ctl.hotkeys) do fireHotkey(self, action, false, ctl) end
 end
 
-function skinHitSet(self, x, y)
+function skinHitSet(self, x, y, prev)
   local page = TouchSkin.page()
   if not page then return nil end
   local ww, wh, ox, oy = surfaceRect()
   local set = nil
   for _, ctl in ipairs(page.controls) do
-    if not ctl.decorative and TouchSkin.hits(page, ctl, ww, wh, x, y, ox, oy) then
+    local held = (prev and prev[ctl]) == true
+    if not ctl.decorative
+       and TouchSkin.hits(page, ctl, ww, wh, x, y, ox, oy, held) then
       set = set or {}
       set[ctl] = true
     end
@@ -665,7 +667,7 @@ function TouchControls:touchpressed(id, x, y)
     return
   end
   if TouchSkin.active then
-    local set = skinHitSet(self, x, y)
+    local set = skinHitSet(self, x, y, nil)
     if not set then return end
     local touch = { control = "skin" }
     self.touches[id] = touch
@@ -698,7 +700,7 @@ function TouchControls:touchmoved(id, x, y)
   local touch = self.touches[id]
   if not touch then return end
   if touch.control == "skin" then
-    applySkinSet(self, touch, skinHitSet(self, x, y))
+    applySkinSet(self, touch, skinHitSet(self, x, y, touch.set))
     return
   end
   -- only the d-pad tracks movement (slide between directions without

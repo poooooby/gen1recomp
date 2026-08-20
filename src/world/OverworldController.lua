@@ -9,7 +9,6 @@ local Collision = require("src.world.Collision")
 local Encounter = require("src.world.Encounter")
 local FieldDefaults = require("src.world.FieldDefaults")
 local GameVersion = require("src.core.GameVersion")
-local GameViewport = require("src.render.GameViewport")
 local Logger = require("src.core.Logger")
 local Map = require("src.world.Map")
 local MapLoader = require("src.world.MapLoader")
@@ -538,6 +537,15 @@ function OverworldState:setMap(mapId, x, y, facing, opts)
   -- Route22Gate_Script rewrites wLastMap from the player's Y on entry
   -- too (not only on step), so a save/load mid-gate keeps exits correct
   if not (opts and opts.checkpoint) then self:syncLastMapRewrite() end
+  -- home/overworld.asm:1821 (JoypadOverworld runs RunMapScript every frame);
+  -- scripts/Route16Gate1F.asm:16, Route5Gate.asm:19, Route22Gate.asm:21
+  if opts and opts.freshBoot and not opts.checkpoint then
+    local standing = mapScripts and mapScripts.get(mapId)
+    if not (standing and standing.onStep
+            and standing.onStep(Game, self, self.player.cellX, self.player.cellY)) then
+      self:checkBadgeGate()
+    end
+  end
 end
 
 -- Neighbor maps drawn at the composed connection offsets: at least the
@@ -2911,7 +2919,15 @@ function OverworldState:openPC(onDone)
     keepOpen = true,
     onSelect = function()
       require("src.core.Sound").play(Game.data, "Enter_PC")
-      Screens.push(Game, "BoxMenu")
+      -- engine/menus/pc.asm:73 BillsPC prints the access text before the farcall
+      local accessed = metBill
+        and romText(Game.data, "_AccessedBillsPCText",
+          "Accessed BILL's\nPC.\fAccessed POKéMON\nStorage System.")
+        or romText(Game.data, "_AccessedSomeonesPCText",
+          "Accessed someone's\nPC.\fAccessed POKéMON\nStorage System.")
+      Game.stack:push(TextBox.new(Game, accessed, function()
+        Screens.push(Game, "BoxMenu")
+      end))
       done()
     end,
   })
@@ -2921,9 +2937,13 @@ function OverworldState:openPC(onDone)
     label = (Game.save.player.name or "RED") .. "'s PC",
     keepOpen = true,
     onSelect = function()
-      -- pc.asm .playersPC plays SFX_ENTER_PC before the farcall (#960)
+      -- pc.asm .playersPC plays SFX_ENTER_PC then prints AccessedMyPCText
+      -- before the farcall (engine/menus/pc.asm:54, #960)
       require("src.core.Sound").play(Game.data, "Enter_PC")
-      Screens.push(Game, "PlayerPC")
+      Game.stack:push(TextBox.new(Game,
+        romText(Game.data, "_AccessedMyPCText",
+          "Accessed my PC.\fAccessed Item\nStorage System."),
+        function() Screens.push(Game, "PlayerPC") end))
       done()
     end,
   })
@@ -5196,7 +5216,7 @@ function OverworldState:drawWorld()
     -- point projects under the pipeline's own camera.  That is the direct
     -- analogue of what :billboard does for tilt, and it keeps exactly one
     -- copy of every effect: the closures above are the ones that run.
-    local pw, ph = GameViewport.dimensions()
+    local _, _, pw, ph = Game.renderer:playfieldRect()
     local pscale = Zoom.scale(Game.renderer:fitScale())
     local ctx = {
       state = self, cam = cam, vw = vw, vh = vh, bgY = bgY,

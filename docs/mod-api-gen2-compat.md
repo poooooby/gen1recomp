@@ -55,9 +55,10 @@ The short version, for an author deciding what to write:
 ```
 
 `games` is an optional array of version ids (`"red"`, `"blue"`, `"yellow"`,
-`"gold"`), generations (`"gen1"`, `"gen2"`, case-insensitive) or `"all"`.
-`src/mods/ModTargets.lua` resolves the tokens off `GameVersion.ORDER` and
-`GameVersion.generation`, so nothing anywhere restates the game list.
+`"gold"`, `"silver"`), generations (`"gen1"`, `"gen2"`, case-insensitive) or
+`"all"`. `src/mods/ModTargets.lua` resolves the tokens off `GameVersion.ORDER`
+and `GameVersion.generation`, so nothing anywhere restates the game list.
+`"gen2"` now expands to both Gold and Silver.
 `Manifest.validate` stores the resolved, ORDER-sorted ids on `manifest.games`
 and **derives** `manifest.gen2compat` from them, which is the one field the
 loader's gate reads.
@@ -512,8 +513,9 @@ gains a field instead of the name gaining a prefix.
   id under Gen 1's `name` key, which is the one payload difference the
   numeric flag space forces.
 - *Menus (`src/ui/gen2/`):* `ui.start_menu.items`, `ui.title_menu.items`,
-  `ui.options.rows`, `ui.party.submenu`, `ui.naming.grid`, `ui.pc.items`,
-  `ui.list_menu`, `transition.style`. `ui.list_menu` covers Gold's script
+  `ui.options.rows`, `ui.party.submenu`, `ui.party.grid_navigation`,
+  `ui.naming.grid`, `ui.pc.items`, `ui.list_menu`, `transition.style`.
+  `ui.list_menu` covers Gold's script
   menus (`ScriptMenu.lua`); the `Chrome.List` widget the START and title
   menus draw with does not raise it yet, so those two are composed through
   their own hooks only.
