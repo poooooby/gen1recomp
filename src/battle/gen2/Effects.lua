@@ -12,6 +12,8 @@
 -- returns a value or a small table, which is what lets the tests drive them
 -- directly.
 
+local Strings = require("src.core.Strings")
+
 local Effects = {}
 
 -- --------------------------------------------------------------- stat stages
@@ -47,6 +49,20 @@ Effects.STAT_CHANGES = {
   EFFECT_SPEED_DOWN_2 = { "speed", -2, "foe" },
 }
 
+-- pokegold data/moves/effects.asm:187-352, :1488, :2068
+Effects.NO_CHECKHIT = {
+  EFFECT_ATTACK_UP = true,
+  EFFECT_DEFENSE_UP = true,
+  EFFECT_SP_ATK_UP = true,
+  EFFECT_EVASION_UP = true,
+  EFFECT_ATTACK_UP_2 = true,
+  EFFECT_DEFENSE_UP_2 = true,
+  EFFECT_SPEED_UP_2 = true,
+  EFFECT_SP_DEF_UP_2 = true,
+  EFFECT_DEFENSE_CURL = true,
+  EFFECT_CURSE = true,
+}
+
 -- The secondary versions, rolled against the move's effect chance after a hit.
 Effects.STAT_CHANGES_ON_HIT = {
   EFFECT_ATTACK_UP_HIT = { "attack", 1, "self" },
@@ -64,9 +80,11 @@ Effects.ALL_UP_STATS = {
 }
 
 Effects.STAT_NAMES = {
-  attack = "ATTACK", defense = "DEFENSE", speed = "SPEED",
-  specialAttack = "SPCL.ATK", specialDefense = "SPCL.DEF",
-  accuracy = "ACCURACY", evasion = "EVASION",
+  attack = Strings.source("ATTACK"), defense = Strings.source("DEFENSE"),
+  speed = Strings.source("SPEED"),
+  specialAttack = Strings.source("SPCL.ATK"),
+  specialDefense = Strings.source("SPCL.DEF"),
+  accuracy = Strings.source("ACCURACY"), evasion = Strings.source("EVASION"),
 }
 
 -- Stages clamp at ±6 (BattleCommand_StatUp's .CantRaise / .CantLower).
@@ -88,10 +106,17 @@ end
 -- BattleCommand_StatUpMessage / StatDownMessage: one stage is "rose"/"fell",
 -- two are "sharply rose" / "sharply fell".
 function Effects.stageMessage(name, stat, applied)
-  local label = Effects.STAT_NAMES[stat] or stat
-  local sharply = math.abs(applied) >= 2 and "sharply " or ""
-  local verb = applied > 0 and "rose" or "fell"
-  return ("%s's %s %s%s!"):format(name, label, sharply, verb)
+  local label = Strings(Effects.STAT_NAMES[stat] or stat)
+  if applied > 0 then
+    if math.abs(applied) >= 2 then
+      return Strings("%s's %s sharply rose!", name, label)
+    end
+    return Strings("%s's %s rose!", name, label)
+  end
+  if math.abs(applied) >= 2 then
+    return Strings("%s's %s sharply fell!", name, label)
+  end
+  return Strings("%s's %s fell!", name, label)
 end
 
 -- ------------------------------------------------------------------ hit count
@@ -156,11 +181,11 @@ Effects.DRAIN = {
 -- stores the move, turn two attacks.  Fly and Dig also make the user
 -- untargetable in between, which is the `semi-invulnerable` flag here.
 Effects.CHARGE = {
-  EFFECT_RAZOR_WIND = { text = "%s made a whirlwind!" },
-  EFFECT_SOLARBEAM = { text = "%s took in sunlight!" },
-  EFFECT_SKULL_BASH = { text = "%s lowered its head!" },
-  EFFECT_SKY_ATTACK = { text = "%s is glowing!" },
-  EFFECT_FLY = { text = "%s flew up high!", vanish = true },
+  EFFECT_RAZOR_WIND = { text = Strings.source("%s made a whirlwind!") },
+  EFFECT_SOLARBEAM = { text = Strings.source("%s took in sunlight!") },
+  EFFECT_SKULL_BASH = { text = Strings.source("%s lowered its head!") },
+  EFFECT_SKY_ATTACK = { text = Strings.source("%s is glowing!") },
+  EFFECT_FLY = { text = Strings.source("%s flew up high!"), vanish = true },
 }
 
 -- CheckHit's .FlyDigMoves (effect_commands.asm:1713-1746): a vanished target
@@ -267,7 +292,7 @@ Effects.MAGNITUDE_POWER = {
 -- power and the magnitude number the text prints.
 --
 -- `random` is BattleRandom (0..n-1).  If none is supplied, roll via love.math
--- / math.random — never hard-code 0 (that always yields Magnitude 4).
+-- / math.random -- never hard-code 0 (that always yields Magnitude 4).
 function Effects.magnitudePower(random)
   local roll
   if type(random) == "function" then
@@ -282,6 +307,14 @@ function Effects.magnitudePower(random)
   end
   local last = Effects.MAGNITUDE_POWER[#Effects.MAGNITUDE_POWER]
   return last[2], last[3]
+end
+
+-- engine/battle/move_effects/return.asm:1-24, frustration.asm:1-25
+function Effects.happinessPower(happiness, frustration)
+  local h = happiness or 0
+  if h < 0 then h = 0 elseif h > 255 then h = 255 end
+  if frustration then h = 255 - h end
+  return math.floor(h * 10 / 25)
 end
 
 -- ------------------------------------------------------------------- weather
@@ -300,21 +333,21 @@ Effects.WEATHER = {
 Effects.WEATHER_TURNS = 5
 
 Effects.WEATHER_START_TEXT = {
-  rain = "It started to rain!",
-  sun = "The sunlight got bright!",
-  sandstorm = "A sandstorm brewed!",
+  rain = Strings.source("It started to rain!"),
+  sun = Strings.source("The sunlight got bright!"),
+  sandstorm = Strings.source("A sandstorm brewed!"),
 }
 
 Effects.WEATHER_TURN_TEXT = {
-  rain = "Rain continues to fall.",
-  sun = "The sunlight is strong.",
-  sandstorm = "The sandstorm rages.",
+  rain = Strings.source("Rain continues to fall."),
+  sun = Strings.source("The sunlight is strong."),
+  sandstorm = Strings.source("The sandstorm rages."),
 }
 
 Effects.WEATHER_END_TEXT = {
-  rain = "The rain stopped.",
-  sun = "The sunlight faded.",
-  sandstorm = "The sandstorm subsided.",
+  rain = Strings.source("The rain stopped."),
+  sun = Strings.source("The sunlight faded."),
+  sandstorm = Strings.source("The sandstorm subsided."),
 }
 
 -- data/battle/weather_modifiers.asm pairs each weather with MORE_EFFECTIVE or
@@ -356,19 +389,38 @@ function Effects.sandstormHits(types)
   return true
 end
 
--- Morning Sun / Synthesis / Moonlight heal a HALF normally, and the weather
--- shifts that one step either way: x2 in sun, /2 in rain or sandstorm
--- (BattleCommand_Heal's .Weather block walks a multiplier index).
+-- BattleCommand_TimeBasedHealContinue's .Multipliers
+-- (engine/battle/effect_commands.asm:6450-6454).
+Effects.HEAL_MULTIPLIERS = { 1 / 8, 1 / 4, 1 / 2, 1 }
+
+-- wTimeOfDay (constants/ram_constants.asm:134-139): MORN_F 0, DAY_F 1,
+-- NITE_F 2, DARKNESS_F 3.
+Effects.TIME_OF_DAY_ID = { MORN = 0, DAY = 1, NITE = 2, DARK = 3 }
+
+-- Morning Sun / Synthesis / Moonlight and the wTimeOfDay each one wants
+-- (engine/battle/effect_commands.asm:6362-6371).
 Effects.SUN_HEAL = {
-  EFFECT_MORNING_SUN = true,
-  EFFECT_SYNTHESIS = true,
-  EFFECT_MOONLIGHT = true,
+  EFFECT_MORNING_SUN = 0,
+  EFFECT_SYNTHESIS = 1,
+  EFFECT_MOONLIGHT = 2,
 }
 
-function Effects.weatherHealFraction(weather)
-  if weather == "sun" then return 2 / 3 end
-  if weather == "rain" or weather == "sandstorm" then return 1 / 4 end
-  return 1 / 2
+function Effects.timeOfDayIndex(timeOfDay)
+  if type(timeOfDay) == "number" then return math.floor(timeOfDay) end
+  return Effects.TIME_OF_DAY_ID[timeOfDay]
+end
+
+-- engine/battle/effect_commands.asm:6388-6417: the index opens at a half, the
+-- wrong time of day steps it down, sun steps it up, rain and sandstorm down.
+function Effects.timeBasedHealFraction(weather, wants, timeOfDay)
+  local index = 3
+  local now = Effects.timeOfDayIndex(timeOfDay)
+  if wants ~= nil and now ~= nil and now ~= wants then index = index - 1 end
+  if weather then
+    index = index + 1
+    if weather ~= "sun" then index = index - 2 end
+  end
+  return Effects.HEAL_MULTIPLIERS[math.max(1, math.min(4, index))]
 end
 
 -- ---------------------------------------------------------------- Perish Song

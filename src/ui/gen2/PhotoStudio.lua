@@ -9,7 +9,7 @@
 -- then a second card (PrintPartyMonPage2, the mon's other three moves and
 -- its non-HP stats) goes out behind it.  There is no Game Boy Printer here
 -- -- same reason src/ui/gen2/UnownPrinter.lua takes its A press nowhere and
--- PrintDiploma is stubbed in Specials.lua
+-- PrintDiploma's own print goes nowhere
 -- -- so only page 1 is worth transcribing: it is the portrait itself, the
 -- part a player actually watches happen, while page 2 only ever existed as
 -- ink on a strip of thermal paper nobody in this port owns. H.PhotoStudio
@@ -202,8 +202,7 @@ function PhotoStudio:drawsWidescreen() return true end
 
 function PhotoStudio:drawWidescreen(winW, winH)
   local G = love.graphics
-  G.setColor(1, 1, 1, 1)
-  G.rectangle("fill", 0, 0, winW, winH)
+  Chrome.letterbox(winW, winH, 1, 1, 1)
   local scale = Chrome.fitScale(winW, winH)
   local ox, oy = Chrome.fitOrigin(winW, winH, scale)
   G.push()

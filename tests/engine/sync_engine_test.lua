@@ -94,20 +94,26 @@ do
   local eng, transport = engine({
     ["POST /sync/create"] = { code = 200, body =
       '{"account":"aa11","code1":"11112222","code2":"33334444","deviceToken":"tok"}' },
-  }, {}, SyncState.defaults())
+    ["GET /sync/state"] = { code = 200, body = '{"saves":{}}' },
+    ["PUT /sync/save"] = { code = 200, body = '{"ok":true,"rev":1}' },
+  }, { saveEntry("red", "abc", 500, 400) }, SyncState.defaults())
 
   T.eq(eng:linked(), false, "a fresh engine is not linked")
   T.eq(eng.status, "Not set up", "and says so")
 
   eng:createAccount("laptop")
-  pump(eng, 3)
+  pump(eng)
   T.eq(eng:linked(), true, "creating an account links this device")
   T.eq(eng.state.account, "aa11", "and stores the account id")
   T.eq(eng.codes.code1, "1111-2222", "the first code is shown grouped")
   T.eq(eng.codes.code2, "3333-4444", "and so is the second")
   T.eq(eng.state.code1, nil, "codes never enter the persisted state")
+  T.eq(transport.sent[2].url, "http://sync.test/sync/state",
+    "creating the account starts a sync straight away")
+  T.eq(transport.sent[3].method, "PUT",
+    "so the saves that existed before setup are uploaded")
+  T.eq(SyncState.rev(eng.state, "red/abc"), 1, "and the served rev is remembered")
   T.eq(eng.phase, "idle", "and the engine settles")
-  T.eq(#transport.sent, 1, "one request was made")
 end
 
 do
@@ -158,6 +164,59 @@ do
   T.eq(eng.phase, "idle", "the engine settles")
   T.eq(transport.sent[2].url, "http://sync.test/sync/save?id=xyz&version=gold",
     "the download names the playthrough, not the slot")
+  T.eq(eng.changed, true, "and the launcher is told a slot changed")
+  T.eq(eng.lastDownloads and eng.lastDownloads[1].version, "gold",
+    "naming the game")
+  T.eq(eng.lastDownloads and eng.lastDownloads[1].slot, "slot1", "and the slot")
+end
+
+do
+  local eng, _, saves = engine({
+    ["GET /sync/state"] = { code = 200,
+      body = '{"saves":{"red/xyz":{"rev":2,"meta":{"savedAt":900}}}}' },
+    ["GET /sync/save"] = { code = 200,
+      body = '{"rev":2,"meta":{"savedAt":900,"device":"Android"},' ..
+             '"blob":"return { player = {} }"}' },
+  }, {})
+  saves.write = function() return "slot3", true end
+  eng:syncNow()
+  pump(eng)
+  T.eq(eng.changed, true, "a download into a fresh slot flags the launcher")
+  T.eq(eng.lastDownloads[1].slot, "slot3", "naming the slot")
+  T.eq(eng.lastDownloads[1].created, true, "as one it created")
+  T.eq(eng.lastDownloads[1].device, "Android",
+    "and the device whose save it holds")
+end
+
+do
+  local state = linkedState()
+  SyncState.setRev(state, "red/abc", 1, 500)
+  local eng, _, saves = engine({
+    ["GET /sync/state"] = { code = 200,
+      body = '{"saves":{"red/abc":{"rev":5,"meta":{"savedAt":900}}}}' },
+    ["GET /sync/save"] = { code = 200,
+      body = '{"rev":5,"meta":{"savedAt":900},"blob":"return { player = {} }"}' },
+  }, { saveEntry("red", "abc", 500, 400) }, state)
+  eng:protectPlaythrough("red", "abc")
+  eng:syncNow()
+  pump(eng)
+  T.eq(#saves.writes, 0,
+    "while a playthrough is being played its moved rev is left alone")
+  T.eq(eng.phase, "idle", "and that sync still settles")
+  eng:protectPlaythrough(nil, nil)
+  T.eq(eng.protectedKey, nil, "leaving the game drops the protection")
+  eng:syncNow()
+  pump(eng)
+  T.eq(#saves.writes, 1,
+    "so the launcher's next sync fetches the other device's progress")
+  T.eq(saves.writes[1].mode, "replace", "into this playthrough's slot")
+  T.eq(SyncState.rev(eng.state, "red/abc"), 5, "and adopts the served rev")
+
+  local main = assert(io.open("main.lua")):read("*a")
+  local body = main:match("local function returnToLauncher%(opts%)(.-)\nend\n")
+  T.check(body ~= nil, "main.lua still has returnToLauncher")
+  T.check(body and body:find("protectPlaythrough", 1, true) ~= nil,
+    "and returning to the launcher clears the played key on the shared engine")
 end
 
 do
@@ -172,6 +231,58 @@ do
   pump(eng)
   T.eq(#transport.sent, 1, "an unchanged save is neither uploaded nor downloaded")
   T.eq(eng.phase, "idle", "and the sync ends idle")
+end
+
+-- Identical playtime is not a fork.  The Gold prompt the player saw offered
+-- "GOLD - 8 badges - 3:46 - 9 seen" against "GOLD - 8 badges - 3:46 - 9 seen":
+-- the same minute of the same playthrough, two saves that differ only in
+-- their savedAt stamp.  Nothing to choose between, so nothing to ask.
+do
+  T.eq(SyncEngine.samePlaytime(
+        { summary = { timeText = "3:46" } },
+        { summary = { timeText = "3:46" } }), true,
+    "the same H:MM is the same point in the playthrough")
+  T.eq(SyncEngine.samePlaytime(
+        { summary = { timeText = "3:46" } },
+        { summary = { timeText = "3:47" } }), false,
+    "one minute apart is a real fork")
+  T.eq(SyncEngine.samePlaytime({ playTime = 13560 }, { playTime = 13599 }),
+    true, "Gen 1's seconds count compares to the minute, not the second")
+  T.eq(SyncEngine.samePlaytime({ playTime = 13560 }, { playTime = 13620 }),
+    false, "and a whole minute apart still forks")
+  -- Gen 2 stores playTime as a table, so meta.playTime is nil on a Gold
+  -- save and only timeText survives; a missing time must never read as a
+  -- match, or an unknowable conflict would be silently discarded.
+  T.eq(SyncEngine.samePlaytime({}, {}), false,
+    "two unknown playtimes are not a match")
+  T.eq(SyncEngine.samePlaytime({ summary = { timeText = "3:46" } }, {}), false,
+    "and neither is one unknown side")
+end
+
+do
+  local state = linkedState()
+  SyncState.setRev(state, "red/abc", 7, 500)
+  local entry = saveEntry("red", "abc", 700, 650)
+  entry.meta.summary.timeText = "3:46"
+  local eng, transport = engine({
+    ["GET /sync/state"] = { code = 200,
+      body = '{"saves":{"red/abc":{"rev":9,"meta":{"savedAt":760,' ..
+             '"sessionStart":600,"summary":{"name":"ASH","timeText":"3:46"}}}}}' },
+    ["PUT /sync/save"] = { code = 200, body = '{"ok":true,"rev":10}' },
+  }, { entry }, state)
+
+  eng:syncNow()
+  pump(eng)
+  T.eq(#eng.conflicts, 0, "matching playtime raises no conflict")
+  T.eq(#eng.state.pendingConflicts, 0, "and leaves nothing pending")
+  T.neq(eng.phase, "conflict", "so the player is never prompted")
+  local put
+  for _, req in ipairs(transport.sent) do
+    if req.method == "PUT" then put = req end
+  end
+  T.check(put ~= nil, "this device's copy is pushed instead")
+  T.check(put and put.body:find('"force":true', 1, true) ~= nil,
+    "forced past the moved rev, since there is nothing to preserve")
 end
 
 local function conflictEngine()
@@ -294,13 +405,104 @@ do
 end
 
 do
+  local eng, transport = engine({
+    ["GET /sync/state"] = { code = 200, body = '{"saves":{}}' },
+  }, {})
+  eng:update(SyncEngine.AUTO_INTERVAL - 1)
+  T.eq(#transport.sent, 0, "an idle linked engine does not poll early")
+  eng:update(1)
+  T.eq(#transport.sent, 1, "after the auto interval it checks the server")
+  pump(eng)
+  T.eq(eng.phase, "idle", "and settles")
+  eng:update(SyncEngine.AUTO_INTERVAL - 10)
+  T.eq(#transport.sent, 1, "the next poll waits a whole interval again")
+  eng:update(10)
+  T.eq(#transport.sent, 2, "then fires")
+end
+
+do
+  local eng, transport = engine({
+    ["GET /sync/state"] = { code = 200, body = '{"saves":{}}' },
+  }, {}, SyncState.defaults())
+  eng:update(SyncEngine.AUTO_INTERVAL * 2)
+  T.eq(#transport.sent, 0, "an unlinked engine never polls on its own")
+end
+
+do
+  local calls = 0
+  local eng = engine({
+    ["GET /sync/state"] = function()
+      calls = calls + 1
+      if calls == 1 then return { code = 500, body = '{"error":"down"}' } end
+      return { code = 200, body = '{"saves":{}}' }
+    end,
+  }, {})
+  eng:syncNow()
+  pump(eng, 3)
+  T.eq(eng.phase, "error", "the first sync fails")
+  eng:update(SyncEngine.AUTO_INTERVAL)
+  pump(eng, 3)
+  T.eq(eng.phase, "idle", "the auto interval retries and recovers")
+end
+
+do
+  local eng, transport = conflictEngine()
+  eng:syncNow()
+  pump(eng)
+  local sent = #transport.sent
+  eng:update(SyncEngine.AUTO_INTERVAL * 2)
+  T.eq(#transport.sent, sent, "a waiting conflict is never auto-synced over")
+  T.eq(eng.phase, "conflict", "the player still decides")
+end
+
+do
+  local eng, transport = engine({
+    ["GET /sync/state"] = { code = 200, body = '{"saves":{}}' },
+  }, {})
+  eng:noteResumed()
+  T.eq(#transport.sent, 1, "regaining the app checks the server")
+  pump(eng)
+  eng:noteResumed()
+  T.eq(#transport.sent, 1, "but not twice in quick succession")
+end
+
+do
+  local eng, transport = engine({}, {}, SyncState.defaults())
+  eng:noteResumed()
+  T.eq(#transport.sent, 0, "an unlinked engine ignores a resume")
+end
+
+do
+  local state = linkedState()
+  SyncState.setRev(state, "red/abc", 2, 500)
+  local eng, transport, saves = engine({
+    ["GET /sync/state"] = { code = 200,
+      body = '{"saves":{"red/abc":{"rev":4,"meta":{"savedAt":900}},' ..
+             '"gold/xyz":{"rev":1,"meta":{"savedAt":900}}}}' },
+    ["GET /sync/save"] = { code = 200,
+      body = '{"rev":1,"meta":{"savedAt":900},"blob":"return { player = {} }"}' },
+  }, { saveEntry("red", "abc", 500, 400) }, state)
+  eng:protectPlaythrough("red", "abc")
+  eng:syncNow()
+  pump(eng)
+  T.eq(#saves.writes, 1, "only the save that is not being played downloads")
+  T.eq(saves.writes[1].version, "gold", "the other playthrough still arrives")
+  T.eq(SyncState.rev(eng.state, "red/abc"), 2,
+    "the live playthrough keeps its rev so the launcher can fetch it later")
+  T.eq(eng.phase, "idle", "and the sync settles")
+  eng:protectPlaythrough("red", nil)
+  T.eq(eng.protectedKey, nil, "no live playthrough means no protection")
+end
+
+do
   local eng = engine({
     ["POST /sync/create"] = { code = 200, body =
       '{"account":"aa11","code1":"11112222","code2":"33334444",' ..
       '"deviceToken":"tok","device":"0a1b2c3d"}' },
+    ["GET /sync/state"] = { code = 200, body = '{"saves":{}}' },
   }, {}, SyncState.defaults())
   eng:createAccount("laptop")
-  pump(eng, 3)
+  pump(eng)
   T.eq(eng.state.deviceId, "0a1b2c3d",
     "creating an account records the id the server gave this device")
   T.eq(SyncState.sanitize(eng.state).deviceId, "0a1b2c3d",
@@ -344,9 +546,49 @@ do
   }, {}, state)
   eng:unlink()
   pump(eng, 3)
-  T.eq(eng.phase, "error", "a failed revocation is surfaced")
-  T.eq(eng:linked(), true,
-    "and the device stays linked rather than lying about it")
+  T.eq(eng:linked(), false,
+    "a server that refuses the revocation still unlinks this device")
+  T.neq(eng.phase, "error", "so the player is not left stuck on a red status")
+end
+
+do
+  local state = linkedState()
+  state.deviceId = "0a1b2c3d"
+  local transport = {
+    begin = function() return 1 end,
+    poll = function()
+      return { status = "error",
+               err = "fetch failed for http://sync.test/sync/unlink: " ..
+                     "curl: (28) timed out" }
+    end,
+    release = function() end,
+  }
+  local eng = SyncEngine.new({
+    baseUrl = "http://sync.test", transport = transport, state = state,
+    saves = fakeSaves({}), persist = false,
+    now = function() return 1700001000 end,
+  })
+  eng:unlink()
+  pump(eng, 3)
+  T.eq(eng:linked(), false,
+    "an unreachable server does not trap the device as linked")
+  T.eq(eng.status, "Not set up", "and the modal says the device is unlinked")
+end
+
+do
+  local state = linkedState()
+  state.deviceId = "0a1b2c3d"
+  local eng, transport = engine({
+    ["GET /sync/state"] = { code = 200, body = '{"saves":{}}' },
+    ["POST /sync/unlink"] = { code = 200, body = '{"ok":true,"devices":1}' },
+  }, {}, state)
+  eng.pending = { handle = 99 }
+  T.eq(eng:busy(), true, "a request is in flight")
+  eng:unlink()
+  T.eq(transport.sent[1].url, "http://sync.test/sync/unlink",
+    "unlink cancels it instead of refusing as busy")
+  pump(eng, 3)
+  T.eq(eng:linked(), false, "and the device is unlinked")
 end
 
 do
@@ -454,6 +696,209 @@ do
   T.eq(eng.modApply, nil, "a failing step still ends the job")
   T.check(eng.status:find("download failed", 1, true) ~= nil,
     "and the failure reaches the status line")
+end
+
+do
+  local shared = {}
+  local eng, transport = engine({
+    ["POST /sync/modshare"] = function(req)
+      shared[#shared + 1] = Json.decode(req.body)
+      return { code = 200, body = '{"code":"K7QW3M"}' }
+    end,
+  }, {})
+  eng.modDeps = {
+    installed = function()
+      return { { id = "alpha", version = "1.0.0",
+                 enabledByVersion = { red = true } } }
+    end,
+    indexes = function() return {} end,
+    modOptions = function() return { alpha = { speed = 3 } } end,
+    setOptions = function() return true end,
+  }
+
+  eng:shareMods(false)
+  pump(eng)
+  T.eq(shared[1].manifest.mods[1].options, nil,
+    "a shared list can leave the player's options at home")
+  T.eq(eng.shareCode, "K7QW3M", "and still mints a code")
+
+  eng:shareMods(true)
+  pump(eng)
+  T.eq(shared[2].manifest.mods[1].options.speed, 3,
+    "or carry the options that go with those mods")
+  T.eq(#transport.sent, 2, "one request each")
+end
+
+do
+  local eng = engine({
+    ["GET /sync/modshare"] = { code = 200, body =
+      '{"code":"K7QW3M","manifest":{"rev":2,"indexes":[],"hasOptions":true,' ..
+      '"mods":[{"id":"alpha","version":"1.0.0","enabledFor":["red"],' ..
+      '"options":{"speed":1}}]}}' },
+  }, {})
+  local written = {}
+  eng.modDeps = {
+    installed = function()
+      return { { id = "alpha", version = "1.0.0",
+                 enabledByVersion = { red = true } } }
+    end,
+    indexes = function() return {} end,
+    findEntry = function() return nil end,
+    addIndex = function() return true end,
+    install = function() return true end,
+    setEnabled = function() return true end,
+    modOptions = function() return { alpha = { speed = 3 } } end,
+    setOptions = function(id, values) written[id] = values return true end,
+  }
+
+  eng:fetchShare("K7QW3M")
+  pump(eng)
+  T.eq(#eng.modPlan.options, 1, "a fetched list reports the options it carries")
+  T.eq(eng.modPlan.applyOptions, nil, "without deciding for the player")
+  T.check(eng.status:find("options", 1, true) ~= nil,
+    "and the status line says there is a question to answer")
+  local ask = eng:modOptionsAsk()
+  T.eq(ask and ask[1], "alpha", "the launcher can name the mods it would touch")
+
+  eng:answerModOptions(false)
+  T.eq(eng:modOptionsAsk(), nil, "answering closes the question")
+  eng:applyModPlan()
+  pump(eng)
+  T.eq(next(written), nil, "declining leaves this device's options alone")
+
+  eng:fetchShare("K7QW3M")
+  pump(eng)
+  eng:answerModOptions(true)
+  eng:applyModPlan()
+  pump(eng)
+  T.eq(written.alpha.speed, 1, "accepting writes the sharer's values")
+end
+
+do
+  local eng = engine({
+    ["GET /sync/modshare"] = { code = 200, body =
+      '{"code":"K7QW3M","manifest":{"rev":2,"indexes":[],"hasOptions":true,' ..
+      '"mods":[{"id":"alpha","version":"1.0.0","enabledFor":["red"],' ..
+      '"options":{"speed":1}}]}}' },
+  }, {})
+  local written = {}
+  eng.modDeps = {
+    installed = function()
+      return { { id = "alpha", version = "1.0.0",
+                 enabledByVersion = { red = true } } }
+    end,
+    indexes = function() return {} end,
+    findEntry = function() return nil end,
+    addIndex = function() return true end,
+    install = function() return true end,
+    setEnabled = function() return true end,
+    modOptions = function() return { alpha = { speed = 3 } } end,
+    setOptions = function(id, values) written[id] = values return true end,
+  }
+  eng:fetchShare("K7QW3M")
+  pump(eng)
+  eng:applyModPlan()
+  pump(eng)
+  T.eq(next(written), nil,
+    "an apply that never asked imports nothing: silence is not consent")
+end
+
+do
+  T.eq(SyncEngine.unixSeconds(0), nil, "a zero stamp is no stamp")
+  T.eq(SyncEngine.unixSeconds(-5), nil, "and neither is a negative one")
+  T.eq(SyncEngine.unixSeconds(1700000000), 1700000000, "a real stamp survives")
+  T.eq(SyncEngine.displayMeta({ savedAt = 0, sessionStart = 0 }).savedAt, nil,
+    "the prompt is never handed a stamp it would date 1969")
+  T.eq(SyncEngine.overlaps({ sessionStart = 0, savedAt = 0 },
+                           { sessionStart = 0, savedAt = 0 }), false,
+    "two server-zeroed windows do not overlap in 1970")
+  T.eq(SyncEngine.samePlaytime({ playTime = 0 }, { playTime = 0 }), false,
+    "a server-zeroed playtime is unknown, not zero minutes")
+end
+
+do
+  local SaveData = require("src.core.SaveData")
+  local raw = "return { player = { name = 'GOLD' }, savedAt = 1700000500 }"
+  local slots = { { id = "slot1", exists = true } }
+  local realList, realRead, realDecode, realSummary, realOptions =
+    SaveData.listSlots, SaveData.readSlotSource, SaveData.decode,
+    SaveData.slotSummary, SaveData.loadOptions
+  SaveData.listSlots = function(version)
+    return version == "gold" and slots or {}
+  end
+  SaveData.readSlotSource = function() return raw end
+  SaveData.decode = function() return { player = { name = "GOLD" },
+                                        savedAt = 1700000500 } end
+  SaveData.slotSummary = function()
+    return "GOLD", { badges = 8, timeText = "3:46", dexCount = 9 }
+  end
+  SaveData.loadOptions = function()
+    return { playthroughIds = { gold = { slot1 = "xyz" } } }
+  end
+  local list = SyncEngine.defaultSaves().list()
+  SaveData.listSlots, SaveData.readSlotSource, SaveData.decode,
+    SaveData.slotSummary, SaveData.loadOptions =
+    realList, realRead, realDecode, realSummary, realOptions
+  T.eq(#list, 1, "the Gold slot is listed")
+  T.eq(list[1].meta.savedAt, 1700000500,
+    "with the stamp gen2/Save.lua actually writes")
+end
+
+do
+  local state = linkedState()
+  local entry = saveEntry("gold", "xyz", 1700000500, nil)
+  entry.meta.summary = { name = "GOLD", badges = 8, timeText = "3:46",
+                         dexCount = 9 }
+  local eng, transport = engine({
+    ["GET /sync/state"] = { code = 200,
+      body = '{"saves":{"gold/xyz":{"rev":4,"meta":{"savedAt":0,' ..
+             '"summary":{"name":"GOLD","badges":8,"timeText":"3:46",' ..
+             '"dexCount":9}}}}}' },
+    ["PUT /sync/save"] = { code = 200, body = '{"ok":true,"rev":5}' },
+  }, { entry }, state)
+
+  eng:syncNow()
+  pump(eng)
+  T.eq(#eng.conflicts, 0,
+    "the same playthrough with an epoch-dated server row is not a fork")
+  T.neq(eng.phase, "conflict", "so no duplicate-save prompt is raised")
+  T.eq(SyncState.stamp(eng.state, "gold/xyz"), 1700000500,
+    "and the upload leaves a stamp behind")
+  local put
+  for _, req in ipairs(transport.sent) do
+    if req.method == "PUT" then put = req end
+  end
+  T.check(put ~= nil, "this device's copy is pushed instead")
+end
+
+do
+  local state = linkedState()
+  SyncState.setRev(state, "gold/xyz", 4, 1700000500)
+  local entry = saveEntry("gold", "xyz", 1700000500, nil)
+  local eng, transport = engine({
+    ["GET /sync/state"] = { code = 200,
+      body = '{"saves":{"gold/xyz":{"rev":4,"meta":{"savedAt":0}}}}' },
+  }, { entry }, state)
+  eng:syncNow()
+  pump(eng)
+  T.eq(#transport.sent, 1,
+    "a Gold save at the rev it was uploaded at syncs no further")
+  T.eq(eng.phase, "idle", "and the second boot is idle")
+end
+
+do
+  local state = linkedState()
+  SyncState.setRev(state, "gold/xyz", 4, nil)
+  local entry = saveEntry("gold", "xyz", nil, nil)
+  local eng, transport = engine({
+    ["GET /sync/state"] = { code = 200,
+      body = '{"saves":{"gold/xyz":{"rev":4,"meta":{"savedAt":0}}}}' },
+  }, { entry }, state)
+  eng:syncNow()
+  pump(eng)
+  T.eq(#transport.sent, 1,
+    "an older Gold save with no stamp on either side is not dirty every boot")
+  T.eq(eng.phase, "idle", "so the launcher settles")
 end
 
 T.finish("sync_engine")

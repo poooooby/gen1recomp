@@ -21,6 +21,12 @@ local function renderVisible(stack, state)
   return state and (not stack.renderVisible or stack:renderVisible(state))
 end
 
+-- Vanilla defaults for ModRuntime.call, hoisted to module level: called from
+-- the 60Hz logic step / per-frame speed resolution, an inline closure here
+-- allocated a fresh function every tick for no behavioral gain.
+local function noop() end
+local function resolveLogicSpeedVanilla(g) return g:_resolveLogicSpeed() end
+
 -- dev-mode gate for the F5/backtick hotkeys; false keeps every src/dev
 -- module unloaded, so a player boot never touches a byte of dev code
 local devMode = os.getenv("POKEPORT_DEV") == "1" or _G.POKEPORT_DEV_MODE == true
@@ -32,7 +38,9 @@ local function bootScreens(game)
   return (boot and boot.screens) or {}
 end
 
-function Game:load()
+function Game:load(opts)
+  opts = opts or {}
+  local arena = opts.arena
   self.data = Data
   self.sessionStartedAt = os.time()
   Data:load()
@@ -42,7 +50,15 @@ function Game:load()
   -- the rest of the game consumes.  A broken mod is reported and skipped by
   -- the loader without preventing the base game from booting.
   self.mods = ModLoader.new()
-  self.mods:load(Data)
+  if arena then
+    self.mods:load(Data, {
+      mode = (arena.profile and arena.profile.kind == "cart")
+        and "cartOnly" or "disableAll",
+      cartId = opts.cartId,
+    })
+  else
+    self.mods:load(Data)
+  end
   self.modStatus = self.mods:status()
   -- render pipelines dispatch off the merged dataset; point them at the
   -- one the mods just merged into before anything can draw a frame
@@ -102,7 +118,9 @@ function Game:load()
   -- boot into the title screen (engine/movie/title.asm); NEW GAME runs
   -- the Oak speech + naming, CONTINUE restores the save.  The headless
   -- autopilot skips straight into the overworld.
-  if os.getenv("POKEPORT_AUTOPILOT") then
+  if arena then
+    self:enterArena(arena)
+  elseif os.getenv("POKEPORT_AUTOPILOT") then
     StateStack:push(OverworldState, self.save.player.map,
                     self.save.player.x, self.save.player.y, self.save.player.facing)
   else
@@ -147,33 +165,69 @@ function Game:bootConfig()
   return boot
 end
 
+-- NEW GAME, as a call: a fresh skeleton (through save.new_game, so a mod
+-- can reshape it), the overworld at the skeleton's spawn, and the intro
+-- screen on top.  The title menu's NEW GAME row is this; a mod that starts a
+-- game on its own terms -- a match, a challenge mode -- calls it directly.
+--
+-- opts.intro = false skips the newGame screen (Oak's speech) so the player
+-- lands straight in the world; the skeleton then has to carry a name and a
+-- party, which is the caller's job via save.new_game.
+function Game:startNewGame(opts)
+  local OverworldState = require("src.world.OverworldController")
+  while self.stack:top() do self.stack:pop() end
+  -- New Game keeps the standalone options.lua preferences
+  self.sessionStartedAt = os.time()
+  self.save = SaveData.newGame(self:bootConfig())
+  -- no bucket carry-over: mod state from an abandoned session must
+  -- not leak into a fresh slot; mods seed via save.created instead
+  self:adoptSave(self.save)
+  ModRuntime.emit("save.created", { save = self.save })
+  self:applyOptions(self.save.options)
+  self.stack:push(OverworldState, self.save.player.map,
+                  self.save.player.x, self.save.player.y,
+                  self.save.player.facing,
+                  { via = "boot", freshBoot = true })
+  if not (opts and opts.intro == false) then
+    Screens.push(self, bootScreens(self).newGame or "OakSpeech",
+                 function() end)
+  end
+end
+
+function Game:enterArena(spec)
+  local version = require("src.core.GameVersion").get()
+  if spec.slotId then pcall(SaveData.setActiveSlot, version, spec.slotId) end
+  local loaded = SaveData.load()
+  if loaded then
+    local activeMods = self.modStatus and self.modStatus.loaded
+    SaveData.runMigrations(loaded, self.mods and self.mods.migrations, activeMods)
+    self.saveReport = SaveData.validate(loaded, self.data)
+    self.save = loaded
+    loaded.startMenuIndex = nil
+    self.startMenuIndex = nil
+    self:adoptSave(loaded)
+    self:applyOptions(loaded.options)
+    local stamp = require("src.battle.BattleState").stampOT
+    for _, mon in ipairs(loaded.party or {}) do stamp(loaded, mon) end
+  else
+    Logger.warn("arena: save slot %s could not be loaded", tostring(spec.slotId))
+  end
+  self.linkSession = true
+  StateStack:push(require("src.ui.ArenaState").new(self, spec))
+end
+
 -- the title screen with its NEW GAME / CONTINUE wiring; used at boot
 -- and by the START-menu QUIT confirmation
 function Game:makeTitleState()
   local OverworldState = require("src.world.OverworldController")
   local factory = Screens.get(self, bootScreens(self).title or "TitleState")
   local title = factory.new(self, {
-    onNewGame = function()
-      while self.stack:top() do self.stack:pop() end
-      -- New Game keeps the standalone options.lua preferences
-      self.sessionStartedAt = os.time()
-      self.save = SaveData.newGame(self:bootConfig())
-      -- no bucket carry-over: mod state from an abandoned session must
-      -- not leak into a fresh slot; mods seed via save.created instead
-      self:adoptSave(self.save)
-      ModRuntime.emit("save.created", { save = self.save })
-      self:applyOptions(self.save.options)
-      self.stack:push(OverworldState, self.save.player.map,
-                      self.save.player.x, self.save.player.y,
-                      self.save.player.facing,
-                      { via = "boot", freshBoot = true })
-      Screens.push(self, bootScreens(self).newGame or "OakSpeech",
-                   function() end)
-    end,
+    onNewGame = function() self:startNewGame() end,
     onContinue = function()
       local loaded, recovered = SaveData.load()
       if loaded then
-        self:restoreSave(loaded, recovered, { freshBoot = true })
+        self:restoreSave(loaded, recovered,
+                         { freshBoot = true, continued = true })
       end
     end,
     onExit = self.onExit,
@@ -225,8 +279,12 @@ function Game:touchSkinHotkey(action, pressed)
   end
 end
 
-function Game:breakLink(err)
-  Logger.error("link: torn down after an error\n%s", tostring(err))
+function Game:breakLink(err, source)
+  if source == "engine" then
+    Logger.error("link: engine error, link torn down\n%s", tostring(err))
+  else
+    Logger.error("link: torn down after an error\n%s", tostring(err))
+  end
   self.linkSession = nil
   local net = self.linkNet
   self.linkNet = nil
@@ -241,7 +299,9 @@ function Game:breakLink(err)
   pcall(function()
     local Strings = require("src.core.Strings")
     local TextBox = require("src.render.TextBox")
-    stack:push(TextBox.new(self, Strings("The link was\nbroken.")))
+    stack:push(TextBox.new(self, source == "engine"
+      and Strings("Something broke\nduring the link.")
+      or Strings("The link was\nbroken.")))
   end)
 end
 
@@ -250,7 +310,7 @@ function Game:step(dt)
   -- the same fixed-step boundary as a physical controller.  Run them before
   -- Input:step promotes queued edges so a button chosen here is visible to
   -- this logic tick, not one tick later.  With no wrapper this is a no-op.
-  ModRuntime.call("input.step", function() end, self, dt)
+  ModRuntime.call("input.step", noop, self, dt)
   self.input:step()
   -- A+B+SELECT+START held for 16 steps: SoftReset (home/init.asm) stops the
   -- audio, whites the palettes out and falls through into Init, i.e. the
@@ -274,7 +334,7 @@ function Game:step(dt)
   if self.linkNet and not self.linkNet.closed then
     local ok, err = pcall(self.linkNet.update, self.linkNet)
     if not ok then
-      self:breakLink(err)
+      self:breakLink(err, "transport")
       return
     end
   end
@@ -282,7 +342,7 @@ function Game:step(dt)
     local ok, err = xpcall(function() self.stack:update(dt) end,
       function(e) return debug.traceback(tostring(e), 2) end)
     if not ok then
-      self:breakLink(err)
+      self:breakLink(err, "engine")
       return
     end
   else
@@ -326,6 +386,9 @@ function Game:logicSpeed()
   if self.linkSession or (self.linkNet and not self.linkNet.closed) then
     return 1
   end
+  if Game.isFixedSpeedInStack and Game.isFixedSpeedInStack(self.stack) then
+    return 1
+  end
   if self.speedOverride then return GameSpeed.clamp(self.speedOverride) end
   -- Clamp here too, not just in _resolveLogicSpeed's vanilla path: a mod's
   -- core.logic_speed hook can return anything (0, negative, nil, NaN) and
@@ -333,7 +396,7 @@ function Game:logicSpeed()
   -- returns a bad value, so an unclamped result would flow straight into
   -- the FixedStep accumulator math below and freeze or destabilize logic.
   return GameSpeed.clamp(ModRuntime.call("core.logic_speed",
-    function(g) return g:_resolveLogicSpeed() end, self))
+    resolveLogicSpeedVanilla, self))
 end
 
 function Game:update(dt)
@@ -341,11 +404,12 @@ function Game:update(dt)
   -- Give the accumulator room for one full frame at the current speed,
   -- or the anti-spiral clamp quietly caps every level above ~15X.
   local speed = self:logicSpeed()
-  FixedStep.maxAccum = math.max(0.25, speed * FixedStep.STEP * 1.5)
-  FixedStep:update(dt * speed)
+  FixedStep.maxAccum = FixedStep.catchupLimit(speed)
+  FixedStep:update(dt, speed)
   -- Audio runs off real time at a fixed 60Hz regardless of game speed or
   -- display refresh, so fades and chip synthesis keep their intended tempo
-  -- whether we are at 1X, 10X, or running with vsync disabled.
+  -- whether we are at 1X, 10X, or running with vsync disabled.  One-shot
+  -- SFX stay at natural pitch too (#1990/#1991/#1997).
   local step = FixedStep.STEP
   self.audioAccum = math.min((self.audioAccum or 0) + dt, 0.25)
   while self.audioAccum >= step do
@@ -361,12 +425,15 @@ function Game:update(dt)
   pcall(function() require("src.core.DiscordPresence").update(dt) end)
   self:updateSync(dt)
   -- Steady-state memory backstop: advance the incremental collector one
-  -- small step every rendered frame.  The heavy GPU objects are now freed
-  -- explicitly (map eviction, battle exit, canvas/renderer swaps), so this
-  -- only has to keep ordinary Lua-heap garbage (per-frame tables/closures)
-  -- from drifting upward over a long session, and to spread collection out
-  -- so the default lazy schedule never batches it into a visible pause.
-  if collectgarbage then collectgarbage("step", 1) end
+  -- small step every few rendered frames.  The heavy GPU objects are now
+  -- freed explicitly (map eviction, battle exit, canvas/renderer swaps), so
+  -- this only has to keep ordinary Lua-heap garbage (per-frame tables) from
+  -- drifting upward over a long session, and to spread collection out so the
+  -- default lazy schedule never batches it into a visible pause.  Every 4th
+  -- frame (not every frame) so the stepping itself does not compete with
+  -- the frame budget on weak single-core handhelds.
+  self.gcStepFrame = (self.gcStepFrame or 0) + 1
+  if collectgarbage and self.gcStepFrame % 4 == 0 then collectgarbage("step", 1) end
 end
 
 -- render.zones' identity default: unhooked, the zone list reaches the blit
@@ -473,6 +540,15 @@ function Game.speedCategoryInStack(stack)
     if state and state.isOverworld then return "overworld" end
   end
   return "menu"
+end
+
+function Game.isFixedSpeedInStack(stack)
+  local states = stack and stack.states
+  for i = #(states or {}), 1, -1 do
+    local state = states[i]
+    if state and (state.isFixedSpeed or state.isMinigame) then return true end
+  end
+  return false
 end
 
 -- Whether a state on the stack composes its own screen and so wants the
@@ -597,9 +673,10 @@ function Game:draw()
   -- ...and for the same reason the UI's own scale has to know the world is
   -- still the backdrop while an opaque menu covers it.  Renderer:uiScale
   -- steps the UI down with the survey zoom only while a world is behind it,
-  -- gated on this frame's world pass -- which the party menu and the bag end
-  -- by being opaque.  Without this hold they lose the step-down and blit at
-  -- full fit scale over a battle drawn at the zoomed-out one.
+  -- gated on this frame's world pass -- which the party menu ends by being
+  -- opaque (the bag's item box shows the map around it, #1521).  Without
+  -- this hold it loses the step-down and blits at full fit scale over a
+  -- battle drawn at the zoomed-out one.
   Renderer.uiWorldHold = Renderer.battleDim ~= nil
   -- ...and a battle keeps its dialogue box and YES/NO inside its own screen
   -- instead of letting them dock to the window edge.
@@ -804,14 +881,6 @@ function Game:keypressed(key)
       self:writeOptions()
     end
     return
-  elseif key == "5" then
-    -- cycle GBC FX OFF → 1 → 2 → 3 → 4 (unlit-GBC ladder); always on
-    -- desktop.  Mobile refuses the present shader (issue #136).
-    local GBCFX = require("src.render.GBCFX")
-    if not GBCFX.isSupported() then return end
-    self.save.options.gbcfx = GBCFX.cycle()
-    self:writeOptions()
-    return
   end
   -- Mod render pipelines claim their hotkeys last, so one can never shadow
   -- an engine display key however a mod declares it (12 §rendering
@@ -859,26 +928,20 @@ function Game:gamepadpressed(joystick, button)
     end)
     selectHeld = ok and down == true
   end
-  -- shoulder buttons and analog triggers cycle GAME SPEED (R1/RB or
-  -- R2/RT = faster, L1/LB or L2/LT = slower; same as keyboard hotkey
-  -- 1).  LÖVE reports an analog trigger as gamepadpressed once it
-  -- crosses the press threshold, so a trigger pull lands here like any
-  -- other pad button.  Skip while Select is held so Select+L can reach
-  -- displayChordDigit ("7").
-  if not selectHeld then
-    if button == "rightshoulder" or button == "righttrigger" then
-      self:_cycleSpeed(1)
-      return
-    elseif button == "leftshoulder" or button == "lefttrigger" then
-      self:_cycleSpeed(-1)
-      return
-    end
-  end
-  -- BindingsMenu's pad capture rides the same top-state routing as keys
   local top = self.stack and self.stack:top()
   if top and top.onGamepadPressed then
     top:onGamepadPressed(button)
     return
+  end
+  if not selectHeld then
+    local action = Input:padAction(button)
+    if action == "speedUp" then
+      self:_cycleSpeed(1)
+      return
+    elseif action == "speedDown" then
+      self:_cycleSpeed(-1)
+      return
+    end
   end
   -- Select+face display chords → same digit path as Game:keypressed
   -- (COLORS/TILT/pipelines). Intercept before Input so face does not
@@ -906,16 +969,7 @@ function Game:gamepadaxis(joystick, axis, value)
   Input:gamepadaxis(joystick, axis, value)
 end
 
--- conf.lua turns the mobile accelerometer-joystick off (#468), but guard the
--- generic joystick path anyway: any sensor-style device that still reaches us
--- has gravity pinning an axis past the deadzone, which would hide the touch
--- overlay every instant and steer the player by tilt through the axis-1/2
--- mapping (#459).  Real controllers arrive as SDL gamepads or named sticks,
--- never as "* Accelerometer".
-local function isAccelerometer(joystick)
-  local name = joystick and joystick.getName and joystick:getName()
-  return name ~= nil and name:lower():find("accelerometer", 1, true) ~= nil
-end
+local isAccelerometer = GamepadMap.isAccelerometer
 
 -- BindingsMenu's raw-stick capture rides the same top-state routing as the
 -- keyboard and gamepad paths (#632).  Only a stick SDL does not recognize
@@ -970,7 +1024,11 @@ end
 -- parked the player until every direction was re-pressed (#799).
 function Game:focus(f)
   Input:reset()
-  if f then Input:reconcile() end
+  if f then
+    Input:reconcile()
+    local eng = self:syncEngine()
+    if eng then pcall(eng.noteResumed, eng) end
+  end
   TouchControls:reset()
   self:cancelPointers()
 end
@@ -990,6 +1048,8 @@ function Game:onResume()
   Input:reconcile()
   TouchControls:reset()
   self:cancelPointers()
+  local eng = self:syncEngine()
+  if eng then pcall(eng.noteResumed, eng) end
   -- Chip music may survive NX suspend as a duplicate stream; stop it and let
   -- the active screen re-cue on the next frame (hardware audio check: T19).
   -- Desktop/mobile window-visible flips must not kill overworld music.
@@ -1197,18 +1257,26 @@ end
 
 function Game:syncEngine()
   if self._syncOff then return nil end
-  if self._syncEngineRef then return self._syncEngineRef end
-  local ok, SyncEngine = pcall(require, "src.sync.SyncEngine")
-  if not ok or type(SyncEngine) ~= "table" then
-    self._syncOff = true
-    return nil
-  end
-  local eng = SyncEngine.shared()
+  local eng = self._syncEngineRef
   if not eng then
-    self._syncOff = true
-    return nil
+    local ok, SyncEngine = pcall(require, "src.sync.SyncEngine")
+    if not ok or type(SyncEngine) ~= "table" then
+      self._syncOff = true
+      return nil
+    end
+    eng = SyncEngine.shared()
+    if not eng then
+      self._syncOff = true
+      return nil
+    end
+    self._syncEngineRef = eng
   end
-  self._syncEngineRef = eng
+  if type(eng.protectPlaythrough) == "function" then
+    local meta = self.save and self.save.meta
+    eng:protectPlaythrough(
+      (self.save and self.save.version) or require("src.core.GameVersion").get(),
+      type(meta) == "table" and meta.playthroughId or nil)
+  end
   return eng
 end
 
@@ -1216,14 +1284,25 @@ function Game:updateSync(dt)
   local eng = self:syncEngine()
   if not eng then return end
   if not (eng.state.enabled and eng:linked()) and not eng:busy() then return end
+  local wasBusy = eng:busy()
   pcall(eng.update, eng, dt)
+  if wasBusy and not eng:busy() then self:adoptPlaythroughId() end
+end
+
+function Game:adoptPlaythroughId()
+  local save = self.save
+  local meta = type(save) == "table" and save.meta
+  if type(meta) ~= "table" or meta.savedAt == nil then return end
+  if type(meta.playthroughId) == "string" and meta.playthroughId ~= "" then return end
+  local id = SaveData.selectedPlaythroughId(save)
+  if type(id) == "string" and id ~= "" then meta.playthroughId = id end
 end
 
 -- Persist options.lua only (Options menu / hotkeys 2-5).  Keeps settings
 -- across New Game without touching the progress save.
 function Game:writeOptions()
   if not (self.save and self.save.options) then return end
-  SaveData.saveOptions(self.save.options)
+  SaveData.saveLiveOptions(self.save)
 end
 
 -- Push the live options table into audio + display subsystems.
@@ -1235,43 +1314,45 @@ function Game:applyOptions(opts)
   if Sound.applyOptions then Sound.applyOptions(opts) end
   require("src.render.PaletteFX").applyOptions(opts)
   require("src.render.Tilt").applyOptions(opts)
+  require("src.render.Letterbox").applyOptions(opts)
   -- after Tilt, so a persisted world pipeline can switch the tilt level it
   -- just restored back off (the two are mutually exclusive)
   require("src.render.Pipelines").applyOptions(opts)
   require("src.render.Zoom").applyOptions(opts)
   require("src.render.TileRenderer").applyOptions(opts)
-  -- returns true when a persisted GBC FX level was cleared on mobile
-  local gbcCleared = require("src.render.GBCFX").applyOptions(opts)
+  -- returns true when a persisted preset name no longer resolves (deleted
+  -- from the drop-in folder, or failed to (re)translate) and had to be
+  -- cleared back to OFF -- "sanitized, please persist" contract
+  local shaderfxCleared = require("src.render.ShaderFX").applyOptions(opts)
   require("src.core.VideoMode").applyOptions(opts)
   -- Android orientation lock (#592); no-op everywhere else
   require("src.core.Orientation").applyOptions(opts)
   -- after VideoMode: a faithful-resolution lock is an exact window size, so
   -- it has to be the last word on the window (it drops fullscreen to hold)
   require("src.core.FaithfulRes").applyOptions(opts)
-  -- normalizes a nil/garbage cap to the 60 default, so old saves with no
-  -- fpsCap key pace at the standard rate (issue #88)
+  require("src.core.ScreenPosition").applyOptions(opts)
+  require("src.core.VSync").applyOptions(opts)
   require("src.core.FrameCap").applyOptions(opts)
+  require("src.core.PresentSync").applyFixedStepPeriod()
   -- Scale the optional presentation extras to the device's performance
   -- tier.  Every heavy feature was just applied from the stored options
   -- above; here we clamp the *live* state down for a weaker device without
   -- rewriting what the player saved, so raising the tier later restores
-  -- their exact TILT / GBC FX / ZOOM / MAX FPS choices.  A HIGH tier (the
+  -- their exact TILT / ZOOM / MAX FPS choices.  A HIGH tier (the
   -- default on a normal desktop, and every options.lua predating this
   -- option) clamps nothing, so it is a no-op for the common case.
   local caps = require("src.core.Performance").applyOptions(opts)
   if not caps.tilt then require("src.render.Tilt").setLevel(0) end
-  if not caps.gbcfx then require("src.render.GBCFX").setLevel(0) end
+  if not caps.shaderfx then require("src.render.ShaderFX").deactivate() end
   local Zoom = require("src.render.Zoom")
   Zoom.allowSurvey = caps.survey
   if not caps.survey and Zoom.offset < 0 then Zoom.offset = 0 end
   if caps.fpsMax then
-    local FrameCap = require("src.core.FrameCap")
-    if FrameCap.current > caps.fpsMax then FrameCap.apply(caps.fpsMax) end
+    require("src.core.FrameCap").clampToPerformance(caps.fpsMax)
   end
   Input:applyBindings(opts.bindings)
   TouchControls:applyOptions(opts)
-  -- heal soft-bricked APK installs that already saved gbcfx > 0 (#136)
-  if gbcCleared then self:writeOptions() end
+  if shaderfxCleared then self:writeOptions() end
 end
 
 function Game:restoreSave(loaded, recovered, opts)
@@ -1296,12 +1377,13 @@ function Game:restoreSave(loaded, recovered, opts)
   report.recovered = recovered
   report.modsDiff = modsDiff
   self.save = loaded
+  -- the START cursor lives outside sGameData (ram/sram.asm:17-21)
+  loaded.startMenuIndex = nil
+  self.startMenuIndex = nil
   self:adoptSave(loaded)
   -- SaveData.load already attached the standalone options.lua table
   self:applyOptions(loaded.options)
-  -- saves from before OT/ID stamping: backfill with the player's (after
-  -- the scrub, so every mon the stamp loop sees is known)
-  SaveData.repairTradedOtIds(loaded)
+  -- saves from before OT/ID stamping: backfill with the player's
   local stamp = require("src.battle.BattleState").stampOT
   for _, mon in ipairs(loaded.party or {}) do stamp(loaded, mon) end
   for _, box in ipairs(loaded.boxes or {}) do
@@ -1312,8 +1394,10 @@ function Game:restoreSave(loaded, recovered, opts)
   -- freshBoot threads through from the caller (onContinue and F2 both set
   -- it); a future caller that doesn't ask for it keeps the ordinary
   -- crossfade by default.
+  -- engine/menus/main_menu.asm:110 (CONTINUE forces PLAYER_DIR_DOWN)
+  local facing = (opts and opts.continued) and "down" or loaded.player.facing
   self.stack:push(self.overworld, loaded.player.map,
-                  loaded.player.x, loaded.player.y, loaded.player.facing,
+                  loaded.player.x, loaded.player.y, facing,
                   { via = "boot", freshBoot = opts and opts.freshBoot })
   self.saveReport = report
   if not SaveData.emptyReport(report) then
@@ -1343,12 +1427,20 @@ function Game:restoreCheckpointSave(loaded)
   self.save = loaded
   self:adoptSave(loaded)
   while self.stack:top() do self.stack:pop() end
-  -- freshBoot unconditionally: Checkpoint.resume (src/core/Checkpoint.lua)
-  -- is this method's only caller, and it is itself gated to the title
-  -- session (isTitleSession).
+  -- setMap zeroes poisonSteps on every non-seamless map entry, mirroring
+  -- ClearVariablesOnEnterMap.  Re-entering the map is how a restore installs
+  -- the world, but it is not a map entry from the player's point of view, and
+  -- Checkpoint.restore verifies the applied state against the checkpoint --
+  -- so the discarded counter failed the comparison and rolled the whole
+  -- restore back three steps out of four (#1971).
+  local poisonSteps = loaded.poisonSteps
+  -- freshBoot unconditionally: both callers arrive through Checkpoint.apply
+  -- (src/core/Checkpoint.lua), which serves Checkpoint.resume from the title
+  -- session and Checkpoint.restore from a settled runtime.
   self.stack:push(self.overworld, loaded.player.map,
                   loaded.player.x, loaded.player.y, loaded.player.facing,
                   { via = "checkpoint", checkpoint = true, freshBoot = true })
+  self.save.poisonSteps = poisonSteps
 end
 
 -- Install a reconstructed battle without calling BattleState:enter(), whose
@@ -1360,6 +1452,46 @@ function Game:restoreCheckpointBattle(battle)
   end
   self.stack.states[#self.stack.states + 1] = battle
   if battle.resumeCheckpoint then battle:resumeCheckpoint() end
+end
+
+-- Drop every session-owned field so the next Game:load() starts clean when
+-- the process returns to the launcher in-place (Android / intent_game).
+--
+-- Gen1 Game is a MODULE SINGLETON (methods live on this table).  Never fan
+-- out arbitrary field:release() here: session fields can hold shared modules
+-- (Fetch, SyncClient, …) whose :release is a job-handle API, not instance
+-- teardown -- calling them as value:release() corrupts process state and has
+-- been observed to leave Game.load nil after EXIT GAME on Android.
+-- Explicit GPU owners are released below; everything else is just dropped.
+function Game:reset()
+  if self.stack and self.stack.clear then
+    pcall(function() self.stack:clear() end)
+  end
+  if self.world and self.world.release then
+    pcall(function() self.world:release() end)
+  end
+  if self._canvases then
+    for _, canvas in pairs(self._canvases) do
+      if canvas and canvas.release then pcall(canvas.release, canvas) end
+    end
+  end
+  if self.renderer then
+    local release = self.renderer.releaseCanvases or self.renderer.release
+    if release then pcall(release, self.renderer) end
+  end
+  -- Keep methods; clear every other field (including session scalars like
+  -- speedOverride).  Re-seed module constants afterward.
+  local skinFast = self.SKIN_FAST_FORWARD
+  local keys = {}
+  for key, value in pairs(self) do
+    if type(value) ~= "function" then
+      keys[#keys + 1] = key
+    end
+  end
+  for _, key in ipairs(keys) do
+    self[key] = nil
+  end
+  self.SKIN_FAST_FORWARD = skinFast or 4
 end
 
 return Game

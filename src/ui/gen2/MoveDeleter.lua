@@ -14,7 +14,9 @@
 -- answer a row.
 
 local Chrome = require("src.ui.gen2.Chrome")
+local ForgetMoveList = require("src.ui.gen2.ForgetMoveList")
 local Sound = require("src.core.Sound")
+local Strings = require("src.core.Strings")
 
 local MoveDeleter = {}
 MoveDeleter.__index = MoveDeleter
@@ -29,6 +31,7 @@ function MoveDeleter.new(game, opts)
   local self = setmetatable({}, MoveDeleter)
   self.game = game
   local data = (game and game.data) or {}
+  self.forget = opts.layout == "forget"
   self.mon = opts.mon
   self.moves = opts.moves or data.moves
   self.onChoose = opts.onChoose
@@ -74,10 +77,19 @@ function MoveDeleter:update(_dt)
     if input:wasPressed("a") or input:wasPressed("b") then self:finish(nil) end
     return
   end
-  if input:wasPressed("up") and self.row > 1 then
-    self.row = self.row - 1
-  elseif input:wasPressed("down") and self.row < n then
-    self.row = self.row + 1
+  -- engine/pokemon/learn.asm:160
+  if input:wasPressed("up") then
+    if self.row > 1 then
+      self.row = self.row - 1
+    elseif self.forget then
+      self.row = n
+    end
+  elseif input:wasPressed("down") then
+    if self.row < n then
+      self.row = self.row + 1
+    elseif self.forget then
+      self.row = 1
+    end
   elseif input:wasPressed("a") then
     self:playSfx("Sfx_ReadText2")
     self:finish(self.row)
@@ -88,6 +100,11 @@ function MoveDeleter:update(_dt)
 end
 
 function MoveDeleter:draw()
+  if self.forget then
+    ForgetMoveList.draw(self.list, self.row, self.moves)
+    love.graphics.setColor(1, 1, 1, 1)
+    return
+  end
   Chrome.textbox(0, 1, 18, 9)
   for slot = 1, 4 do
     local nameY = 3 + (slot - 1) * 2
@@ -95,7 +112,7 @@ function MoveDeleter:draw()
     local entry = self.list[slot]
     if entry then
       Chrome.print(self:moveName(entry), 2, nameY)
-      Chrome.print("PP", 10, ppY)
+      Chrome.print(Strings("PP"), 10, ppY)
       Chrome.print(Chrome.number(entry.pp, 2, true), 13, ppY)
       Chrome.print("/", 15, ppY)
       Chrome.print(Chrome.number(entry.maxPp or entry.pp, 2, true), 16, ppY)

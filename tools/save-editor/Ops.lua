@@ -329,6 +329,31 @@ function Ops.speciesSearch(S, query)
   for _, id in ipairs(S.cat.species) do
     if Ops.speciesMatches(S, id, query) then out[#out + 1] = id end
   end
+  -- Rank hits so a typed prefix ("pika") puts PIKACHU above mid-string
+  -- noise; empty query keeps the catalog's A-Z order.
+  if query and tostring(query) ~= "" then
+    local q = tostring(query):lower()
+    local function rank(id)
+      local idLower = id:lower()
+      local def = S.data.pokemon[id]
+      local nameLower = def and def.name and tostring(def.name):lower() or ""
+      if idLower == q or nameLower == q then return 0 end
+      if idLower:sub(1, #q) == q
+          or (nameLower ~= "" and nameLower:sub(1, #q) == q) then
+        return 1
+      end
+      if idLower:find(q, 1, true)
+          or (nameLower ~= "" and nameLower:find(q, 1, true)) then
+        return 2
+      end
+      return 3  -- dex-number hit
+    end
+    table.sort(out, function(a, b)
+      local ra, rb = rank(a), rank(b)
+      if ra ~= rb then return ra < rb end
+      return a < b
+    end)
+  end
   return out
 end
 
@@ -429,6 +454,8 @@ function Ops.setDv(S, mon, key, value)
   return Ops.mark(S, ("%s DV %d  (HP DV now %d)"):format(key, mon.dvs[key], mon.dvs.hp))
 end
 
+-- Kept for tests and any keyboard path; the inspector opens the searchable
+-- picker instead of walking the catalog one tap at a time.
 function Ops.cycleMove(S, mon, slot)
   if not mon or not (S.cat and S.cat.moves and #S.cat.moves > 0) then return false end
   local moves = S.cat.moves
@@ -441,12 +468,115 @@ function Ops.cycleMove(S, mon, slot)
   end
   for step = 1, #moves do
     local nextId = moves[((idx + step - 1) % #moves) + 1]
-    if S.data and S.data.moves and type(S.data.moves[nextId]) == "table" then
-      MonOps.setMove(S.data, mon, slot, nextId)
-      return Ops.mark(S, ("Move %d set to %s"):format(slot, nextId))
+    if Ops.moveUsable(S, nextId) then
+      return Ops.setMove(S, mon, slot, nextId)
     end
   end
   return false
+end
+
+-- A move record is usable when it is a real table with a numeric PP -- the
+-- same floor Catalog already uses to keep provenance scalars out of the list.
+function Ops.moveUsable(S, id)
+  local def = id and S.data and S.data.moves and S.data.moves[id]
+  return type(def) == "table" and type(def.pp) == "number"
+end
+
+-- Search predicate behind the move picker's field: id, display name, and type
+-- substring-match case-insensitively; power / accuracy match as whole numbers
+-- (same plain-text / no-pattern rule as Ops.speciesMatches).
+function Ops.moveMatches(S, id, query)
+  if not query or query == "" then return true end
+  local q = tostring(query):lower()
+  if id:lower():find(q, 1, true) then return true end
+  local def = S.data.moves[id]
+  if type(def) ~= "table" then return false end
+  local name = def.name
+  if name and tostring(name):lower():find(q, 1, true) then return true end
+  local typ = def.type
+  if typ and tostring(typ):lower():find(q, 1, true) then return true end
+  local power = tonumber(def.power)
+  if power ~= nil and q == tostring(power) then return true end
+  local accuracy = tonumber(def.accuracy)
+  return accuracy ~= nil and q == tostring(accuracy)
+end
+
+function Ops.moveSearch(S, query)
+  local out = {}
+  for _, id in ipairs(S.cat.moves or {}) do
+    if Ops.moveMatches(S, id, query) then out[#out + 1] = id end
+  end
+  -- Rank hits so a typed prefix ("sur") puts SURF above mid-string noise
+  -- like ACUPRESSURE / FISSURE; empty query keeps the catalog's A-Z order.
+  if query and tostring(query) ~= "" then
+    local q = tostring(query):lower()
+    local function rank(id)
+      local idLower = id:lower()
+      local def = S.data.moves[id]
+      local nameLower = (type(def) == "table" and def.name)
+        and tostring(def.name):lower() or ""
+      if idLower == q or nameLower == q then return 0 end
+      if idLower:sub(1, #q) == q
+          or (nameLower ~= "" and nameLower:sub(1, #q) == q) then
+        return 1
+      end
+      if idLower:find(q, 1, true)
+          or (nameLower ~= "" and nameLower:find(q, 1, true)) then
+        return 2
+      end
+      return 3  -- type / power / accuracy hit
+    end
+    table.sort(out, function(a, b)
+      local ra, rb = rank(a), rank(b)
+      if ra ~= rb then return ra < rb end
+      return a < b
+    end)
+  end
+  return out
+end
+
+-- One funnel for assigning a move (picker commit and cycleMove).  Refuses
+-- unknown / scalar ids before MonOps asserts, and speaks in the status bar.
+function Ops.setMove(S, mon, slot, id)
+  if not mon then return false end
+  slot = math.floor(tonumber(slot) or 0)
+  if slot < 1 or slot > 4 then return false end
+  local current = mon.moves and mon.moves[slot] and mon.moves[slot].id
+  if id == current then
+    return Ops.say(S, ("Move %d is already %s"):format(slot, tostring(id)))
+  end
+  if not Ops.moveUsable(S, id) then
+    return Ops.say(S, ("%s is not a usable move,  cannot assign it")
+      :format(tostring(id)))
+  end
+  local ok, err = pcall(MonOps.setMove, S.data, mon, slot, id)
+  if not ok then
+    return Ops.say(S, ("Could not set move %d: %s"):format(slot, tostring(err)))
+  end
+  return Ops.mark(S, ("Move %d set to %s"):format(slot, id))
+end
+
+-- Modal door for the move picker.  `slot` is which of the four move rows the
+-- inspector opened; the picker writes back through Ops.setMove on commit.
+function Ops.openMovePicker(S, Kit, slot)
+  if not S.editingMon then
+    return Ops.say(S, "Pick a slot first, then choose a move")
+  end
+  slot = math.floor(tonumber(slot) or 0)
+  if slot < 1 or slot > 4 then
+    return Ops.say(S, "Move slots are 1 through 4")
+  end
+  if not (S.cat and S.cat.moves and #S.cat.moves > 0) then
+    return Ops.say(S, "No moves in the catalog")
+  end
+  S.movePicker = { query = "", offset = 0, opened = true, slot = slot }
+  if Kit then Kit.focus = "move-picker" end
+  return true
+end
+
+function Ops.closeMovePicker(S, Kit)
+  S.movePicker = nil
+  if Kit and Kit.blur then Kit.blur() end
 end
 
 function Ops.clearMove(S, mon, slot)
@@ -780,6 +910,8 @@ function Ops.maxMoney(S)
   return Ops.addMoney(S, Ops.MONEY_MAX)
 end
 
+-- ram/wram.asm:1908 wPlayerCoins is two BCD bytes, so 9999 is the ceiling on
+-- both generations (misc_constants.asm:47 MAX_COINS).
 Ops.COIN_MAX = 9999
 
 function Ops.addCoins(S, delta)
@@ -791,6 +923,10 @@ function Ops.addCoins(S, delta)
   end
   Gen.setCoins(S.save, want)
   return Ops.mark(S, ("Coins set to %d"):format(want))
+end
+
+function Ops.maxCoins(S)
+  return Ops.addCoins(S, Ops.COIN_MAX)
 end
 
 function Ops.addToBag(S, id)
@@ -829,6 +965,105 @@ function Ops.bagDrop(S, id)
   return Ops.mark(S, ("Dropped all %d %s"):format(qty, id))
 end
 
+-- home/list_menu.asm:474 IsKeyItem (Gen 1 prints no count for key items or
+-- HMs); ram/wram.asm:3115 wKeyItems (Gen 2 stores that pocket as bare ids)
+-- and engine/items/tmhm.asm:390 prints no count for an HM.
+function Ops.itemStacks(S, id)
+  if not id then return false end
+  if Gen.ofState(S) == 2 then
+    return Bag.pocketOf(id, S.data) ~= "KEY_ITEM"
+      and tostring(id):sub(1, 3) ~= "HM_"
+  end
+  local def = S.data and S.data.items and S.data.items[id]
+  return not ((def and def.keyItem) or tostring(id):find("^HM_") ~= nil)
+end
+
+-- engine/items/inventory.asm:74 caps a slot at 99
+function Ops.bagMax(S, id)
+  if not id then return Ops.say(S, "No bag row selected") end
+  local have = S.save.inventory[id] or 0
+  if have <= 0 then return Ops.say(S, ("%s is not in the bag"):format(id)) end
+  if not Ops.itemStacks(S, id) then
+    return Ops.say(S, ("%s has no quantity to max"):format(id))
+  end
+  if have >= Ops.STACK_MAX then
+    return Ops.say(S, ("%s is already at x%d"):format(id, Ops.STACK_MAX))
+  end
+  Bag.add(S.save, id, Ops.STACK_MAX - have, S.data)
+  return Ops.mark(S, ("%s x%d"):format(id, Ops.STACK_MAX))
+end
+
+function Ops.bagCanMax(S, id)
+  if id then
+    local have = S.save.inventory[id] or 0
+    return have > 0 and have < Ops.STACK_MAX and Ops.itemStacks(S, id)
+  end
+  for _, rowId in ipairs(Bag.order(S.save, S.data)) do
+    if Ops.bagCanMax(S, rowId) then return true end
+  end
+  return false
+end
+
+function Ops.bagMaxAll(S)
+  local order = Bag.order(S.save, S.data)
+  local ids = {}
+  for i = 1, #order do ids[i] = order[i] end
+  local n = 0
+  for _, id in ipairs(ids) do
+    local have = S.save.inventory[id] or 0
+    if have > 0 and have < Ops.STACK_MAX and Ops.itemStacks(S, id) then
+      Bag.add(S.save, id, Ops.STACK_MAX - have, S.data)
+      n = n + 1
+    end
+  end
+  if n == 0 then
+    return Ops.say(S, ("Every bag stack is already at x%d"):format(Ops.STACK_MAX))
+  end
+  return Ops.mark(S, ("Maxed %d bag stack%s to x%d")
+    :format(n, n == 1 and "" or "s", Ops.STACK_MAX))
+end
+
+-- constants/item_data_constants.asm:41
+local POCKET_RANK = { ITEM = 1, BALL = 2, KEY_ITEM = 3, TM_HM = 4 }
+
+local ITEM_SORT_KEYS = {
+  index = function(def, id) return (def and def.index) or math.huge end,
+  name = function(def, id)
+    return tostring((def and def.name) or id):lower()
+  end,
+}
+
+local function itemRows(S, ids, mode)
+  local make = ITEM_SORT_KEYS[mode] or ITEM_SORT_KEYS.index
+  local items = S.data and S.data.items
+  local gen2 = Gen.ofState(S) == 2
+  local rows = {}
+  for i = 1, #ids do
+    local id = ids[i]
+    local def = items and items[id]
+    rows[i] = { id = id, key = make(def, id),
+      rank = gen2 and (POCKET_RANK[Bag.pocketOf(id, S.data)] or 9) or 0 }
+  end
+  table.sort(rows, function(a, b)
+    if a.rank ~= b.rank then return a.rank < b.rank end
+    if a.key ~= b.key then return a.key < b.key end
+    return a.id < b.id
+  end)
+  local out = {}
+  for i = 1, #rows do out[i] = rows[i].id end
+  return out
+end
+
+function Ops.bagSort(S, mode)
+  if not ITEM_SORT_KEYS[mode] then return false end
+  local order = Bag.order(S.save, S.data)
+  if #order < 2 then return Ops.say(S, "Nothing to sort in the bag") end
+  local sorted = itemRows(S, order, mode)
+  for i = 1, #sorted do order[i] = sorted[i] end
+  S.bagOffset = 0
+  return Ops.mark(S, ("Bag sorted by %s (%d items)"):format(mode, #order))
+end
+
 function Ops.pcItems(S)
   S.save.pcItems = S.save.pcItems or {}
   return S.save.pcItems
@@ -837,8 +1072,29 @@ end
 function Ops.pcOrder(S)
   local ids = {}
   for id in pairs(Ops.pcItems(S)) do ids[#ids + 1] = id end
-  table.sort(ids)
-  return ids
+  return itemRows(S, ids, S.pcSort)
+end
+
+function Ops.pcSort(S, mode)
+  if not ITEM_SORT_KEYS[mode] then return false end
+  local repeated = S.pcSort == mode
+  S.pcSort = mode
+  if not repeated then S.pcOffset = 0 end
+  local stored = S.save.pcOrder
+  if type(stored) == "table" then
+    local sorted = Ops.pcOrder(S)
+    local same = #stored == #sorted
+    for i = 1, #sorted do
+      if stored[i] ~= sorted[i] then same = false end
+    end
+    if not same then
+      S.pcOffset = 0
+      for i = 1, #stored do stored[i] = nil end
+      for i = 1, #sorted do stored[i] = sorted[i] end
+      return Ops.mark(S, ("PC storage sorted by %s"):format(mode))
+    end
+  end
+  return not repeated
 end
 
 function Ops.addToPc(S, id)
@@ -875,6 +1131,50 @@ function Ops.pcDrop(S, id)
   local qty = pc[id] or 0
   pc[id] = nil
   return Ops.mark(S, ("Dropped all %d %s from PC storage"):format(qty, id))
+end
+
+function Ops.pcMax(S, id)
+  if not id then return Ops.say(S, "No PC row selected") end
+  local pc = Ops.pcItems(S)
+  if not pc[id] then return Ops.say(S, ("%s is not in PC storage"):format(id)) end
+  if not Ops.itemStacks(S, id) then
+    return Ops.say(S, ("%s has no quantity to max"):format(id))
+  end
+  if pc[id] >= Ops.STACK_MAX then
+    return Ops.say(S, ("%s is already at x%d"):format(id, Ops.STACK_MAX))
+  end
+  pc[id] = Ops.STACK_MAX
+  return Ops.mark(S, ("%s x%d in PC storage"):format(id, Ops.STACK_MAX))
+end
+
+function Ops.pcCanMax(S, id)
+  local pc = Ops.pcItems(S)
+  if id then
+    return (pc[id] or 0) > 0 and pc[id] < Ops.STACK_MAX and Ops.itemStacks(S, id)
+  end
+  for rowId, qty in pairs(pc) do
+    if qty > 0 and qty < Ops.STACK_MAX and Ops.itemStacks(S, rowId) then
+      return true
+    end
+  end
+  return false
+end
+
+function Ops.pcMaxAll(S)
+  local pc = Ops.pcItems(S)
+  local n = 0
+  for _, id in ipairs(Ops.pcOrder(S)) do
+    local qty = pc[id] or 0
+    if qty > 0 and qty < Ops.STACK_MAX and Ops.itemStacks(S, id) then
+      pc[id] = Ops.STACK_MAX
+      n = n + 1
+    end
+  end
+  if n == 0 then
+    return Ops.say(S, ("Every PC stack is already at x%d"):format(Ops.STACK_MAX))
+  end
+  return Ops.mark(S, ("Maxed %d PC stack%s to x%d")
+    :format(n, n == 1 and "" or "s", Ops.STACK_MAX))
 end
 
 -- Badges are truthy inventory flags, not stackable items, which is why the
@@ -1139,6 +1439,76 @@ function Ops.setPokerus(S, mon, value)
   end
   mon.pokerus = want
   return Ops.mark(S, ("%s pokerus byte %d"):format(mon.species, want))
+end
+
+-- engine/pokemon/caught_data.asm:169-172
+Ops.CAUGHT_TIMES = { "UNKNOWN", "MORN", "DAY", "NITE" }
+
+local function caughtGuard(S, mon)
+  if not mon then return false end
+  if not Gen.hasCaughtData(S.save, S.version) then
+    return Ops.say(S, "This game has no caught data")
+  end
+  return true
+end
+
+function Ops.setCaughtTime(S, mon, value)
+  if not caughtGuard(S, mon) then return false end
+  local want = clamp(math.floor(tonumber(value) or 0), 0, 3)
+  if want == (mon.caughtTime or 0) then
+    return Ops.say(S, ("Caught time is already %s"):format(Ops.CAUGHT_TIMES[want + 1]))
+  end
+  mon.caughtTime = want
+  return Ops.mark(S, ("%s caught time %s")
+    :format(mon.species, Ops.CAUGHT_TIMES[want + 1]))
+end
+
+-- constants/pokemon_data_constants.asm:120-121
+function Ops.setCaughtLevel(S, mon, value)
+  if not caughtGuard(S, mon) then return false end
+  local Mon = require("src.battle.gen2.Mon")
+  local want = clamp(math.floor(tonumber(value) or 0), 0, Mon.CAUGHT_LEVEL_MASK)
+  if want == (mon.caughtLevel or 0) then
+    return Ops.say(S, ("Caught level is already %d"):format(want))
+  end
+  mon.caughtLevel = want
+  return Ops.mark(S, ("%s caught level %d"):format(mon.species, want))
+end
+
+-- constants/landmark_constants.asm:111-113
+function Ops.setCaughtLocation(S, mon, value)
+  if not caughtGuard(S, mon) then return false end
+  local Mon = require("src.battle.gen2.Mon")
+  local span = Mon.CAUGHT_LOCATION_MASK + 1
+  local want = math.floor(tonumber(value) or 0) % span
+  if want == (mon.caughtLocation or 0) then
+    return Ops.say(S, ("Caught location is already %s")
+      :format(Gen.landmarkName(S.data, want)))
+  end
+  mon.caughtLocation = want
+  return Ops.mark(S, ("%s caught at %s")
+    :format(mon.species, Gen.landmarkName(S.data, want)))
+end
+
+function Ops.setCaughtByGender(S, mon, gender)
+  if not caughtGuard(S, mon) then return false end
+  local Mon = require("src.battle.gen2.Mon")
+  local want = Mon.caughtGenderOf(gender)
+  if want == mon.caughtByGender then
+    return Ops.say(S, ("Caught by is already %s"):format(tostring(want or "none")))
+  end
+  mon.caughtByGender = want
+  return Ops.mark(S, ("%s caught by %s"):format(mon.species, tostring(want or "none")))
+end
+
+function Ops.setPlayerGender(S, gender)
+  if not Gen.hasPlayerGender(S.save, S.version) then
+    return Ops.say(S, "This game has no player gender")
+  end
+  if Gen.playerGender(S.save) == gender then
+    return Ops.say(S, ("Player is already %s"):format(tostring(gender)))
+  end
+  return Ops.mark(S, ("Player gender %s"):format(Gen.setPlayerGender(S.save, gender)))
 end
 
 return Ops

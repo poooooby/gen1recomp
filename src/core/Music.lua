@@ -230,7 +230,7 @@ end
 
 function Music.play(data, song, loop, ctx)
   if not song then return end
-  if not love.audio then return end -- headless test stub
+  if not (love and love.audio) then return end -- headless test stub
   ctx = ctx or {}
   song = selectSong(song, ctx)
 
@@ -313,7 +313,7 @@ function Music.play(data, song, loop, ctx)
   -- (update() starts it, like the paused-song resume)
   if fanfareActive() then
     state.fanfareResume = true
-  else
+  elseif not isChip then
     pcall(src.play, src)
   end
   local previous = state.current
@@ -476,11 +476,11 @@ function Music.mapSong()
   return state.mapSong
 end
 
-function Music.restoreMap(data)
+function Music.restoreMap(data, reason)
   state.current = nil
   state.pendingRestore = nil
   local play = effectiveMapSong(data, state.mapSong)
-  if play then Music.play(data, play, nil, { reason = "map" }) end
+  if play then Music.play(data, play, nil, { reason = reason or "map" }) end
 end
 
 -- Overwrite the remembered map song without playing anything: the wMapMusic
@@ -519,6 +519,13 @@ function Music.applyOptions(opts)
   Music.setFilterLevel(opts and opts.musicFilter or 0)
   -- engine/menus/options_menu.asm SOUND row (wOptions STEREO bit)
   local ChipAudio = require("src.core.ChipAudio")
+  local data, song, loop = state.data, state.current, state.loop
+  local tempo, start, wasChip = state.tempo, state.start, state.chip
+  if ChipAudio.applyOptions(opts) and wasChip and data and song then
+    Music.stop()
+    Music.play(data, song, loop, { reason = "audiorate", selected = true,
+                                   tempo = tempo, start = start })
+  end
   ChipAudio.setStereo(opts and opts.sound == "STEREO")
   -- setStereo may swap the queueable source so the new pan is not sitting
   -- behind already-mixed buffers; re-bind so volume/filter follow (#1471)

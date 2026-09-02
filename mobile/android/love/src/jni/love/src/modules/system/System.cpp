@@ -182,7 +182,7 @@ void System::vibrate(double seconds) const
 #endif
 }
 
-bool System::pickFile(const char *kind) const
+bool System::pickFile(const char *kind, const char *destination) const
 {
 #ifdef LOVE_ANDROID
 	const char *dest = "picked_rom.gb";
@@ -193,7 +193,8 @@ bool System::pickFile(const char *kind) const
 		else if (strcmp(kind, "sav") == 0 || strcmp(kind, "save") == 0)
 			dest = "picked_save.sav";
 		else if (strcmp(kind, "required_import") == 0)
-			dest = "picked_required_import.bin";
+			dest = (destination != nullptr && destination[0] != '\0')
+				? destination : "picked_required_import.bin";
 		else if (strcmp(kind, "rom") == 0)
 			dest = "picked_rom.gb";
 		// Unknown kinds used to fall through to the ROM destination. Refuse them
@@ -245,6 +246,16 @@ bool System::restartApp() const
 #endif
 }
 
+bool System::installApk(const char *path) const
+{
+#ifdef LOVE_ANDROID
+	return love::android::installApk(path);
+#else
+	LOVE_UNUSED(path);
+	return false;
+#endif
+}
+
 bool System::updateShortcuts(const std::vector<std::string> &versions) const
 {
 #ifdef LOVE_ANDROID
@@ -259,6 +270,15 @@ std::string System::getLaunchGame() const
 {
 #ifdef LOVE_ANDROID
 	return love::android::getLaunchGame();
+#else
+	return "";
+#endif
+}
+
+std::string System::getLaunchURI() const
+{
+#ifdef LOVE_ANDROID
+	return love::android::getLaunchURI();
 #else
 	return "";
 #endif

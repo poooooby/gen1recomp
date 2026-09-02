@@ -11,6 +11,7 @@
 
 local Assets = require("src.render.Assets")
 local Font = require("src.render.Font")
+local LevelDisplay = require("src.ui.LevelDisplay")
 local Logger = require("src.core.Logger")
 local Runtime = require("src.mods.Runtime")
 local Screens = require("src.ui.Screens")
@@ -70,6 +71,12 @@ function PartyMenu:sgbPalettes(game)
   end
   return zones
 end
+
+-- data/moves/field_moves.asm: leftmost tile per field move name
+local FIELD_MOVE_X = {
+  cut = 12, fly = 12, surf = 12, flash = 12, DIG = 12,
+  strength = 10, TELEPORT = 10, softboiled = 8,
+}
 
 local function sameItems(_, items) return items end
 
@@ -305,6 +312,7 @@ function PartyMenu.new(game, opts)
   self.onSwitch = opts.onSwitch
   self.onCancel = opts.onCancel
   self.pickOnly = opts.pickOnly
+  self.itemUse = opts.itemUse -- USE_ITEM_PARTY_MENU (item_effects.asm:813)
   -- Medicine keeps the picker on screen: item_effects.asm .doneHealing
   -- animates the party HP bar and then prints the message through
   -- RedrawPartyMenu with the menu STILL up, so BagMenu asks for keepOpen and
@@ -321,6 +329,7 @@ function PartyMenu.new(game, opts)
   self.battle = opts.battle
   self.party = party -- link/scoped battles pass their local party view
   self.swapFrom = nil
+  self.swapAnim = nil
   self.submenu = nil
   self.subIndex = 1
   self.blink = 0
@@ -353,6 +362,19 @@ function PartyMenu:close()
   if self.game.stack:top() == self then self.game.stack:pop() end
 end
 
+-- engine/menus/party_menu.asm:12, engine/menus/start_sub_menus.asm:287
+function PartyMenu:eraseCursors()
+  self.cursorsErased = true
+end
+
+-- engine/battle/core.asm:2329
+function PartyMenu:refuse(text)
+  self.submenu = nil
+  self.subIndex = 1
+  local TextBox = require("src.render.TextBox")
+  self.game.stack:push(TextBox.new(self.game, text))
+end
+
 function PartyMenu:gridNavigation()
   if not self.battle
       or not Runtime.wantsHook("ui.party.grid_navigation") then return false end
@@ -375,6 +397,25 @@ function PartyMenu:update(dt)
     end
     return
   end
+  -- SwitchPartyMon_ClearGfx (engine/menus/start_sub_menus.asm:690), then
+  -- RedrawPartyMenu_ (engine/menus/party_menu.asm:8)
+  local anim = self.swapAnim
+  if anim then
+    anim.frames = anim.frames + 1
+    local playing = false
+    if anim.src then
+      local ok, p = pcall(anim.src.isPlaying, anim.src)
+      playing = ok and p or false
+    end
+    if anim.frames < 10 or (playing and anim.frames < 30) then return end
+    self.swapAnim = nil
+    if self.game.data then
+      require("src.core.Sound").play(self.game.data, "Swap")
+    end
+    return
+  end
+  -- home/window.asm:119
+  self.cursorsErased = nil
   local input = self.game.input
   local party = self.party or self.game.save.party
 
@@ -410,8 +451,13 @@ function PartyMenu:update(dt)
         -- (core.asm .partyMenuWasSelected)
         Screens.push(self.game, "SummaryMenu", mon)
       elseif action == "battle_switch" then
-        self.game.stack:pop()
-        self.onSwitch(mon)
+        -- engine/battle/core.asm:2396
+        if self.keepOpen then
+          self.onSwitch(mon, self)
+        else
+          self.game.stack:pop()
+          self.onSwitch(mon)
+        end
         return
       elseif action == "cancel" then
         self.game.stack:pop()
@@ -635,11 +681,17 @@ function PartyMenu:update(dt)
       self.softboiledFrom = nil
       self.game.overworld:useSoftboiledFieldMove(user, mon)
     elseif self.swapFrom then
-      if self.swapFrom ~= self.index then
-        party[self.swapFrom], party[self.index] = party[self.index], party[self.swapFrom]
-        require("src.core.Sound").play(self.game.data, "Swap")
-      end
+      -- SwitchPartyMon (engine/menus/start_sub_menus.asm:660)
+      local from = self.swapFrom
       self.swapFrom = nil
+      if from ~= self.index then
+        party[from], party[self.index] = party[self.index], party[from]
+      end
+      self.swapAnim = { blank = { [from] = true }, frames = 0 }
+      if self.game.data then
+        self.swapAnim.src = require("src.core.Sound").play(self.game.data, "Swap")
+      end
+      return
     elseif self.onSwitch and (self.forceSwitch or self.pickOnly or not self.battle) then
       -- keepOpen callers (HP medicine) need the menu still drawn while the
       -- bar fills and the message prints, and close it themselves; everyone
@@ -705,6 +757,9 @@ function PartyMenu:update(dt)
         -- (text_box.asm .donePrintingNames). #768
         items[#items + 1] = { label = Strings("STATS"), action = "stats" }
         items[#items + 1] = { label = Strings("SWITCH"), action = "switch" }
+        -- CANCEL closes the whole party menu (start_sub_menus.asm:71-75
+        -- .exitMenu), where B returns to the party list. #1833
+        items[#items + 1] = { label = Strings("CANCEL"), action = "cancel" }
       end
       local ctx = { battle = self.battle, overworld = ow }
       local hooked = Runtime.call("ui.party.submenu", sameItems,
@@ -720,22 +775,18 @@ function PartyMenu:update(dt)
   end
 end
 
--- The bottom-of-screen context message for the current menu state
--- (pokered engine/menus/party_menu.asm PartyMenuMessage / RedrawPartyMenu_):
--- the party menu always prints a message in the bottom text box.  With the
--- normal message id that is PartyMenuBattleText ("Bring out which POKéMON?")
--- when IsInBattle else PartyMenuNormalText ("Choose a POKéMON."); the swap /
--- item / TM-HM ids print their own strings, which draw() handles inline.
--- Pure (no side effects) so drivers can assert it. #147
+-- engine/menus/party_menu.asm:229 (#147 #1610 #1901)
 function PartyMenu:bottomMessage()
   if self.swapFrom then
-    return "Move to where?"
-  elseif self.softboiledFrom or self.pickOnly then
-    return "Use on which one?"
+    return self.game.data.text._PartyMenuSwapMonText
+      or Strings("Move POKéMON\nwhere?")
   elseif self.tmhm then
     return self.game.data.text._PartyMenuUseTMText
       or Strings("Use TM on which\nPOKéMON?")
-  elseif self.battle then
+  elseif self.softboiledFrom or self.itemUse then
+    return self.game.data.text._PartyMenuItemUseText
+      or Strings("Use item on which\nPOKéMON?")
+  elseif self.forceSwitch then
     return self.game.data.text._PartyMenuBattleText
       or Strings("Bring out which\nPOKéMON?")
   else
@@ -772,6 +823,8 @@ function PartyMenu:draw()
   local barZoned = PaletteFX.shader() ~= nil
                    and PaletteFX.pal(self.game.data, "GREENBAR") ~= nil
   for i, mon in ipairs(party) do
+    -- SwitchPartyMon_ClearGfx (engine/menus/start_sub_menus.asm:668)
+    if not (self.swapAnim and self.swapAnim.blank[i]) then
     local def = self.game.data.pokemon[mon.species]
     local y = PartyMenu.entryY(i)
     love.graphics.setColor(1, 1, 1, 1)
@@ -781,7 +834,11 @@ function PartyMenu:draw()
     -- level at column 13 (<LV> tile + digits, PrintLevel) AND the
     -- status/FNT text at column 17 (PrintStatusCondition), like the
     -- original rows -- statused mons keep their level display
-    if mon.level < 100 then
+    if not LevelDisplay.visible(mon, "party", self.game) then -- RFC 0019
+      -- the level column is simply empty; the status/FNT column at 17 is a
+      -- separate field and still prints, exactly as it does for a mon whose
+      -- level is on screen
+    elseif mon.level < 100 then
       HudTiles.tile(0x6E, 104, y) -- <LV>
       Font.draw(tostring(mon.level), 112, y)
     else
@@ -849,56 +906,41 @@ function PartyMenu:draw()
     -- level with the middle of the two-row icon -- not on the name row that
     -- entryY returns.  Drawing it at y put it a tile too high (#278).
     local cursorY = y + 8
-    if i == self.index then
+    if i == self.index and not self.cursorsErased then
       Font.drawCode(Theme.cursor, 0, cursorY)
     end
     -- the unfilled swap arrow; the filled cursor replaces it in the tilemap
     -- when they share a row (PlaceMenuCursor, home/window.asm:184-185) (#814)
-    if (i == self.swapFrom or i == self.softboiledFrom) and i ~= self.index then
+    if (i == self.swapFrom or i == self.softboiledFrom) and i ~= self.index
+        and not self.cursorsErased then
       Font.drawCode(Theme.cursorHollow, 0, cursorY)
     end
+    end
   end
-  if self.swapFrom then
-    Font.draw(Strings("Move to where?"), 8, 136)
-  elseif self.softboiledFrom then
-    Font.draw(Strings("Use on which one?"), 8, 136)
-  elseif self.tmhm then
-    -- "Use TM on which\nPOKeMON?" in the standard bottom text box
-    -- (party_menu.asm keeps the message box for the TM/HM menu); box + line
-    -- geometry match TextBox's default (rows 12-17, text on rows 14/16). #210
-    Font.drawBox(0, 12, 20, 6)
-    love.graphics.setColor(0, 0, 0, 1)
-    local prompt = self.game.data.text._PartyMenuUseTMText
-      or Strings("Use TM on which\nPOKéMON?")
-    local ly = 112
-    for line in (prompt .. "\n"):gmatch("([^\n]*)\n") do
-      Font.draw(line, 8, ly)
-      ly = ly + 16
-    end
-  elseif self.pickOnly then
-    Font.draw(Strings("Use on which one?"), 8, 136)
-  else
-    -- default field party menu (StartMenu) and the battle voluntary-switch
-    -- (BattleState:openParty): Gen1 prints PartyMenuNormalText / PartyMenuBattleText
-    -- in the standard bottom text box (party_menu.asm PartyMenuMessage), not
-    -- plain bottom-row text.  Box + line geometry match the #210 TM/HM case and
-    -- TextBox's default (rows 12-17, text on rows 14/16). #147
-    Font.drawBox(0, 12, 20, 6)
-    love.graphics.setColor(0, 0, 0, 1)
-    local ly = 112
-    for line in (self:bottomMessage() .. "\n"):gmatch("([^\n]*)\n") do
-      Font.draw(line, 8, ly)
-      ly = ly + 16
-    end
+  -- every message id prints through PrintText, so it lands in the standard
+  -- bottom text box, rows 12-17 (party_menu.asm:174). #147 #210 #1610
+  Font.drawBox(0, 12, 20, 6)
+  love.graphics.setColor(0, 0, 0, 1)
+  local ly = 112
+  for line in (self:bottomMessage() .. "\n"):gmatch("([^\n]*)\n") do
+    Font.draw(line, 8, ly)
+    ly = ly + 16
   end
   if self.submenu then
     local n = #self.subItems
-    Font.drawBox(9, 17 - n * 2 - 1, 11, n * 2 + 1)
-    local y0 = (17 - n * 2) * 8
-    for si, entry in ipairs(self.subItems) do
-      Font.draw(entry.label, 88, y0 + (si - 1) * 16)
+    -- engine/menus/text_box.asm:397-440, data/text_boxes.asm:33 #1819
+    local lx = 12
+    for _, entry in ipairs(self.subItems) do
+      local mx = FIELD_MOVE_X[entry.move or entry.action]
+      if mx and mx < lx then lx = mx end
     end
-    Font.drawCode(Theme.cursor, 80, y0 + (self.subIndex - 1) * 16)
+    local top = n > 3 and math.max(0, 16 - n * 2) or 11
+    Font.drawBox(lx - 1, top, 21 - lx, 18 - top)
+    local y0 = (18 - n * 2) * 8
+    for si, entry in ipairs(self.subItems) do
+      Font.draw(entry.label, (lx + 1) * 8, y0 + (si - 1) * 16)
+    end
+    Font.drawCode(Theme.cursor, lx * 8, y0 + (self.subIndex - 1) * 16)
   end
   love.graphics.setColor(1, 1, 1, 1)
 end

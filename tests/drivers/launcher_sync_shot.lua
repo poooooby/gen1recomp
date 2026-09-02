@@ -22,6 +22,10 @@ return function(game)
     syncNow = function(self) self.status = "Checking for changes..." return true end,
     unlink = function(self) self.isLinked, self.codes = false, nil return true end,
     shareMods = function(self) self.shareCode = "K7QW3M" return true end,
+    answerModOptions = function(self, importThem)
+      if self.modPlan then self.modPlan.applyOptions = importThem and true or false end
+      return importThem
+    end,
     fetchShare = function(self) return true end,
     applyModPlan = function(self) self.modPlan = nil return true end,
     resolveConflict = function(self) self.conflicts = {} self.phase = "idle" return true end,
@@ -95,6 +99,24 @@ return function(game)
   U.log("share code:", tostring(eng.shareCode))
   shot("sync_mods.png")
 
+  eng.modPlan.options = {
+    { id = "jp_green", values = { language = "JP" } },
+    { id = "randomizer", values = { seed = 1234, wild = true } },
+    { id = "widescreen_hud", values = { scale = 2 } },
+  }
+  U.wait(2)
+  U.log("options question up:", tostring(eng.modPlan.applyOptions == nil))
+  shot("sync_mod_options.png")
+
+  love.window.setMode(800, 480, { resizable = true, highdpi = true })
+  U.wait(3)
+  shot("sync_mod_options_short.png")
+  imp:_syncAnswerModOptions(false)
+  U.wait(2)
+  shot("sync_mods_short.png")
+  love.window.setMode(1024, 768, { resizable = true, highdpi = true })
+  U.wait(3)
+
   eng.phase = "conflict"
   eng.status = "These saves were played at the same time."
   eng.conflicts = { {
@@ -121,6 +143,30 @@ return function(game)
   U.wait(2)
   U.log("closed:", tostring(imp._syncModal == nil))
   shot("sync_closed.png")
+
+  love.window.setMode(1024, 768, { resizable = true, highdpi = true })
+  U.wait(3)
+  imp:_switchTab("red")
+  eng.changed = true
+  eng.lastDownloads = { { version = "red", slot = "slot2", created = true,
+                          device = "Android" } }
+  imp:update(1 / 60)
+  U.log("download notice:", tostring(imp.saveNotice.red and imp.saveNotice.red.text))
+  U.wait(2)
+  shot("sync_downloaded.png")
+
+  eng.changed = true
+  eng.lastDownloads = { { version = "red", cart = "nuzlocke", slot = "slot1",
+                          created = true, device = "Android" } }
+  imp:update(1 / 60)
+  local cartNotice = imp.saveNotice["cart_nuzlocke"]
+  U.log("cart download notice:", tostring(cartNotice and cartNotice.text))
+  U.log("cart slots refreshed:",
+    tostring(imp.slots["cart_nuzlocke"] ~= nil))
+  U.log("vanilla notice intact:",
+    tostring(imp.saveNotice.red and imp.saveNotice.red.text))
+  U.wait(2)
+  shot("sync_downloaded_cart.png")
 
   U.log("done")
   love.event.quit()

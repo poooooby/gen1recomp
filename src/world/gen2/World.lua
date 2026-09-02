@@ -20,6 +20,7 @@ local CallAsm = require("src.script.gen2.CallAsm")
 local Camera = require("src.render.Camera")
 local Clock = require("src.core.gen2.Clock")
 local CatchTutorial = require("src.core.gen2.CatchTutorial")
+local Catching = require("src.battle.gen2.Catching")
 local Decorations = require("src.core.gen2.Decorations")
 local MomShopping = require("src.core.gen2.MomShopping")
 local CmdQueue = require("src.world.gen2.CmdQueue")
@@ -40,7 +41,9 @@ local HallOfFame = require("src.core.gen2.HallOfFame")
 local HiddenItems = require("src.world.gen2.HiddenItems")
 local Mail = require("src.core.gen2.Mail")
 local Map = require("src.world.gen2.Map")
+local MapNameSign = require("src.world.gen2.MapNameSign")
 local Palettes = require("src.world.gen2.Palettes")
+local UnownWords = require("src.world.gen2.UnownWords")
 local Mon = require("src.battle.gen2.Mon")
 local Movement = require("src.script.gen2.Movement")
 local Music = require("src.core.Music")
@@ -55,7 +58,11 @@ local Roamers = require("src.core.gen2.Roamers")
 local Runtime = require("src.mods.Runtime")
 local Screens = require("src.ui.Screens")
 local Sound = require("src.core.Sound")
+local SpriteRenderer = require("src.render.SpriteRenderer")
 local StepEvents = require("src.world.gen2.StepEvents")
+local TileAttrs = require("src.world.gen2.TileAttrs")
+local OamFootprint = require("src.world.gen2.OamFootprint")
+local MapAttrGrid = require("src.world.gen2.MapAttrGrid")
 local Tilt = require("src.render.Tilt")
 local Strings = require("src.core.Strings")
 local TextBox = require("src.render.TextBox")
@@ -83,6 +90,8 @@ local SFX = {
   WARP_TO = 19,
   EXIT_BUILDING = 35,
   JUMP_OVER_LEDGE = 0x16,
+  BUMP = 0x24,
+  FLY = 0x18,
 }
 local EMOTE_SHOCK = 0
 
@@ -115,6 +124,14 @@ local VAR = {
   XCOORD = 0x12,
   YCOORD = 0x13,
   SPECIALPHONECALL = 0x14,
+  -- ../pokecrystal/constants/script_constants.asm:69-74, the six rows Gold's
+  -- table stops short of; ../pokecrystal/engine/overworld/variables.asm:62-67.
+  BT_WIN_STREAK = 0x15,
+  KURT_APRICORNS = 0x16,
+  CALLERID = 0x17,
+  BLUECARDBALANCE = 0x18,
+  BUENASPASSWORD = 0x19,
+  KENJI_BREAK = 0x1a,
 }
 
 -- constants/ram_constants.asm:293 wPlayerState.  PLAYER_SKATE (2) has no row:
@@ -132,6 +149,8 @@ for id, state in pairs(PLAYER_STATE_BY_ID) do PLAYER_STATE_ID[state] = id end
 
 local BATTLETYPE = {
   CANLOSE = 1,
+  -- CheckEncounterRoamMon, ../pokecrystal/engine/overworld/wildmons.asm:561
+  ROAMING = 5,
   FORCESHINY = 7,
   FORCEITEM = 10,
 }
@@ -214,6 +233,17 @@ local MAPSETUP_ROAM_JUMP = { [MAPSETUP.TELEPORT] = true }
 -- World:draw already holds for the fade specials.
 local FADE_STEPS = 4
 local FADE_STEP_FRAMES = 2
+
+-- home/map.asm:1927-1940 over home/tilemap.asm:12-25
+local MENU_EXIT_RELOAD_FRAMES = 9
+local MENU_EXIT_WHITE_FRAMES = 4 + MENU_EXIT_RELOAD_FRAMES + (4 + 4) + 2
+-- engine/pokegear/pokegear.asm:2074-2078, home/menu.asm:80-83
+local FLY_EXIT_WHITE_FRAMES = 4 + 4 + MENU_EXIT_WHITE_FRAMES
+-- engine/pokegear/pokegear.asm:2027-2046 over home/gfx.asm:189-262
+local FLY_MAP_BUILD_FRAMES = 4 + 4 + 7 + 1 + 7 + 3 + 2
+-- engine/events/overworld.asm:593-597, engine/menus/start_menu.asm:503-518
+local FLY_CANCEL_BLANK_FRAMES = 4 + 8 + 4 + 5
+local FLY_CANCEL_ICON_FRAMES = 3
 
 -- A New Game starts in the bedroom, not outside: engine/menus/intro_menu.asm
 -- NewGame sets wDefaultSpawnpoint = SPAWN_HOME and warps there, and
@@ -373,6 +403,13 @@ local function itemByIndex(items, index)
   return nil
 end
 
+-- One WRAM byte, the width every VAR_* store is (`ld a, [de]` / `ld [de], a`).
+local function byteOf(value)
+  local n = math.floor(tonumber(value) or 0)
+  if n < 0 then n = 0 end
+  return n % 256
+end
+
 -- CountSetBits over a { key = true } flag table: VAR.DEXCAUGHT, VAR.DEXSEEN
 -- and VAR.BADGES are all "how many of these are set" reads off one.
 local function countFlags(flags)
@@ -391,14 +428,18 @@ end
 -- Gen 2 moveset lives in `levelMoves` (EvosAttacks).  So every scripted gift,
 -- the STARTER included, arrived knowing nothing: FIGHT listed no moves and the
 -- battle had no legal action left in it.
-local function givePokeMon(data, speciesIndex, level, itemIndex)
+local function givePokeMon(data, speciesIndex, level, itemIndex, opts)
   local id = speciesByIndex(data.pokemon, speciesIndex)
   if not id then return nil end
   return Mon.new(data, id, level or 5, {
     item = itemIndex and itemIndex ~= 0
       and itemByIndex(data.items, itemIndex) or nil,
+    nickname = opts and opts.nickname or nil,
   })
 end
+
+-- GivePoke's trainer arm (engine/pokemon/move_mon.asm:1698-1736)
+local RANDY_OT_ID = 1001
 
 local function loadGenerated(path)
   -- Same NX gold/ fallback Game2 uses. World:load is what surfaces
@@ -528,6 +569,7 @@ function World.new(game)
     lastSfx = nil,
     pokePic = nil,
     pendingSceneScript = false,
+    startedOverworld = false,
     -- GBC color state (engine/gfx/color.asm).  `daytime` is the resolved
     -- MORN/DAY/NITE/DARK the map is currently lit by; clockHour overrides
     -- World:hour for drivers and tests, so the palette, the hour windows and
@@ -553,6 +595,9 @@ function World.new(game)
     -- STATUSFLAGS_NO_WILD_ENCOUNTERS_F, driven by the `wildoff` / `wildon`
     -- script commands.
     noWildEncounters = false,
+    -- ../pokegold/engine/battle/battle_transition.asm:164
+    staleBattleMonLevel = 0,
+    staleEnemyMonLevel = 0,
     -- Blocks CUT and WHIRLPOOL have swapped out on the loaded map, as
     -- { mapId = { [index] = original } }.  The cart edits wOverworldMapBlocks,
     -- a BUFFER, and LoadMapAttributes refills it from ROM on every map load --
@@ -736,6 +781,15 @@ function World:load()
   self.tilesets = tilesets
   self.roofs = self:dataTable("gen2Roofs", "data/generated/roofs.lua")
   self.sprites = self:dataTable("gen2Sprites", "data/generated/sprites.lua")
+  -- A pre-#1748 cache stamps a SpriteMons row `frames = 1`, leaving
+  -- OBJECT_ACTION_BOUNCE one frame -- engine/overworld/map_object_action.asm:184
+  for _, def in pairs(self.sprites or {}) do
+    if type(def) == "table" and (def.frames or 1) < 2
+       and type(def.source) == "string"
+       and def.source:find("^ROM:SpriteMons") then
+      def.frames = 2
+    end
+  end
   -- A cache from before the palette stage existed simply has no palettes.lua;
   -- everything below falls back to the grayscale path rather than failing.
   self.palettes = self:dataTable("gen2Palettes", "data/generated/palettes.lua")
@@ -779,6 +833,27 @@ function World:load()
       local okImg, img = pcall(Assets.image, emotes.grassRustle)
       if okImg then self.grassRustleImage = img end
     end
+    -- data/sprites/emotes.asm:19
+    if emotes.jumpShadow then
+      local okImg, img = pcall(Assets.image, emotes.jumpShadow)
+      if okImg then self.jumpShadowImage = img end
+    end
+    -- engine/events/field_moves.asm:390-407
+    if emotes.cutGrass then
+      local okImg, img = pcall(Assets.image, emotes.cutGrass)
+      if okImg then
+        self.cutGrassImage = img
+        self.cutGrassQuad = love.graphics.newQuad(0, 0, 8, 8, 32, 8)
+      end
+    end
+    -- LoadFishingGFX's two sheets
+    -- (../pokecrystal/engine/events/fishing_gfx.asm:7-12)
+    if emotes.fishing and pcall(Assets.image, emotes.fishing) then
+      self.fishingSheet = emotes.fishing
+    end
+    if emotes.fishingFemale and pcall(Assets.image, emotes.fishingFemale) then
+      self.fishingSheetFemale = emotes.fishingFemale
+    end
   end
   -- The heal machine's two OBJ tiles and their CGB palette, for the
   -- Pokecenter light show (World:startHealMachineAnim).  A cache from before
@@ -805,6 +880,7 @@ function World:load()
   self.text = self:dataTable("gen2Text", "data/generated/text.lua") or {}
   self.constants =
     self:dataTable("gen2Constants", "data/generated/constants.lua") or {}
+  FieldMoves.bindEngineFlags(self.constants.engineFlagOrder)
   -- The side tables a script command NAMES rather than carries: the phone
   -- book, the in-game trades, the elevator's floor labels and the decoration
   -- descriptions.  A cache built before the extractor reached them has no
@@ -887,8 +963,8 @@ function World:load()
     -- `hold` is the same story one argument along: the cart `pause` a held box
     -- stands through (FindItemInBallScript's `pause 60`).  Dropping it made the
     -- box hand back the instant it finished typing.
-    showText = function(body, onDone, stay, hold)
-      self:showText(body, onDone, stay, hold)
+    showText = function(body, onDone, stay, hold, sfxWait, arrows)
+      self:showText(body, onDone, stay, hold, sfxWait, arrows)
     end,
     facePlayer = function()
       if self.talkNpc and self.player then
@@ -997,15 +1073,28 @@ function World:load()
     setStringBuffer = function(value)
       if self.game then self.game.stringBuffer = value end
     end,
-    givePoke = function(speciesIndex, level, item)
+    givePoke = function(speciesIndex, level, item, opts)
       local data = self.game and self.game.data
       local save = self.game and self.game.save
       if not (data and save) then return end
       save.party = save.party or {}
-      local mon = givePokeMon(data, speciesIndex, level, item)
+      local mon = givePokeMon(data, speciesIndex, level, item, opts)
       if mon then
+        if opts and opts.otName then
+          mon.ot = opts.otName
+          mon.otName = opts.otName
+          mon.otId = RANDY_OT_ID
+        end
         -- GivePoke -> TryAddMonToParty -> AddPartyMon (move_mon.asm:44-56, :143-149).
         Mon.stampOT(save, mon)
+        -- move_mon.asm:1734, :1761
+        if Mon.hasCaughtData(save.version) then
+          if opts and opts.otName then
+            Mon.setGiftCaughtData(mon, opts.caughtBy or "unknown")
+          else
+            Catching.stampCaughtData(mon, self:caughtDataOpts())
+          end
+        end
         Party.add(save.party, mon)
         -- GivePoke ends in SetSeenAndCaughtMon, which is why the STARTER is
         -- already ticked off in the #DEX before the first battle.
@@ -1049,6 +1138,8 @@ function World:load()
       self:playCry(speciesIndex)
     end,
     playSound = function(sfxId)
+      -- home/audio.asm:180
+      require("src.core.Sound").dropPressSfx()
       self:playSfx(sfxId)
     end,
     playMusic = function(musicId)
@@ -1069,6 +1160,22 @@ function World:load()
       if not src then return true end
       local ok, playing = pcall(src.isPlaying, src)
       return not (ok and playing)
+    end,
+    waitSfxCap = function()
+      local left = require("src.core.Sound").sfxRemaining()
+      local src = self.lastSfx
+      local okp, playing = false, false
+      if src then okp, playing = pcall(src.isPlaying, src) end
+      if okp and playing then
+        local okd, dur = pcall(src.getDuration, src)
+        local okt, pos = pcall(src.tell, src)
+        if not (okd and okt) then return nil end
+        if type(dur) ~= "number" or type(pos) ~= "number" then return nil end
+        local rest = math.max(0, dur - pos)
+        if left == nil or rest > left then left = rest end
+      end
+      if left == nil then return nil end
+      return math.ceil(left * 60) + 30
     end,
     readVar = function(varId)
       return self:readVar(varId)
@@ -1093,6 +1200,7 @@ function World:load()
     reloadMap = function(setup)
       if setup then
         self:forceMapMusic()
+        self:battleReturnFade()
         -- Script_reloadmap re-enters through MAPSTATUS_ENTER (engine/overworld/
         -- scripting.asm:1108-1116), so a wild battle re-arms EnterMap's cooldown.
         self.wildCooldown = 5
@@ -1246,7 +1354,7 @@ function World:load()
     end,
 
     -- ---- encounters --------------------------------------------------------
-    setSwarm = function(group, mapNum) self:setSwarm(group, mapNum) end,
+    setSwarm = function(group, mapNum, kind) self:setSwarm(group, mapNum, kind) end,
     rollWild = function() return self:rollWild() end,
     -- The WRAM bytes the ENGINE owns rather than the script: nil means "not
     -- mine", and the VM falls back to its own sparse store.
@@ -1400,6 +1508,9 @@ function World:busy()
     -- and the waterfall climb are all applymovement / pause commands inside a
     -- queued script, so nothing else may run under them.
     or self.fieldMove ~= nil
+    -- FlyFromAnim and FlyToAnim are blocking `callasm`s inside .FlyScript
+    -- (engine/events/overworld.asm:599, :605).
+    or self.flyAnim ~= nil
 end
 
 -- CheckMenuOW (engine/overworld/events.asm:802) is the tail of OWPlayerInput,
@@ -1407,12 +1518,15 @@ end
 -- away while wScriptRunning is non-zero (events.asm:238-243).  Two more gates
 -- sit above it even with no script up: PlayerMovement answering
 -- PLAYERMOVEMENT_CONTINUE, i.e. the player is mid-step (events.asm:474-477),
--- and CheckStandingOnIce carrying (events.asm:479-480).  START and SELECT are
--- read NOWHERE else in the overworld, so a press that arrives while any of
--- those hold is not queued or deferred, it is never read at all.
+-- and CheckStandingOnIce carrying (events.asm:479-480).  The frame a step is
+-- QUEUED answers PLAYERMOVEMENT_FINISH instead (player_movement.asm:455-461),
+-- which is zero, so the poll still runs there -- and on the Cycling Road's
+-- forced roll that landing frame is the only one there is (#1718).
 function World:acceptsMenuInput()
   if self.battleActive or self:busy() then return false end
-  if self.player and self.player.moving then return false end
+  if self.player and self.player.moving and not self.stepFinished then
+    return false
+  end
   -- The same latch pair World:step's slide uses: a latched direction on an ice
   -- tile is CheckStandingOnIce's carry.
   if self.turningDirection and Permissions.isIce(self:playerCollision()) then
@@ -1458,13 +1572,27 @@ function World:mapSceneOf(group, mapNum)
 end
 
 -- wTimeOfDay (constants/ram_constants.asm): MORN_F 0, DAY_F 1, NITE_F 2,
--- DARKNESS_F 3.  Palettes.daytimeFor has already resolved the clock and the
--- map's own PALETTE_* override into one of four names, so this is a rename
--- rather than a second clock.
+-- DARKNESS_F 3, off the RTC hour (engine/tilesets/timeofday_pals.asm:5-11)
 local TIME_OF_DAY_ID = { MORN = 0, DAY = 1, NITE = 2, DARK = 3 }
 
 function World:timeOfDayId()
-  return TIME_OF_DAY_ID[self.daytime or "DAY"] or 1
+  return TIME_OF_DAY_ID[self.tod or self.daytime or "DAY"] or 1
+end
+
+-- caught_data.asm:168-199
+function World:caughtDataOpts()
+  local save = self.game and self.game.save
+  local opts = {
+    version = save and save.version,
+    save = save,
+    data = self.game and self.game.data,
+    timeOfDay = self:timeOfDayId(),
+    map = self.map and self.map.def,
+    backupMap = self.backupMapId and self.maps and self.maps[self.backupMapId],
+    playerGender = save and save.player and save.player.gender,
+  }
+  opts.landmark = Catching.caughtLandmark(opts)
+  return opts
 end
 
 -- GetWeekday -> wCurDay, which the RTC counts SUNDAY 0 .. SATURDAY 6 -- the
@@ -1565,7 +1693,76 @@ function World:readVar(varId)
   if varId == VAR.SPECIALPHONECALL then
     return self:specialCall()
   end
+  if varId >= VAR.BT_WIN_STREAK and varId <= VAR.KENJI_BREAK then
+    return self:crystalVar(varId)
+  end
   return 0
+end
+
+-- ../pokecrystal/engine/overworld/variables.asm:62-67, the six .VarActionTable
+-- rows Crystal appends past VAR_SPECIALPHONECALL.
+function World:crystalVar(varId)
+  -- ../pokecrystal/ram/wram.asm:3286 wCurCaller, which this port parks on the
+  -- VM (src/script/gen2/CallAsm.lua:190).
+  if varId == VAR.CALLERID then
+    return (self.vm and self.vm.curPhoneCaller) or 0
+  end
+  local save = self.game and self.game.save
+  if not save then return 0 end
+  -- ../pokecrystal/ram/wram.asm:1703 wNrOfBeatenBattleTowerTrainers.
+  if varId == VAR.BT_WIN_STREAK then
+    return byteOf(Gen2Save.battleTowerState(save).streak)
+  end
+  -- ../pokecrystal/engine/events/kurt.asm:24,45 wKurtApricornQuantity.
+  if varId == VAR.KURT_APRICORNS then
+    return byteOf(save.kurtApricornQuantity)
+  end
+  local crystal = Gen2Save.crystalState(save)
+  if varId == VAR.BLUECARDBALANCE then
+    return byteOf(crystal.buenaPassword.balance)
+  end
+  if varId == VAR.BUENASPASSWORD then
+    return byteOf(crystal.buenaPassword.word)
+  end
+  -- ../pokecrystal/engine/overworld/time.asm:136 SampleKenjiBreakCountdown.
+  if varId == VAR.KENJI_BREAK then
+    return byteOf(crystal.kenjiBreak)
+  end
+  return 0
+end
+
+-- The three of them Script_writevar can reach: RETVAR_ADDR_DE rows write the
+-- variable itself, RETVAR_STRBUF2 rows write the scratch buffer and are lost
+-- (../pokecrystal/engine/overworld/variables.asm:21-25).
+function World:setCrystalVar(varId, value)
+  value = byteOf(value)
+  if varId == VAR.CALLERID then
+    if self.vm then self.vm.curPhoneCaller = value end
+    return
+  end
+  local save = self.game and self.game.save
+  if not save then return end
+  local buena = Gen2Save.crystalState(save).buenaPassword
+  if varId == VAR.BLUECARDBALANCE then
+    buena.balance = value
+  elseif varId == VAR.BUENASPASSWORD then
+    buena.word = value
+  end
+end
+
+-- ../pokecrystal/engine/events/kurt.asm:19-45 SelectApricornForKurt, whose
+-- byte is what `verbosegiveitemvar <BALL>, VAR_KURT_APRICORNS` hands over.
+function World:setKurtApricornQuantity(count)
+  local save = self.game and self.game.save
+  if not save then return end
+  save.kurtApricornQuantity = byteOf(count)
+end
+
+-- ../pokecrystal/engine/overworld/time.asm:136-142, the 3..6 day roll.
+function World:setKenjiBreak(days)
+  local save = self.game and self.game.save
+  if not save then return end
+  Gen2Save.crystalState(save).kenjiBreak = byteOf(days)
 end
 
 -- Script_checkver: 0 for Gold, 1 for Silver (constants/misc_constants.asm
@@ -1575,6 +1772,14 @@ function World:gsVersion()
   local save = self.game and self.game.save
   local version = (save and save.version) or GameVersion.get()
   return version == "silver" and 1 or 0
+end
+
+function World:isCrystal()
+  local GameVersion = require("src.core.GameVersion")
+  -- Rendering follows the loaded ROM column (BorderFill / MapPreview do the
+  -- same), not save.version — a Crystal save under the Gold column still bakes
+  -- and draws with Gold's single-bank tilesets.
+  return GameVersion.engine() == "crystal"
 end
 
 -- ENGINE_* flags (data/events/engine_flags.asm), the namespace `setflag` /
@@ -1601,7 +1806,7 @@ function World:engineFlag(flag)
   -- how the two would come apart -- the officer's `setflag` and the results
   -- script's `clearflag` are the only writers, and both go through the pair
   -- below.
-  if flag == BugContest.ENGINE_BUG_CONTEST_TIMER and save then
+  if flag == FieldMoves.BUG_CONTEST_FLAG and save then
     return BugContest.isActive(save)
   end
   -- Badges live in save.player.badges, not in the flag table: on the cart the
@@ -1613,6 +1818,11 @@ function World:engineFlag(flag)
     local player = save.player
     local owned = player and player[badge.store]
     return type(owned) == "table" and owned[badge.name] == true
+  end
+  -- Same one-store rule for ENGINE_PLAYER_IS_FEMALE, which IS wPlayerGender
+  -- (../pokecrystal/data/events/engine_flags.asm:131); Gold's FEMALE_FLAG is nil.
+  if flag == FieldMoves.FEMALE_FLAG then
+    return Gen2Save.isFemale(save)
   end
   -- Same one-store rule for the day care.  data/events/engine_flags.asm:18-20
   -- maps the three ids onto DAYCAREMAN_HAS_EGG_F / DAYCAREMAN_HAS_MON_F /
@@ -1637,7 +1847,7 @@ end
 function World:setEngineFlag(flag, value)
   if flag == nil then return end
   local save = self.game and self.game.save
-  if flag == BugContest.ENGINE_BUG_CONTEST_TIMER and save then
+  if flag == FieldMoves.BUG_CONTEST_FLAG and save then
     -- Route35NationalParkGate_OkayToProceed sets the flag BEFORE `special
     -- GiveParkBalls`, so starting here and starting again there is the cart's
     -- own order and the second start is what puts the balls on the counter.
@@ -1651,6 +1861,13 @@ function World:setEngineFlag(flag, value)
     save.player = save.player or {}
     save.player[badge.store] = save.player[badge.store] or {}
     save.player[badge.store][badge.name] = value and true or nil
+    return
+  end
+  -- InitGender is the only writer on the cart, so this exists only to keep a
+  -- stray setflag out of save.engineFlags (../pokecrystal/engine/menus/init_gender.asm:23-42).
+  if flag == FieldMoves.FEMALE_FLAG and save then
+    save.player = save.player or {}
+    save.player.gender = value and "female" or "male"
     return
   end
   -- The write half of the day-care aliases.  DayCareManScript_Outside's
@@ -1688,6 +1905,9 @@ function World:writeVar(varId, value)
   if varId == VAR.MOVEMENT then
     local state = PLAYER_STATE_BY_ID[value or 0]
     if state then self:applyPlayerState(state) end
+  end
+  if varId >= VAR.BT_WIN_STREAK and varId <= VAR.KENJI_BREAK then
+    self:setCrystalVar(varId, value)
   end
 end
 
@@ -1846,6 +2066,16 @@ end
 -- (maps/Route36.asm:58, and again at :70 on the DidntCatchSudowoodo arm) hands
 -- the same slot to the Route 37 twins.  So the pooled objects that read
 -- through the slot have to go with it.
+-- ../pokecrystal/engine/events/battle_tower/battle_tower.asm:1564-1575 writes
+-- the sprite byte into wMapObjects, the LIVE copy, so the map def is untouched.
+function World:setObjectSprite(objectId, spriteName)
+  local npc = self:objectEntity(objectId)
+  local spriteDef = spriteName and self.sprites and self.sprites[spriteName]
+  if not (npc and spriteDef) then return false end
+  if npc:setSpriteDef(spriteDef) then self:applySpritePalette(npc) end
+  return true
+end
+
 function World:setVariableSprite(slot, spriteIndex)
   if slot == nil then return end
   self.variableSprites[slot] = spriteIndex
@@ -1923,7 +2153,7 @@ function World:breedmonSpriteDef(species)
   local def = {
     id = "SPRITE_DAY_CARE_MON",
     image = entry.image,
-    frames = 1,
+    frames = 2,
     walker = false,
     spriteType = "POKEMON_SPRITE",
     palette = "PAL_OW_RED",
@@ -2176,6 +2406,13 @@ function World:playSfxNamed(want, fallbackId)
   self:playSfx(self:sfxIdNamed(want, fallbackId))
 end
 
+-- .BumpSound (engine/overworld/player_movement.asm:771), CheckSFX at
+-- home/audio.asm:477
+function World:bumpSound()
+  if Sound.sfxBusy() then return end
+  self:playSfxNamed("Sfx_Bump", SFX.BUMP)
+end
+
 -- Script_specialsound (engine/overworld/scripting.asm:476) is not a fixed cue:
 -- it farcalls CheckItemPocket (engine/items/items.asm:512), which writes
 -- wCurItem's pocket into wItemAttributeValue, and rings SFX.GET_TM for the
@@ -2185,6 +2422,9 @@ end
 -- rang the ordinary item jingle while the item argument was thrown away.  An
 -- item the cache cannot name takes the `cp TM_HM / jr z` fall-through, SFX.ITEM.
 function World:specialSound(itemIndex)
+  -- The `waitsfx` above it (scripting.asm:445): SFX_READ_TEXT_2 ($08), which
+  -- the box rings on its own press, outranks SFX_GET_TM ($9b) here (#1483).
+  Sound.waitSfxDone()
   local id = itemIndex and self:itemIdByIndex(itemIndex)
   local items = self.game and self.game.data and self.game.data.items
   local def = id and items and items[id]
@@ -2198,6 +2438,7 @@ end
 function World:warpSound()
   local p = self.player
   if not (self.map and p) then return end
+  Sound.dropPressSfx()
   local coll = self.map:cellCollision(p.cellX, p.cellY)
   local id = SFX.EXIT_BUILDING
   if coll == COLL.DOOR then
@@ -2303,17 +2544,14 @@ end
 -- the map pair and DAILYFLAGS1_SWARM are set by the one command.  A port that
 -- stored only the map would leave the Dunsparce call live forever, because
 -- CheckSwarmFlag answers off the flag and clears the pair itself.
-function World:setSwarm(group, mapNum)
+function World:setSwarm(group, mapNum, kind)
   local save = self.game and self.game.save
   if not save then return end
-  save.dailyFlags = save.dailyFlags or {}
-  save.dailyFlags.swarm = true
-  save.swarmMap = self:mapIdByGroupMap(group, mapNum)
+  Roamers.Swarm.set(save, self:mapIdByGroupMap(group, mapNum), kind)
 end
 
 -- Script_loadwildmon's other half: roll the CURRENT map's own table the way a
 -- step would, and hand it to the startbattle that follows.  nil is fine --
--- startScriptedBattle answers "win" rather than hanging when there is no mon.
 function World:rollWild()
   local map = self.map
   if not (map and self.encounters and self.player) then return nil end
@@ -2381,17 +2619,31 @@ function World:playMapMusic()
   end
 end
 
--- RestartMapMusic, which replays wMapMusic -- and wMapMusic is MUSIC_BICYCLE
--- for as long as the player is riding (.GetOnBike writes it there).  So a
--- battle, a hatch or a menu that owned the sound gives the BIKE theme back,
--- not the map's own song.
+-- data/maps/setup_scripts.asm:48
+-- home/audio.asm:335
+-- home/audio.asm:281
+function World:setMapMusic(mapId, seamless)
+  local data = self.game and self.game.data
+  local audio = data and data.audio
+  if not (audio and audio.runtime) then return end
+  local bike = not seamless
+    and FieldMoves.isBiking(self.playerState)
+    and self:playBikeMusic()
+  if bike then return end
+  Music.playMap(data, mapId, nil,
+                FieldMoves.isSurfing(self.playerState),
+                seamless and Music.MAP_FADE or nil,
+                self:mapMusicSong(mapId))
+end
+
+-- home/audio.asm:379
+-- home/audio.asm:281
 function World:restoreMapMusic()
   local data = self.game and self.game.data
   if not data then return end
-  if FieldMoves.isBiking(self.playerState) and self:playBikeMusic() then
-    return
-  end
-  Music.restoreMap(data)
+  -- engine/events/overworld.asm:1627
+  local reason = FieldMoves.isBiking(self.playerState) and "bike" or nil
+  Music.restoreMap(data, reason)
 end
 
 -- ForceMapMusic (engine/overworld/map_setup.asm:201), the music row every
@@ -3260,7 +3512,9 @@ end
 -- before the map's own deferred scene script gets to run.  On the cart that
 -- falls out of the setup script being a blocking call inside the overworld
 -- loop; here it has to be said out loud.
-function World:runMapSetup(method, load)
+function World:runMapSetup(method, load, fly)
+  -- engine/events/overworld.asm:607
+  if not fly then self.flyHidden = nil end
   -- JumpRoamMons sits above the load in MapSetupScript_Teleport; UpdateRoamMons
   -- below it in _Connection and _Train.  Wrapping the load rather than editing
   -- setMap keeps both on the right side of it, and keeps the roam walk where
@@ -3284,6 +3538,53 @@ function World:runMapSetup(method, load)
     phase = "out", step = 0, wait = FADE_STEP_FRAMES, load = wrapped,
   }
   return true
+end
+
+-- ramp with no load between the halves (home/map.asm:2281-2292).
+function World:exitMenusFade(whiteFrames)
+  self.fade, self.fadeLevel = "white", 1
+  self.mapSetup = {
+    phase = "in", step = FADE_STEPS,
+    wait = whiteFrames or MENU_EXIT_WHITE_FRAMES,
+  }
+end
+
+-- engine/pokegear/pokegear.asm:2078, home/menu.asm:83, home/map.asm:1928
+function World:exitMenusFadeForFly()
+  self:exitMenusFade(FLY_EXIT_WHITE_FRAMES)
+  -- engine/events/overworld.asm:569-572, :611
+  self.flyHidden = "from"
+end
+
+-- engine/menus/start_menu.asm:511, engine/gfx/mon_icons.asm:287-297
+function World.flyCancelBlankFrames(partySize)
+  return FLY_CANCEL_BLANK_FRAMES + FLY_CANCEL_ICON_FRAMES * (partySize or 0)
+end
+
+-- engine/tilesets/timeofday_pals.asm:65-91, home/fade.asm:22-120
+World.FADE_RAMP = {
+  white = { { 3, 2, 1, 0 }, { 2, 1, 0, 0 }, { 1, 0, 0, 0 }, { 0, 0, 0, 0 } },
+  black = { { 3, 2, 1, 0 }, { 3, 3, 2, 1 }, { 3, 3, 3, 2 }, { 3, 3, 3, 3 } },
+}
+
+function World.fadeRampRow(fade, level)
+  local ramp = fade and World.FADE_RAMP[fade]
+  if not ramp then return nil end
+  local step = math.max(1, math.min(FADE_STEPS,
+    math.ceil((level or 1) * FADE_STEPS)))
+  return ramp[step]
+end
+
+-- home/fade.asm:22
+function World.fadeRampByte(row)
+  return row[1] * 64 + row[2] * 16 + row[3] * 4 + row[4]
+end
+
+-- data/maps/setup_scripts.asm:124-139
+function World:battleReturnFade()
+  if self.mapSetup then return end
+  self.fade, self.fadeLevel = "white", 1
+  self.mapSetup = { phase = "in", step = FADE_STEPS, wait = FADE_STEP_FRAMES }
 end
 
 -- ---------------------------------------------------------------------------
@@ -3358,14 +3659,6 @@ function World:updateMapSetup()
   if ms.phase == "out" then
     ms.step = ms.step + 1
     self.fade, self.fadeLevel = "white", ms.step / FADE_STEPS
-    -- FlyFromAnim carries the player up and off the map under the fade.  The
-    -- bird's own frames are not in the cache, but the lift is: it is the same
-    -- OBJECT_SPRITE_Y_OFFSET sine the teleport step type walks
-    -- (src/script/gen2/Movement.lua), stepped over the fade's four levels.
-    if ms.lift and self.player then
-      self.player.spriteYOffset = Movement.teleportYOffset(
-        Movement.TELEPORT_RISE_HEIGHT + ms.step * FADE_STEPS)
-    end
     if ms.step >= FADE_STEPS then
       -- setMap clears self.fade (a map load repaints everything), so the sheet
       -- has to be re-armed at full strength on the far side for the fade in to
@@ -3377,16 +3670,16 @@ function World:updateMapSetup()
     return
   end
   ms.step = ms.step - 1
-  -- FlyToAnim, the same curve read backwards: the player comes down onto the
-  -- destination tile as the fade lets go of the screen.
-  if ms.lift and self.player then
-    self.player.spriteYOffset = Movement.teleportYOffset(
-      Movement.TELEPORT_RISE_HEIGHT + ms.step * FADE_STEPS)
-  end
   if ms.step <= 0 then
     self.fade, self.fadeLevel = nil, nil
     self.mapSetup = nil
-    if ms.lift and self.player then self.player.spriteYOffset = 0 end
+    -- `callasm FlyToAnim` is the command straight after `newloadmap
+    -- MAPSETUP_TELEPORT` (engine/events/overworld.asm:604-605).
+    if ms.flyIn then
+      -- engine/events/overworld.asm:607
+      local function respawn() self.flyHidden = nil end
+      if not self:startFlyAnim("to", ms.flyIn, respawn) then respawn() end
+    end
     return
   end
   self.fadeLevel = ms.step / FADE_STEPS
@@ -3457,7 +3750,7 @@ function World:specialHooks()
     takeItem = function(index, qty) return self:takeItem(index, qty) end,
     engineFlag = function(flag) return self:engineFlag(flag) end,
     setEngineFlag = function(flag, v) self:setEngineFlag(flag, v) end,
-    setSwarm = function(group, mapNum) self:setSwarm(group, mapNum) end,
+    setSwarm = function(group, mapNum, kind) self:setSwarm(group, mapNum, kind) end,
     dayCare = function(side, onDone) self:dayCare(side, onDone) end,
     givePokeMail = function(mail) return self:givePokeMail(mail) end,
     checkPokeMail = function(mail, onDone) self:checkPokeMail(mail, onDone) end,
@@ -3488,6 +3781,14 @@ function World:specialHooks()
     end,
     magnetTrain = function(toGoldenrod, onDone)
       self:magnetTrain(toGoldenrod, onDone)
+    end,
+    -- ../pokecrystal/engine/events/battle_tower/battle_tower.asm:220-223
+    startTowerBattle = function(trainer, onDone)
+      return self:startBattle({ trainer = trainer, battleTower = true }, onDone)
+    end,
+    -- ../pokecrystal/engine/events/battle_tower/battle_tower.asm:1552-1575
+    setObjectSprite = function(objectId, spriteName)
+      return self:setObjectSprite(objectId, spriteName)
     end,
     pushScreen = function(id, opts) return self:pushScreen(id, opts) end,
     monName = function(index)
@@ -3522,7 +3823,34 @@ function World:specialHooks()
       self:openScriptMenu(header, "vertical", onChoose)
     end,
     rareWildMon = function() return self:rareWildMon() end,
+    -- ../pokecrystal/engine/menus/save.asm:181 AskOverwriteSaveFile and :266
+    -- _SaveGameData, the two halves of Link_SaveGame (:63).
+    saveFileState = function() return self:saveFileState() end,
+    writeSave = function() return self:writeSave() end,
+    setKurtApricornQuantity = function(n) self:setKurtApricornQuantity(n) end,
+    setKenjiBreak = function(days) self:setKenjiBreak(days) end,
   }
+end
+
+-- AskOverwriteSaveFile's two reads: wSaveFileExists, and
+-- CompareLoadedAndSavedPlayerID (../pokecrystal/engine/menus/save.asm:224),
+-- which is what picks AlreadyASaveFileText over AnotherSaveFileText.
+function World:saveFileState()
+  local save = self.game and self.game.save
+  local version = save and save.version
+  if not Gen2Save.exists(version) then return false, false end
+  local stored = Gen2Save.load(version)
+  local mine = save and save.player and save.player.id
+  local theirs = stored and stored.player and stored.player.id
+  return true, (mine ~= nil and mine == theirs)
+end
+
+-- _SaveGameData, through the writer the SAVE menu is handed
+-- (src/core/Game2.lua:435) so the save.write veto holds here too.
+function World:writeSave()
+  local game = self.game
+  if not (game and game.writeSave) then return false end
+  return game:writeSave() ~= false
 end
 
 -- RandomUnseenWildMon's lookup half.  The routine picks one of the THREE
@@ -3706,6 +4034,15 @@ function World:updateMovement()
   while st.i <= #st.bytes do
     local b = st.bytes[st.i]
     st.i = st.i + 1
+    -- Movement_step_dig spins for the frames in the byte that follows
+    -- -- engine/overworld/movement.asm:113-131 (#1716)
+    if b == Movement.STEP_DIG then
+      local duration = st.bytes[st.i] or 0
+      st.i = st.i + 1
+      if ent.scriptSpin then ent:scriptSpin(duration) end
+      st.sleep = duration
+      return
+    end
     -- engine/overworld/movement.asm:163
     if b == 0x57 then
       local duration = st.bytes[st.i] or 0
@@ -3731,6 +4068,11 @@ function World:updateMovement()
     elseif act.kind == "step" then
       local fromX, fromY = ent.cellX, ent.cellY
       if ent:scriptStep(act.dir) then
+        -- TurningStep's OBJECT_ACTION_SPIN, for the length of the step
+        -- (engine/overworld/movement.asm:693-699).
+        if act.spin and ent.scriptSpin then
+          ent:scriptSpin(ent.stepFrames or 16)
+        end
         self:followStep(ent, fromX, fromY)
       end
       return
@@ -4034,7 +4376,7 @@ function World:tryWildEncounter()
   -- That is what keeps the Ruins chambers empty until a wall has been solved.
   local monOpts = nil
   if roll.species == Unown.SPECIES then
-    local flags = self:engineFlags()
+    local flags = self:unownUnlockFlags()
     if not Unown.anyUnlocked(flags) then return false end
     -- LoadEnemyMon's .GenerateDVs loop rerolls until CheckUnownLetter clears
     -- the form, so a chamber only ever produces letters its own puzzle
@@ -4167,7 +4509,8 @@ function World:checkTimeEvents()
   local save = self.game and self.game.save
   if not save then return false end
   if not BugContest.isActive(save) then
-    Apricorns.checkDailyResetTimer(save)
+    Apricorns.checkDailyResetTimer(save, nil,
+      self.engineFlagResolver and self:engineFlagResolver() or nil)
     -- CheckSwarmFlag, second on `.do_daily` and the ONLY thing that ever ends
     -- a swarm: the reset above takes DAILYFLAGS1_SWARM down, and this is what
     -- notices and clears wSwarmMapGroup/Number and wFishingSwarmFlag with it.
@@ -4369,6 +4712,12 @@ function World:useFieldItem(itemId)
   if itemId == "SACRED_ASH" then return self:useSacredAsh() end
   if itemId == "ESCAPE_ROPE" then return self:useEscapeRope(itemId) end
   if itemId == "SQUIRTBOTTLE" then return self:useSquirtbottle() end
+  -- CoinCaseEffect (engine/items/item_effects.asm:2243).
+  if itemId == "COIN_CASE" then return "coin_case", self:coins() end
+  -- BlueCardEffect (../pokecrystal/engine/items/item_effects.asm:2251).
+  if itemId == "BLUE_CARD" then
+    return "blue_card", self:readVar(VAR.BLUECARDBALANCE)
+  end
   if REPEL_STEPS[itemId] then return self:useRepel(itemId) end
   if TROPHY_BOXES[itemId] then return self:openTrophyBox(itemId) end
   if not World.isRod(itemId, items) then return nil end
@@ -4424,6 +4773,9 @@ function World:useEscapeRope(itemId)
   local items = self.game and self.game.data and self.game.data.items
   local def = items and items[itemId or "ESCAPE_ROPE"]
   self:takeItem(def and def.index, 1)
+  -- ../pokecrystal/engine/events/overworld.asm:809, between .escaperope and
+  -- QueueScript.
+  UnownWords.kabutoChamber(self.events, self.map and self.map.id)
   self.queuedFieldMove = {
     ok = true, action = "escaperope",
     destMap = destMapId, destWarp = destWarp,
@@ -4633,15 +4985,57 @@ end
 -- src/world/gen2/Bike.lua owns every decision; this is the world state those
 -- decisions read and the presentation they end in.
 
+-- ../pokecrystal/constants/engine_flags.asm:25 ENGINE_MOBILE_SYSTEM shifts every
+-- later id up one: :36 ALWAYS_ON_BIKE against ../pokegold's :35.
+function World:engineFlagId(name, goldId)
+  local order = self.constants and self.constants.engineFlagOrder
+  if type(order) ~= "table" then return goldId end
+  local ids = self.engineFlagIds
+  if not ids then
+    ids = {}
+    for index, entry in pairs(order) do
+      if type(index) == "number" and type(entry) == "string" then
+        ids[entry] = index - 1
+      end
+    end
+    self.engineFlagIds = ids
+  end
+  return ids[name] or goldId
+end
+
+function World:engineFlagResolver()
+  local fn = self.engineFlagResolverFn
+  if not fn then
+    fn = function(name, goldId) return self:engineFlagId(name, goldId) end
+    self.engineFlagResolverFn = fn
+  end
+  return fn
+end
+
+-- Unown.UNLOCK_SETS keys the flags by pokegold's ids; Crystal's are one
+-- higher (../pokecrystal/constants/engine_flags.asm:57-60 vs ../pokegold:56-59).
+function World:unownUnlockFlags()
+  local engine = self:engineFlags()
+  local out = {}
+  for _, set in ipairs(Unown.UNLOCK_SETS) do
+    if engine[self:engineFlagId(set.name, set.flag)] then
+      out[set.flag] = true
+    end
+  end
+  return out
+end
+
 -- wBikeFlags' three bits are ENGINE_* ids like any other flag, so the map
 -- callbacks that set them (Route16AlwaysOnBikeCallback,
 -- Route17AlwaysOnBikeCallback) already land on save.engineFlags.
 function World:alwaysOnBike()
-  return self:engineFlag(Bike.ENGINE_ALWAYS_ON_BIKE)
+  return self:engineFlag(World.engineFlagId(
+    self, "ENGINE_ALWAYS_ON_BIKE", Bike.ENGINE_ALWAYS_ON_BIKE))
 end
 
 function World:downhill()
-  return self:engineFlag(Bike.ENGINE_DOWNHILL)
+  return self:engineFlag(World.engineFlagId(
+    self, "ENGINE_DOWNHILL", Bike.ENGINE_DOWNHILL))
 end
 
 -- GetPlayerTilePermission's operand: the collision under the player's feet.
@@ -4697,6 +5091,9 @@ function World:playBikeMusic()
   local audio = data and data.audio
   if not (audio and audio.runtime) then return false end
   if not (audio.songs and audio.songs[Bike.MUSIC_BICYCLE]) then return false end
+  -- engine/events/overworld.asm:1621-1630
+  Music.stop()
+  Music.setMapSong(Bike.MUSIC_BICYCLE)
   Music.play(data, Bike.MUSIC_BICYCLE, true, { reason = "bike" })
   return true
 end
@@ -4772,7 +5169,11 @@ function World:runQueuedScript()
   if not script or self:busy() then return false end
   self.queuedScript = nil
   self.talkNpc = nil
-  return self.vm and self.vm:start(script) or false
+  local vm = self.vm
+  if vm and type(script) == "table" and script.phoneContact ~= nil then
+    vm.curPhoneCaller = script.phoneContact
+  end
+  return vm and vm:start(script) or false
 end
 
 -- Script_FishCastRod, then Script_NotEvenANibble or Script_GotABite.  Held as
@@ -4799,6 +5200,11 @@ function World:beginFishing(outcome, wild)
   if self.player then
     self.player.fishing = true
     self.player.fishingState = self.fishing
+    -- LoadFishingGFX reads wPlayerGender
+    -- (../pokecrystal/engine/events/fishing_gfx.asm:8-12)
+    self.player.fishSheet =
+      (FieldMoves.isFemale(self:playerGender()) and self.fishingSheetFemale)
+      or self.fishingSheet
   end
 end
 
@@ -4944,22 +5350,41 @@ function World:updateHeadbutt()
   self:showText(Strings(TEXT_HEADBUTT_NOTHING))
 end
 
+-- ../pokecrystal/engine/events/treemons.asm:126 GetTreeMon's two RandomRange
+function World:treeRandom(n)
+  if self.treemonRandom then return self.treemonRandom(n) end
+  if love and love.math and love.math.random then
+    return love.math.random(n) - 1
+  end
+  return math.random(n) - 1
+end
+
 -- Headbutt.  A tree's own map entry decides which of the two tree sets is
 -- rolled, and whether anything is home at all (engine/events/treemons.asm
 -- TreeMonEncounter).  Returns "battle", "nothing" or nil.
 function World:tryHeadbutt(cx, cy)
   local game, map = self.game, self.map
   if not (game and map and self.encounters) then return nil end
-  local roll = Encounter.treeSlot(self.encounters, map.id, cx, cy, nil)
+  local save = game.save
+  local GameVersion = require("src.core.GameVersion")
+  local engine = GameVersion.engine((save and save.version) or GameVersion.get())
+  local roll = Encounter.treeSlot(self.encounters, map.id, cx, cy,
+    function(n) return self:treeRandom(n) end,
+    { otId = (save and save.player and save.player.id) or 0, engine = engine })
   if not roll or not roll.species then return "nothing" end
   local wild = Mon.new(game.data, roll.species, roll.level)
   if not wild then return "nothing" end
-  local save = game.save
+  -- LoadEnemyMon's .TreeMon arm (../pokecrystal/engine/battle/core.asm:6249)
+  if Encounter.treeMonAsleep(roll.species, self.tod or self.daytime or "DAY",
+      engine, self.encounters) then
+    wild.status = "sleep"
+    wild.statusTurns = Encounter.TREEMON_SLEEP_TURNS
+  end
   if save then
     save.pokedex = save.pokedex or { seen = {}, caught = {} }
     save.pokedex.seen[roll.species] = true
   end
-  self:startBattle({ wild = wild })
+  self:startBattle({ wild = wild, battleType = "tree" })
   return "battle"
 end
 
@@ -5028,10 +5453,18 @@ end
 -- ones the ENGINE writes, where answering out of that store would read back a
 -- stale 0.  RockSmashScript's `readmem wTempWildMonSpecies / iffalse` is the
 -- whole reason this exists: the byte is written by the callasm one row above.
-local WRAM_TEMP_WILD_MON_SPECIES = 0xd117
+-- wTempWildMonSpecies: 01:d117 (pokesilver.sym), 01:d22e (pokecrystal.sym)
+local WRAM_TEMP_WILD_MON_SPECIES = { gs = 0xd117, crystal = 0xd22e }
+
+function World:tempWildMonSpeciesAddress()
+  local GameVersion = require("src.core.GameVersion")
+  local save = self.game and self.game.save
+  local engine = GameVersion.engine((save and save.version) or GameVersion.get())
+  return WRAM_TEMP_WILD_MON_SPECIES[engine] or WRAM_TEMP_WILD_MON_SPECIES.gs
+end
 
 function World:scriptReadMem(addr)
-  if addr == WRAM_TEMP_WILD_MON_SPECIES then
+  if addr == self:tempWildMonSpeciesAddress() then
     return (self.tempWildMon and self.tempWildMon.species) or 0
   end
   return nil
@@ -5118,7 +5551,7 @@ function World:sweetScentEncounter()
   -- stays empty for SWEET SCENT too.
   local monOpts = nil
   if roll.species == Unown.SPECIES then
-    local flags = self:engineFlags()
+    local flags = self:unownUnlockFlags()
     if not Unown.anyUnlocked(flags) then return false end
     monOpts = { dvs = Unown.wildDVs(flags, Mon.randomDVs) }
   end
@@ -5169,6 +5602,9 @@ function World:fieldContext(mon)
     facingX = fx, facingY = fy,
     facingColl = map:cellCollision(fx, fy),
     playerColl = map:cellCollision(p.cellX, p.cellY),
+    -- Crystal's SurfFunction.TrySurf is the only field move that asks
+    -- (../pokecrystal/engine/events/overworld.asm:364).
+    facingObject = self:facingObject(),
     upColl = map:cellCollision(p.cellX, p.cellY - 1),
     tileset = map.def and map.def.tileset,
     facingBlock = blockId,
@@ -5178,10 +5614,18 @@ function World:fieldContext(mon)
     -- digFromMenu reads this rather than re-deriving the banked warp.
     canEscapeRope = self:escapeRopeTarget() ~= nil,
     playerState = self.playerState,
+    -- SurfFunction.TrySurf and TrySurfOW both refuse while wBikeFlags'
+    -- ALWAYS_ON_BIKE is set (engine/events/overworld.asm:343-345, :498-500).
+    alwaysOnBike = self:alwaysOnBike(),
     strengthActive = self.strengthActive,
     -- FlashFunction tests wTimeOfDayPalset, not the map header, so a
     -- PALETTE_DARK map that FLASH has already lit refuses a second FLASH.
     dark = Palettes.isDarkness(map.def, self:hour(), self.flashUsed),
+    -- ../pokecrystal/engine/events/overworld.asm:285, called by FLASH only and
+    -- only after the badge gate, because it SETS the wall-opened flag.
+    openAerodactylWall = function()
+      return UnownWords.aerodactylChamber(self.events, map.id)
+    end,
   }
 end
 
@@ -5238,6 +5682,37 @@ function World:dropMapImages(mapId)
     end
   end
   if self.connectionMaps then self.connectionMaps[mapId] = nil end
+end
+
+local function safeRelease(obj)
+  if obj and obj ~= false and obj.release then pcall(obj.release, obj) end
+end
+
+-- Eagerly free session-owned GPU caches.  Assets.image-backed atlases are
+-- nilled without release; unique bakes, strips, and roof composites are released.
+function World:release()
+  if self.mapImages then
+    for _, img in pairs(self.mapImages) do safeRelease(img) end
+    self.mapImages = {}
+  end
+  if self.scrollStrips then
+    for _, strip in pairs(self.scrollStrips) do safeRelease(strip) end
+    self.scrollStrips = {}
+  end
+  safeRelease(self.tiltCanvas)
+  self.tiltCanvas = nil
+  if self.grassAtlases then
+    for _, atlas in pairs(self.grassAtlases) do safeRelease(atlas) end
+    self.grassAtlases = {}
+  end
+  if self.atlasCache then
+    for key, atlas in pairs(self.atlasCache) do
+      if key:find("|", 1, true) then safeRelease(atlas) end
+    end
+    self.atlasCache = {}
+  end
+  self.animQuads = nil
+  self.connectionMaps = nil
 end
 
 -- LoadMapAttributes' refill, for every map the session has edited.  Neighbour
@@ -5307,8 +5782,22 @@ function World:refreshMapImages()
   if not self.mapImage then return false end
   self:dropMapImages(self.map and self.map.id)
   self.mapImage = self:imageFor(self.map.id)
+  self:rebuildAttrGrid()
   self:rebuildNeighbors()
   return true
+end
+
+-- wPlayerGender, the byte GetPlayerSprite and AddMapObject both branch on
+-- (engine/overworld/overworld.asm:61-64, engine/overworld/player_object.asm:32-39).
+function World:playerGender()
+  local save = self.game and self.game.save
+  return save and save.player and save.player.gender or nil
+end
+
+-- The Chris/Kris sheet the player wears with no state on it
+-- (data/sprites/player_sprites.asm:2, :9).
+function World:playerSpriteName()
+  return FieldMoves.playerSprite(self:playerGender()) or PLAYER_SPRITE
 end
 
 -- UpdatePlayerSprite (data/sprites/player_sprites.asm ChrisStateSprites): the
@@ -5316,7 +5805,8 @@ end
 -- getting on and off a Lapras a one-byte change rather than an animation.
 function World:applyPlayerState(state)
   self.playerState = state or FieldMoves.PLAYER_NORMAL
-  local name = FieldMoves.STATE_SPRITE[self.playerState] or PLAYER_SPRITE
+  local name = FieldMoves.stateSprite(self.playerState, self:playerGender())
+    or PLAYER_SPRITE
   local def = self.sprites and self.sprites[name]
   if def and self.player then
     self.player:setSprite(def)
@@ -5338,13 +5828,33 @@ function World:runCut(result)
 end
 
 -- Script_UsedWhirlpool, which is Script_Cut with DisappearWhirlpool and
--- PlayWhirlpoolSound (a bare SFX.SURF) in place of the snip.
+-- PlayWhirlpoolSound in place of the snip.
 function World:runWhirlpool(result)
   self:setNickname(result.mon)
   self:showText(Strings(result.text), function()
-    self:replaceBlock(result.blockIndex, result.replacement)
-    self:playSfx(SFX.SURF)
+    self:playWhirlpoolSound(result.blockIndex, result.replacement)
   end)
+end
+
+-- PlayWhirlpoolSound is WaitSFX, SFX_SURF, WaitSFX, never a bare PlaySFX
+-- -- engine/events/field_moves.asm:5-10 (#1717).  The block swap lands after
+-- it -- engine/events/overworld.asm:1157-1164
+function World:playWhirlpoolSound(blockIndex, replacement)
+  self.fieldMove = { phase = "whirlpoolsfx", waiting = true, left = 180,
+    blockIndex = blockIndex, replacement = replacement }
+end
+
+-- PlayerMovementPointers' .force_turn arm and the Script_ForcedMovement it
+-- calls -- events.asm:786-793, forced_movement.asm:1-51 (#1716)
+local FORCED_BACK = { up = "down", down = "up", left = "right", right = "left" }
+
+function World:runForcedMovement()
+  local p = self.player
+  if not p or p.moving or self.moveState then return false end
+  local back = FORCED_BACK[p.facing]
+  if not back then return false end
+  self:beginMovement(0, Movement.forcedMovementBytes(back))
+  return true
 end
 
 -- Script_UseFlash: the text plays SFX.FLASH from inside itself
@@ -5462,7 +5972,9 @@ function World:tryPushBoulder(dir, cx, cy)
   end
   local d = Map.DELTA[dir]
   local tx, ty = cx + d[1], cy + d[2]
-  if not self.map:isWalkable(tx, ty) then return false end
+  -- CanObjectMoveInDirection, engine/overworld/npc_movement.asm:1
+  -- is MovementFunction_Strength's .ok2, engine/overworld/map_objects.asm:686
+  if not self.map:objectStepPermitted(cx, cy, dir) then return false end
   for _, e in ipairs(self.entities or {}) do
     if e ~= npc and e.cellX == tx and e.cellY == ty then return false end
   end
@@ -5499,7 +6011,12 @@ function World:runFieldMove(result)
   elseif action == "waterfall" then
     self:runWaterfall(result)
   elseif action == "fly" then
-    self:openFlyMap()
+    -- (engine/events/overworld.asm:565, :584); a picker that never opened
+    if result.flySpawn then
+      self:flyTo(result.flySpawn, result.mon)
+    else
+      self:openFlyMap(result.mon)
+    end
   elseif action == "headbutt" then
     self:runHeadbutt(result.facingX, result.facingY, result.mon)
   elseif action == "sweetscent" then
@@ -5580,6 +6097,10 @@ function World:useFieldMove(moveId, mon)
   local ctx = self:fieldContext(mon)
   local result = withBlockIndex(FieldMoves.fromMenu(moveId, ctx), ctx)
   result.mon = result.mon or mon
+  -- ../pokecrystal/engine/pokemon/mon_menu.asm:735
+  if result.ok and result.inMenu then
+    return result
+  end
   if result.ok then
     self.queuedFieldMove = result
   elseif result.text then
@@ -5661,8 +6182,18 @@ end
 
 -- ---- fly ------------------------------------------------------------------
 
--- FlyMap's region split, which reads the PLAYER's landmark and nothing else:
--- the first 46 landmarks are Johto, the rest Kanto.
+-- ../pokecrystal/constants/landmark_constants.asm:34
+local LANDMARK_PALLET_TOWN = 0x2e
+local LANDMARK_FAST_SHIP = 0x5e
+
+function World:landmarkIndex(id, fallback)
+  local records = self.landmarks and self.landmarks.landmarks
+  local record = records and (records["LANDMARK_" .. id] or records[id])
+  local index = record and tonumber(record.index)
+  return index or fallback
+end
+
+-- IsInJohto, the PLAYER's landmark and nothing else (home/region.asm:1)
 function World:region()
   local landmarks = self.landmarks and self.landmarks.landmarks
   local id = self.map and self.map.def and self.map.def.landmark
@@ -5674,8 +6205,13 @@ function World:region()
     entry = order and landmarks and landmarks[order[id + 1]]
   end
   local index = (entry and entry.index) or (type(id) == "number" and id) or 0
-  if index == 94 then return "johto" end -- LANDMARK_FAST_SHIP
-  return index >= 46 and "kanto" or "johto"
+  -- ../pokecrystal/home/region.asm:10 (cp LANDMARK_FAST_SHIP)
+  if index == self:landmarkIndex("FAST_SHIP", LANDMARK_FAST_SHIP) then
+    return "johto"
+  end
+  -- ../pokecrystal/home/region.asm:23 (cp KANTO_LANDMARK)
+  return index >= self:landmarkIndex("PALLET_TOWN", LANDMARK_PALLET_TOWN)
+    and "kanto" or "johto"
 end
 
 function World:flyPoints()
@@ -5683,25 +6219,259 @@ function World:flyPoints()
     self.game and self.game.save, self.landmarks, self:region())
 end
 
--- .FlyScript: WarpToSpawnPoint, then `newloadmap MAPSETUP.TELEPORT` brings the
--- map up with the player back in PLAYER_NORMAL.  MapSetupScript_Teleport opens
--- on FadeOutToWhite and falls through into _Warp, so flying is bracketed by the
--- same pair of fades a door is, which is where the two fly animations ride:
--- `lift` below hands them to World:updateMapSetup.
-function World:flyTo(spawnId)
+-- FlyFromAnim / FlyToAnim (engine/events/field_moves.asm:300, :334) and the two
+-- curves they run (engine/sprite_anims/functions.asm:1350, :1418).
+local FLY = {
+  FROM_FRAMES = 128, TO_FRAMES = 64, HOVER = 0x40,
+  AMP_MAX = 0x40, TO_AMP = 11 * 8, RISE = 84,
+  -- engine/tilesets/timeofday_pals.asm:289-299, engine/events/field_moves.asm:305-311
+  FROM_PREROLL = 2 + 4,
+  -- engine/events/field_moves.asm:341 (depixel 31, 10, 4, 0 up to 10 * 8 + 4)
+  TO_RISE = 88,
+  -- engine/events/field_moves.asm:307 over data/sprite_anims/oam.asm:314
+  BIRD_OX = 80 - 8 - 8, BIRD_OY = 84 - 8 - 16,
+  -- engine/sprite_anims/functions.asm:1389-1416
+  LEAF_DEATH_X = 184, LEAF_AMP = 0x40,
+  -- constants/sprite_anim_constants.asm:20
+  LEAF_MAX = 9,
+  -- data/sprite_anims/oam.asm:487 over the OAM origin
+  LEAF_OX = -4 - 8, LEAF_OY = -4 - 16,
+}
+
+-- engine/sprite_anims/core.asm:216 (UpdateAnimFrame)
+function World.leafScreenPos(leaf)
+  return leaf.x + (leaf.xoff or 0) + FLY.LEAF_OX, leaf.y + FLY.LEAF_OY
+end
+
+-- engine/sprite_anims/core.asm:216 (UpdateAnimFrame)
+function World.birdScreenPos(fa)
+  return FLY.BIRD_OX + (fa.xoff or 0), FLY.BIRD_OY + (fa.y or 0)
+end
+
+-- engine/sprite_anims/core.asm:229 (UpdateAnimFrame)
+function World.offGbScreen(x, y, w, h)
+  return x + w <= 0 or y + h <= 0 or x >= 160 or y >= 144
+end
+
+-- FlyFunction_InitGFX's GetSpeciesIcon (engine/events/field_moves.asm:390):
+-- the icon of the mon in wCurPartyMon, on PAL_OW_RED like every other OW OBJ.
+function World:flyIconFor(mon)
+  if type(mon) ~= "table" then return nil end
+  local data = self.game and self.game.data
+  local icons = data and data.gen2Icons
+  local iconId = mon.isEgg and "ICON_EGG"
+    or (icons and icons.species and mon.species
+      and icons.species[mon.species])
+  local entry = iconId and icons and icons.icons and icons.icons[iconId]
+  if not (entry and entry.image) then return nil end
+  local def = {
+    id = "SPRITE_FLY_MON", image = entry.image, frames = 2, walker = false,
+    spriteType = "POKEMON_SPRITE", palette = "PAL_OW_RED", paletteId = 0,
+    species = mon.species, icon = iconId,
+  }
+  local ok, icon = pcall(SpriteRenderer.new, def, "gen2fly")
+  if not (ok and icon) then return nil end
+  local daytime = self.daytime or Palettes.daytimeFor(
+    self.map and self.map.def, self:hour(), self.flashUsed)
+  local colors = Palettes.spritePalette(self.palettes, daytime, def)
+  if colors then
+    icon:setObjPalette(colors, ("gen2:%s:0"):format(tostring(daytime)))
+  end
+  return icon
+end
+
+-- False when there is no icon sheet (or no love at all): the caller then flies
+-- the way it always did rather than parking the world on an animation.
+function World:startFlyAnim(phase, mon, onDone)
+  local icon = self:flyIconFor(mon)
+  local p = self.player
+  if not (icon and p) then return false end
+  local landing = phase == "to"
+  self.flyAnim = {
+    phase = phase, icon = icon, onDone = onDone, t = 0,
+    xoff = 0, wave = 0,
+    leaves = {},
+    left = landing and FLY.TO_FRAMES or FLY.FROM_FRAMES,
+    hover = landing and 0 or FLY.HOVER,
+    amp = landing and FLY.TO_AMP or 0,
+    y = landing and -FLY.TO_RISE or 0,
+    preroll = landing and 0 or FLY.FROM_PREROLL,
+  }
+  return true
+end
+
+-- FlyFunction_FrameTimer (engine/events/field_moves.asm:409) over the two
+-- AnimSeq_Fly* curves; the wobble is Sprites_Cosine's d * cos(n * pi / 32).
+function World:stepFlyAnim()
+  local fa = self.flyAnim
+  if not fa then return end
+  if (fa.preroll or 0) > 0 then
+    fa.preroll = fa.preroll - 1
+    return
+  end
+  local left = fa.left
+  if left <= 0 then
+    local done = fa.onDone
+    self.flyAnim = nil
+    if done then done() end
+    return
+  end
+  self:spawnFlyLeaves(fa)
+  fa.left = left - 1
+  if left >= 0x40 and left % 8 == 0 then
+    self:playSfxNamed("Sfx_Fly", SFX.FLY)
+  end
+  fa.t = fa.t + 1
+  local amp = fa.amp
+  if fa.phase == "to" then
+    if fa.y >= 0 then return end
+    fa.y = fa.y + 2
+    if amp > 0 then fa.amp = amp - 2 end
+  else
+    if fa.hover > 0 then
+      fa.hover = fa.hover - 1
+      return
+    end
+    if fa.y <= -FLY.RISE then return end
+    fa.y = fa.y - 2
+    if amp < FLY.AMP_MAX then fa.amp = amp + 8 end
+  end
+  fa.xoff = math.floor(amp * math.cos((fa.wave % 64) * math.pi / 32))
+  fa.wave = fa.wave + 1
+end
+
+-- engine/events/field_moves.asm:429-446
+-- engine/sprite_anims/functions.asm:1389-1416
+function World:spawnFlyLeaves(fa)
+  local leaves = fa.leaves
+  if not leaves then
+    leaves = {}
+    fa.leaves = leaves
+  end
+  local counter = self.flyLeafCounter or 0
+  self.flyLeafCounter = (counter + 1) % 256
+  if counter % 8 == 0 and #leaves < FLY.LEAF_MAX then
+    local row = math.floor(self.flyLeafCounter / 8) % 4
+    leaves[#leaves + 1] = { x = 0, y = row * 16 + 0x40, wave = 0, xoff = 0 }
+  end
+  for i = #leaves, 1, -1 do
+    local leaf = leaves[i]
+    if leaf.x >= FLY.LEAF_DEATH_X then
+      table.remove(leaves, i)
+    else
+      leaf.x = leaf.x + 2
+      leaf.y = leaf.y - 1
+      leaf.xoff = math.floor(FLY.LEAF_AMP
+        * math.cos((leaf.wave % 64) * math.pi / 32))
+      leaf.wave = leaf.wave + 1
+    end
+  end
+end
+
+-- engine/events/overworld.asm:597
+function World:flyHides()
+  local all = self.flyAnim ~= nil or self.flyHidden == "from"
+  return all, all or self.flyHidden ~= nil
+end
+
+-- engine/events/field_moves.asm:429-446
+function World:gbScreenOrigin()
+  return math.floor(((self.viewW or 160) - 160) / 2),
+    math.floor(((self.viewH or 144) - 144) / 2)
+end
+
+-- data/sprite_anims/oam.asm:485-487
+function World:drawFlyLeaves(s, billboard)
+  local fa = self.flyAnim
+  local sheet = self.cutGrassImage
+  if not (fa and fa.leaves and sheet and self.cutGrassQuad) then return end
+  local G = love.graphics
+  local colors = Palettes.spritePalette(self.palettes,
+    self.daytime or Palettes.daytimeFor(self.map and self.map.def,
+      self:hour(), self.flashUsed),
+    { paletteId = 6 })
+  local sox, soy = self:gbScreenOrigin()
+  local function blit()
+    G.setColor(1, 1, 1, 1)
+    for _, leaf in ipairs(fa.leaves) do
+      local lx, ly = World.leafScreenPos(leaf)
+      if not World.offGbScreen(lx, ly, 8, 8) then
+        lx, ly = lx + sox, ly + soy
+        local function one()
+          G.draw(sheet, self.cutGrassQuad,
+            math.floor(lx * s), math.floor(ly * s), 0, s, s)
+        end
+        if billboard then
+          billboard((lx + 4) * s, (ly + 4) * s, one)
+        else
+          one()
+        end
+      end
+    end
+  end
+  if colors and GbcPalette.available() then
+    GbcPalette.with(colors, blit)
+  else
+    blit()
+  end
+end
+
+-- .Frameset_RedWalk is two 8-frame icon beats, the fourth mirrored
+-- -- data/sprite_anims/framesets.asm:81-86
+function World:drawFlyAnim(s, billboard)
+  local fa = self.flyAnim
+  if not (fa and fa.icon) then return end
+  if (fa.preroll or 0) > 0 then return end
+  local G = love.graphics
+  local bx, by = World.birdScreenPos(fa)
+  if not World.offGbScreen(bx, by, 16, 16) then
+    local sox, soy = self:gbScreenOrigin()
+    local px, py = bx + sox, by + soy
+    local beat = math.floor(fa.t / 8) % 4
+    local function body()
+      G.setColor(1, 1, 1, 1)
+      G.push()
+      G.scale(s, s)
+      fa.icon:draw(px, py, 0, 0, "down", 0, false, false, beat == 3, beat % 2)
+      G.pop()
+    end
+    if billboard then
+      billboard((px + 8) * s, (py + 16) * s, body)
+    else
+      body()
+    end
+  end
+  self:drawFlyLeaves(s, billboard)
+end
+
+-- .FlyScript: FlyFromAnim, WarpToSpawnPoint, `newloadmap MAPSETUP_TELEPORT`,
+-- then FlyToAnim -- engine/events/overworld.asm:595-609
+function World:flyTo(spawnId, mon)
   local spawn = self.landmarks and self.landmarks.spawns
     and self.landmarks.spawns[spawnId]
   if not (spawn and spawn.map and self.maps and self.maps[spawn.map]) then
+    if self.flyHidden == "from" then self.flyHidden = nil end
     return false
   end
-  self:applyPlayerState(FieldMoves.PLAYER_NORMAL)
-  local ok = self:runMapSetup(MAPSETUP.TELEPORT, function()
-    return self:setMap(spawn.map, spawn.x, spawn.y, "down")
-  end)
-  -- FlyFromAnim / FlyToAnim ride the setup script's own two fades: the take-off
-  -- lift under the fade out, the landing under the fade in.
-  if self.mapSetup then self.mapSetup.lift = true end
-  return ok
+  local function warp()
+    self:applyPlayerState(FieldMoves.PLAYER_NORMAL)
+    local ok = self:runMapSetup(MAPSETUP.TELEPORT, function()
+      -- data/maps/setup_scripts.asm:26
+      -- engine/overworld/map_setup.asm:93
+      self.flyHidden = "to"
+      return self:setMap(spawn.map, spawn.x, spawn.y, "down")
+    end, true)
+    if self.mapSetup then
+      self.mapSetup.flyIn = mon
+    else
+      self.flyHidden = nil
+    end
+    return ok
+  end
+  -- engine/events/overworld.asm:597
+  self.flyHidden = "from"
+  if self:startFlyAnim("from", mon, warp) then return true end
+  return warp()
 end
 
 -- _FlyMap: the town map with the cursor locked to visited flypoints, A takes
@@ -5712,39 +6482,73 @@ end
 -- "Where?" plate over it instead of the card strip.  A run with no love at all
 -- (a headless probe) has no screen to push, so the destinations are offered
 -- one at a time through the same yesorno box every other field move uses.
-function World:openFlyMap()
+-- list standing -- engine/events/overworld.asm:556, :578 over
+-- engine/pokemon/mon_menu.asm:624.
+function World:openFlyMap(mon, opts)
   local points = self:flyPoints()
   if #points == 0 then return false end
   -- Loaded on demand and through pcall: a headless run has no love, and this
   -- is the only place in the world that reaches for a screen module by hand.
   local okGear, Pokegear = pcall(require, "src.ui.gen2.Pokegear")
   if okGear and Pokegear.FLY_MAP and self.game and self.game.stack then
-    Screens.push(self.game, "Gen2Pokegear", {
-      save = self.game.save,
-      currentLandmark = self:currentLandmarkId(),
-      fly = points,
-      onFly = function(spawnId)
-        self.game.stack:pop()
-        self:flyTo(spawnId)
-      end,
-      onClose = function() self.game.stack:pop() end,
-    })
+    local function pushGear()
+      Screens.push(self.game, "Gen2Pokegear", {
+        save = self.game.save,
+        currentLandmark = self:currentLandmarkId(),
+        fly = points,
+        -- (../pokecrystal/engine/pokegear/pokegear.asm:2708-2721).
+        flyMon = mon,
+        onFly = function(spawnId)
+          self.game.stack:pop()
+          if opts and opts.onChosen then
+            opts.onChosen(spawnId)
+          else
+            self:flyTo(spawnId, mon)
+          end
+        end,
+        onClose = function()
+          self.game.stack:pop()
+          if opts then
+            -- engine/pokegear/pokegear.asm:2062-2078, engine/menus/start_menu.asm:503-518
+            local party = self.game.save and self.game.save.party
+            Screens.push(self.game, "Gen2BlankScreen", {
+              frames = World.flyCancelBlankFrames(party and #party or 0),
+              onDone = function() self.game.stack:pop() end,
+            })
+          end
+          if opts and opts.onCancel then opts.onCancel() end
+        end,
+      })
+    end
+    if opts then
+      -- engine/pokegear/pokegear.asm:2027-2046
+      Screens.push(self.game, "Gen2BlankScreen", {
+        frames = FLY_MAP_BUILD_FRAMES,
+        onDone = function()
+          self.game.stack:pop()
+          pushGear()
+        end,
+      })
+    else
+      pushGear()
+    end
     return true
   end
-  self:askFlyPoint(points, 1)
+  if opts then return false end
+  self:askFlyPoint(points, 1, mon)
   return true
 end
 
-function World:askFlyPoint(points, index)
+function World:askFlyPoint(points, index, mon)
   local row = points[index]
   if not row then return end
   local name = (row.name or row.landmark):gsub("\n", " ")
   self:showText(Strings(FieldMoves.TEXT.ASK_FLY_TO, name), function()
     self:askYesNo(function(yes)
       if yes then
-        self:flyTo(row.spawn)
+        self:flyTo(row.spawn, mon)
       else
-        self:askFlyPoint(points, index + 1)
+        self:askFlyPoint(points, index + 1, mon)
       end
     end)
   end)
@@ -5772,6 +6576,20 @@ function World:updateFieldMove()
     st.timer = st.timer - 1
     return
   end
+  if st.phase == "whirlpoolsfx" then
+    st.left = (st.left or 0) - 1
+    if st.waiting then
+      if Sound.sfxBusy() and st.left > 0 then return end
+      st.waiting = nil
+      self:playSfxNamed("Sfx_Surf", SFX.SURF)
+      return
+    end
+    if Sound.sfxBusy() and st.left > 0 then return end
+    self.fieldMove = nil
+    -- engine/events/overworld.asm:1163-1164
+    if st.blockIndex then self:replaceBlock(st.blockIndex, st.replacement) end
+    return
+  end
   if st.phase == "strength" then
     self.fieldMove = nil
     if st.text then self:showText(Strings(st.text)) end
@@ -5794,16 +6612,47 @@ end
 -- opponent belongs to, the member inside it (only RIVAL2 reads that), the
 -- map's landmark for RegionCheck, and the clock.
 function World:battleMusicContext(opts)
+  local GameVersion = require("src.core.GameVersion")
   local members = self.constants and self.constants.trainerClassMembers
   local trainer = opts and opts.trainer
+  local save = self.game and self.game.save
   return {
+    battleTheme = World.modBattleTheme(self, opts),
     class = trainer and trainer.classId,
     member = trainer and trainer.memberId,
     members = trainer and trainer.classId and members
       and members[trainer.classId] or nil,
     landmark = self.map and self.map.def and self.map.def.landmark,
-    daytime = self.daytime,
+    -- PlayBattleMusic reads wTimeOfDay (engine/battle/start_battle.asm:24),
+    -- not the map's pinned palette set.
+    daytime = self.tod,
+    -- ../pokecrystal/engine/battle/start_battle.asm:60-66
+    -- wBattleType write at ../pokecrystal/engine/overworld/wildmons.asm:561
+    battleType = (opts and opts.battleType)
+      or (opts and opts.roaming and BATTLETYPE.ROAMING) or nil,
+    crystal = GameVersion.engine((save and save.version)
+      or GameVersion.get()) == "crystal",
   }
+end
+
+-- a mod-set battle theme: the class' trainers.battleTheme, else the wild
+-- species' pokemon.battleTheme; nil for vanilla content
+function World:modBattleTheme(opts)
+  local data = self.game and self.game.data
+  if not data then return nil end
+  local trainer = opts and opts.trainer
+  if trainer then
+    -- classId keys data.trainers.classes; classIndex is keyed by the
+    -- numeric `class`
+    local classes = data.trainers and data.trainers.classes
+    local entry = (trainer.classId and classes and classes[trainer.classId])
+      or (trainer.class and Trainers.classIndex(data.trainers)[trainer.class])
+    return entry and entry.battleTheme or nil
+  end
+  local wild = opts and opts.wild
+  local def = wild and wild.species and data.pokemon
+    and data.pokemon[wild.species]
+  return def and def.battleTheme or nil
 end
 
 function World:playBattleMusic(opts)
@@ -5816,9 +6665,45 @@ function World:playBattleMusic(opts)
   return song
 end
 
+-- ../pokecrystal/engine/battle/start_battle.asm:15
+function World.transitionStatusByte(status, turns)
+  if status == "sleep" then return math.min(turns or 1, 7) end
+  if status == "poison" or status == "toxic" then return 8 end
+  if status == "burn" then return 16 end
+  if status == "freeze" then return 32 end
+  if status == "paralyze" then return 64 end
+  return 0
+end
+
+-- ../pokecrystal/engine/battle/start_battle.asm:15-35
+function World:transitionBattleMonLevel()
+  local GameVersion = require("src.core.GameVersion")
+  local save = self.game and self.game.save
+  local engine = GameVersion.engine((save and save.version) or GameVersion.get())
+  if engine ~= "crystal" then return self.staleBattleMonLevel or 0 end
+  for _, mon in ipairs((save and save.party) or {}) do
+    if (mon.hp or 0) > 0 then
+      return World.transitionStatusByte(mon.status, mon.statusTurns)
+    end
+  end
+  return 0
+end
+
+-- ../pokegold/engine/battle/core.asm:5995
+function World:recordStaleBattleLevels(battle)
+  if battle.enemy and battle.enemy.level then
+    self.staleEnemyMonLevel = battle.enemy.level
+  end
+  if battle.player and battle.player.level then
+    self.staleBattleMonLevel = battle.player.level
+  end
+end
+
 -- DoBattleTransition.  Returns true when the wipe took the screen, false when
 -- there is nothing to wipe (a headless run, or a battle started before the map
 -- is up) and the battle should just come straight in.
+-- ../pokegold/engine/battle/core.asm:7782-7783
+-- ../pokegold/engine/battle/battle_transition.asm:164
 function World:pushBattleTransition(battle, opts, onDone)
   local game = self.game
   if not (game and game.stack and self.map) then return false end
@@ -5826,11 +6711,16 @@ function World:pushBattleTransition(battle, opts, onDone)
     world = self,
     trainer = opts and opts.trainer and true or false,
     environment = self.map.def and self.map.def.environment,
-    playerLevel = battle and battle.player and battle.player.level,
-    enemyLevel = battle and battle.enemy and battle.enemy.level,
+    playerLevel = self:transitionBattleMonLevel(),
+    enemyLevel = self.staleEnemyMonLevel or 0,
     onDone = onDone,
   })
   return true
+end
+
+-- ../pokecrystal/engine/overworld/events.asm:284-285
+function World:cancelMapNameSign()
+  MapNameSign.cancel(self)
 end
 
 -- Push the battle screen.  Kept here rather than in Game2 so a trainer
@@ -5846,6 +6736,7 @@ function World:startBattle(opts, onDone)
     if onDone then onDone("win") end
     return false
   end
+  self:cancelMapNameSign()
   local battle = Battle.new({
     data = game.data,
     -- BATTLETYPE_TUTORIAL fights with an EMPTY party: engine/battle/core.asm
@@ -5865,6 +6756,12 @@ function World:startBattle(opts, onDone)
     -- wBattleType, when the script armed one: the FORCESHINY / TRAP
     -- no-escape rules live in Battle:tryRun and the force-switch handler.
     battleType = opts.battleType,
+    -- wInBattleTowerBattle (../pokecrystal/engine/events/battle_tower/
+    -- battle_tower.asm:220-223), which turns DoBadgeTypeBoosts off.
+    battleTower = opts.battleTower,
+    -- wTimeOfDay, for BattleCommand_TimeBasedHealContinue
+    -- (engine/battle/effect_commands.asm:6401-6404).
+    timeOfDay = self:timeOfDayId(),
   })
   self:playBattleMusic(opts)
   local function pushBattle()
@@ -5885,10 +6782,13 @@ function World:startBattle(opts, onDone)
       -- World:startCatchTutorial sets it.
       tutorial = opts.tutorial,
       onDone = function(outcome)
+        self:recordStaleBattleLevels(battle)
         -- WildBattleScript's reloadmapafterbattle (engine/overworld/events.asm:1158-1162)
         self.wildCooldown = 5
         self.battleActive = nil
         game.stack:pop()
+        -- engine/overworld/events.asm:1158-1162, data/maps/setup_scripts.asm:124
+        if not self:scriptRunning() then self:battleReturnFade() end
         -- wBattleResult (constants/battle_constants.asm): WIN 0, LOSE 1, DRAW 2.
         -- The port never forfeits or draws a battle, so "lose" is the only
         -- other outcome startBattle's onDone hands back; VAR.BATTLERESULT
@@ -5999,6 +6899,24 @@ function World:startBattle(opts, onDone)
   return true
 end
 
+-- wWinTextPointer / wLossTextPointer (home/trainers.asm:120), overwritten by
+-- `winlosstext` (engine/overworld/scripting.asm:651)
+function World:trainerWinLossText()
+  local vm = self.vm
+  if not vm then return nil, nil end
+  local obj = vm.trainerObject or {}
+  local text = self.text or {}
+  -- `winlosstext` writes BOTH pointers; a 0 argument destroys the struct
+  -- value rather than falling back to it (engine/overworld/scripting.asm:651)
+  local winKey, lossKey
+  if vm.winLossArmed then
+    winKey, lossKey = vm.winTextOverride, vm.lossTextOverride
+  else
+    winKey, lossKey = obj.winText, obj.lossText
+  end
+  return winKey and text[winKey] or nil, lossKey and text[lossKey] or nil
+end
+
 -- `startbattle` from a script: a trainer record (class + member) or a
 -- loadwildmon pair.  The VM is parked on the yield until onDone fires, so the
 -- rest of the trainer script (flag set, after-battle text) runs on return.
@@ -6057,6 +6975,9 @@ function World:startScriptedBattle(record, wild, onDone)
       attributes = record.attributes,
       items = record.items,
     }
+    -- wWinTextPointer / wLossTextPointer, read by PrintWinLossText on the
+    -- battle screen (home/trainers.asm:230) (#1512)
+    opts.trainer.winText, opts.trainer.lossText = self:trainerWinLossText()
   elseif wild and wild.species then
     local id, def = speciesByIndex(data and data.pokemon, wild.species)
     -- InitEnemyMon `.NotRoaming` / BATTLETYPE.FORCESHINY: the DV pair is
@@ -6079,8 +7000,18 @@ function World:startScriptedBattle(record, wild, onDone)
       if given then opts.wild.item = given end
     end
   end
+  -- engine/overworld/scripting.asm Script_startbattle
   if not (opts.trainer and #opts.trainer.party > 0) and not opts.wild then
-    if onDone then onDone("win") end
+    require("src.core.Logger").warn(
+      "no battle opened (trainer %s, class %s, member %s, party %d, wild %s)",
+      tostring(record and record.name), tostring(record and record.class),
+      tostring(record and record.member),
+      opts.trainer and #opts.trainer.party or 0,
+      tostring(wild and wild.species))
+    if not wild then
+      self:refuseTrainer(record or (self.vm and self.vm.trainerObject))
+    end
+    if onDone then onDone(nil) end
     return false
   end
   -- wBattleType, which `writevar VAR.BATTLETYPE / loadvar BATTLETYPE_*` armed:
@@ -6185,7 +7116,7 @@ function World:momTriesToBuy()
   local Phone = require("src.core.gen2.Phone")
   if self.vm then self.vm.curPhoneCaller = Phone.PHONECONTACT_MOM end
   self.queuedScript = require("src.core.gen2.PhoneRing").script(
-    { scriptKey = script },
+    { contact = Phone.PHONECONTACT_MOM, scriptKey = script },
     Phone.NON_TRAINER_NAMES[Phone.PHONECONTACT_MOM])
   -- A doll changes what stands in the bedroom, and the room is rebuilt from
   -- the flags on a MAP LOAD -- so nothing has to be dropped here, the same
@@ -6825,7 +7756,9 @@ end
 -- stack the overworld and the VM under it do not tick at all -- so the wait has
 -- to be counted by the box itself.  Frames, already doubled by Vm:pauseFrames
 -- the way Script_pause's `ld c, 2 / call DelayFrames` doubles the operand.
-function World:showText(body, onDone, stay, hold)
+-- ../pokecrystal/home/joypad.asm:302 WaitButton
+function World:showText(body, onDone, stay, hold, sfxWait, arrows)
+  local waitButton = not arrows
   local game = self.game
   -- The box a PREVIOUS `stay` left standing (TextBox's contract is "whoever
   -- pushed it owns the pop", src/render/TextBox.lua:40).  `yesorno` consumes it
@@ -6868,6 +7801,7 @@ function World:showText(body, onDone, stay, hold)
         end
         if onDone then onDone() end
       end },
+      waitButton = waitButton,
     })
     game.stack:push(box)
     return
@@ -6875,7 +7809,7 @@ function World:showText(body, onDone, stay, hold)
   game.stack:push(TextBox.new(game, body, function()
     self.textbox = nil
     if onDone then onDone() end
-  end))
+  end, { sfxWait = sfxWait and true or nil, waitButton = waitButton }))
 end
 
 function World:pooledNpc(mapId, obj)
@@ -7002,6 +7936,22 @@ function World:loadObjectMasks(opts)
   self.maskScripted = scripted
 end
 
+-- InitializeVisibleSprites (engine/overworld/player_object.asm:223)
+function World:objectSpawnable(obj)
+  local map = self.map
+  local def = map and map.def
+  local wCells = (map and map.widthCells) or (def and def.width and def.width * 2)
+  local hCells = (map and map.heightCells)
+    or (def and def.height and def.height * 2)
+  if not (obj and wCells and hCells) then return true end
+  local ox, oy = obj.x or 0, obj.y or 0
+  if ox >= 0 and oy >= 0 and ox < wCells and oy < hCells then return true end
+  local px = (self.player and self.player.cellX) or 0
+  local py = (self.player and self.player.cellY) or 0
+  local dx, dy = ox - px, oy - py
+  return dx >= -5 and dx < 7 and dy >= -5 and dy < 6
+end
+
 -- Current-map NPCs + visual-only ghosts on neighbor strips (Gen 1 pattern).
 function World:rebuildPeople(opts)
   opts = opts or {}
@@ -7038,7 +7988,7 @@ function World:rebuildPeople(opts)
       masked = not (self.events:objectVisible(obj.eventFlag)
         and self:objectTimeVisible(obj))
     end
-    if not masked then
+    if not masked and self:objectSpawnable(obj) then
       local npc = self:pooledNpc(self.map.id, obj)
       if npc then
         fromMap[npc] = true
@@ -7238,6 +8188,24 @@ function World:trainerBeaten(record)
   return self.events:get(record.event) and true or false
 end
 
+local function trainerKey(record)
+  if not (record and record.class and record.member) then return nil end
+  return tostring(record.class) .. "/" .. tostring(record.member)
+end
+
+function World:refuseTrainer(record)
+  local key = trainerKey(record)
+  if not key then return end
+  self.refusedTrainers = self.refusedTrainers or {}
+  self.refusedTrainers[key] = true
+end
+
+function World:trainerRefused(record)
+  local key = trainerKey(record)
+  if not (key and self.refusedTrainers) then return false end
+  return self.refusedTrainers[key] and true or false
+end
+
 -- _CheckTrainerBattle: every visible, unbeaten trainer object that is facing
 -- the player along a shared row or column, within its own sight range.
 function World:checkTrainerBattle()
@@ -7247,7 +8215,8 @@ function World:checkTrainerBattle()
   if not (save and save.party and #save.party > 0) then return false end
   for _, npc in ipairs(self.npcs) do
     local record = npc.def and npc.def.trainer
-    if record and not self:trainerBeaten(record) then
+    if record and not self:trainerBeaten(record)
+      and not self:trainerRefused(record) then
       local distance, dir = Trainers.sees(npc, self.player, npc.def.sight)
       if distance then
         return self:startTrainerScript(npc, SEEN_BY_TRAINER_SCRIPT, {
@@ -7277,6 +8246,7 @@ function World:startTrainerScript(npc, script, sight)
   end
   self.talkNpc = npc
   self:freezeNpc(npc)
+  self:cancelMapNameSign()
   self.vm.trainerObject = npc.def.trainer
   self.trainerSight = sight
   self.trainerNpc = npc
@@ -7357,26 +8327,43 @@ function World:interact()
   return self:interactBody()
 end
 
+-- CheckFacingObject (engine/overworld/npc_movement.asm:229-248): "Double the
+-- distance for counter tiles."  A Pokecenter nurse and a Mart clerk stand
+-- BEHIND a COLL_COUNTER tile, so the cell the player faces is the counter
+-- itself and the object is one further on.  Without this the press finds an
+-- empty wall and nothing happens -- which is to say no nurse and no clerk in
+-- the game could be talked to at all.
+--
+-- Only the OBJECT lookup is doubled, exactly as the cart does it: bg events
+-- and the tile-collision events still read the tile actually faced.
+function World:facingObjectCell()
+  local p = self.player
+  if not p then return nil end
+  local d = Map.DELTA[p.facing] or Map.DELTA.down
+  local fx, fy = p.cellX + d[1], p.cellY + d[2]
+  if self.map and Permissions.isCounter(self.map:cellCollision(fx, fy)) then
+    return p.cellX + d[1] * 2, p.cellY + d[2] * 2
+  end
+  return fx, fy
+end
+
+-- The carry CheckFacingObject answers with: IsNPCAtCoord, and then only when
+-- that object's OBJECT_WALKING reads STANDING (npc_movement.asm:250-266).
+function World:facingObject()
+  local ox, oy = self:facingObjectCell()
+  if not ox then return nil end
+  local npc = self:npcAt(ox, oy)
+  if npc and npc.moving then return nil end
+  return npc
+end
+
 function World:interactBody()
   if self:busy() or not self.player or not self.vm then return false end
   local p = self.player
   if p.moving then return false end
   local d = Map.DELTA[p.facing]
   local fx, fy = p.cellX + d[1], p.cellY + d[2]
-  -- CheckFacingObject (engine/overworld/npc_movement.asm:229): "Double the
-  -- distance for counter tiles."  A Pokecenter nurse and a Mart clerk stand
-  -- BEHIND a COLL_COUNTER tile, so the cell the player faces is the counter
-  -- itself and the object is one further on.  Without this the press finds an
-  -- empty wall and nothing happens -- which is to say no nurse and no clerk in
-  -- the game could be talked to at all.
-  --
-  -- Only the OBJECT lookup is doubled, exactly as the cart does it: bg events
-  -- and the tile-collision events below still read the tile actually faced.
-  local ox, oy = fx, fy
-  if self.map and Permissions.isCounter(self.map:cellCollision(fx, fy)) then
-    ox, oy = p.cellX + d[1] * 2, p.cellY + d[2] * 2
-  end
-  local npc = self:npcAt(ox, oy)
+  local npc = self:npcAt(self:facingObjectCell())
   -- TryObjectEvent writes hLastTalked for EVERY A-press dispatch; scripts
   -- then use LAST_TALKED (`disappear`, `applymovementlasttalked`) without any
   -- setlasttalked of their own.  The port only wrote it from the explicit
@@ -7397,7 +8384,8 @@ function World:interactBody()
     local talkTo = Gen1Facade.talkToWrapper()
     if talkTo and talkTo(self, npc) then return true end
   end
-  if npc and npc.def and npc.def.trainer then
+  if npc and npc.def and npc.def.trainer
+    and not self:trainerRefused(npc.def.trainer) then
     interacted(self, fx, fy, "trainer", npc)
     return self:startTrainerScript(npc, TALK_TO_TRAINER_SCRIPT, nil)
   end
@@ -7570,7 +8558,12 @@ function World:bakeMapImage(map, daytime, flicker)
   -- (#208, see src/render/PixelCanvas.lua).
   local canvas = PixelCanvas.new(pw, ph, "nearest")
   local quads = {}
+  local crystal = self:isCrystal()
   local function quadFor(tile)
+    if crystal then
+      local attr = TileAttrs.forTile(tileset, tile)
+      return TileAttrs.quadFor(atlas, tile, attr, tilesPerRow, quads)
+    end
     local q = quads[tile]
     if q then return q end
     local sx = (tile % tilesPerRow) * 8
@@ -7617,13 +8610,18 @@ function World:bakeMapImage(map, daytime, flicker)
         if block then
           for i = 0, 15 do
             local tile = block[i + 1] or 0
-            -- tilePalettes is 1-based over the 96 sheet tiles; anything past
-            -- the sheet (window/text tiles) has no entry and takes slot 1.
-            local tileSlot = tilePalettes and tilePalettes[tile + 1] or 1
+            local tileSlot = crystal
+              and TileAttrs.paletteSlot(tileset, tile)
+              or (tilePalettes and tilePalettes[tile + 1] or 1)
             if not slot or tileSlot == slot then
               local tx = bx * 32 + (i % 4) * 8
               local ty = by * 32 + math.floor(i / 4) * 8
-              love.graphics.draw(atlas, quadFor(tile), tx, ty)
+              if crystal then
+                local attr = TileAttrs.forTile(tileset, tile)
+                TileAttrs.drawFlippedTile(atlas, quadFor(tile), tx, ty, attr)
+              else
+                love.graphics.draw(atlas, quadFor(tile), tx, ty)
+              end
             end
           end
         end
@@ -7709,6 +8707,7 @@ function World:animCellsFor(map, tileset)
   if not wanted then return nil end
   local blocks = tileset.blocks
   local tilePalettes = tileset.tilePalettes
+  local crystal = self:isCrystal()
   local out = nil
   for by = 0, map.height - 1 do
     for bx = 0, map.width - 1 do
@@ -7726,7 +8725,8 @@ function World:animCellsFor(map, tileset)
               list = {
                 layer = layer,
                 tile = tile,
-                slot = tilePalettes and tilePalettes[tile + 1] or 1,
+                slot = crystal and TileAttrs.paletteSlot(tileset, tile)
+                  or (tilePalettes and tilePalettes[tile + 1] or 1),
                 cells = {},
               }
               out[tile] = list
@@ -7748,7 +8748,8 @@ function World:mapCacheKey(mapId)
   local daytime = self.daytime
   local flicker = (daytime == "DARK") and self.flickerPhase or 1
   return mapId .. "|" .. tostring(daytime)
-    .. "|" .. tostring(GbcPalette.mode) .. "|" .. tostring(flicker)
+    .. "|" .. tostring(GbcPalette.mode) .. "|" .. tostring(GbcPalette.customRamp)
+    .. "|" .. tostring(flicker)
 end
 
 function World:imageFor(mapId)
@@ -7827,12 +8828,217 @@ function World:bgTileAt(map, tileset, mx, my)
   return block[i + 1]
 end
 
--- IN_GRASS puts OAM_PRIO on the sprite's lower 16x8 only: .InitSprite ORs it
--- into hCurSpriteOAMFlags (engine/overworld/map_objects.asm:2850) and only the
--- bottom two OAM entries of a walking facing carry RELATIVE_ATTRIBUTES
--- (data/sprites/facings.asm:45-56).  The strip starts at py+4 because a sprite
--- draws 4 px above its cell (map_objects.asm:2876).
-function World:drawGrassOver(entity, ox, oy, s)
+function World:rebuildAttrGrid()
+  if not self:isCrystal() then
+    self.attrGrid = nil
+    return
+  end
+  if not self.map then
+    self.attrGrid = nil
+    return
+  end
+  local _, tileset = self:atlasFor(self.map.def)
+  if not tileset then
+    self.attrGrid = nil
+    return
+  end
+  self.attrGrid = MapAttrGrid.build(self.map, tileset)
+end
+
+function World:bgTileAttrAt(map, tileset, mx, my)
+  local cell = self.attrGrid and MapAttrGrid.lookup(self.attrGrid, mx, my)
+  if cell then return cell end
+  local tile = self:bgTileAt(map, tileset, mx, my)
+  if not tile then return nil end
+  local tileId, attr = MapAttrGrid.normalizeTile(tile, tileset)
+  return { tileId = tileId, rawTileId = tile, attr = attr }
+end
+
+-- LÖVE scissor is window/canvas space; Playfield.push translates draws but not
+-- scissor rects.  Map-local (ox, oy, s) feet/bbox regions must be lifted.
+local function playfieldOrigin()
+  if Playfield.entered and Playfield.box then
+    return Playfield.box.x or 0, Playfield.box.y or 0
+  end
+  return 0, 0
+end
+
+local function intersectScissor(x, y, w, h, prev)
+  if not prev then return x, y, w, h end
+  local px, py, pw, ph = prev[1], prev[2], prev[3], prev[4]
+  if px == nil then px, py, pw, ph = prev.x, prev.y, prev.width, prev.height end
+  if not (px and py and pw and ph) then return x, y, w, h end
+  local x2 = math.max(x, px)
+  local y2 = math.max(y, py)
+  local x3 = math.min(x + w, px + pw)
+  local y3 = math.min(y + h, py + ph)
+  local iw, ih = x3 - x2, y3 - y2
+  if iw < 1 or ih < 1 then return nil end
+  return x2, y2, iw, ih
+end
+
+function World:feetCompositeCanvas(w, h)
+  local G = love.graphics
+  if not (G and G.newCanvas) then return nil end
+  self._feetCanvases = self._feetCanvases or {}
+  local key = w .. "x" .. h
+  local canvas = self._feetCanvases[key]
+  if canvas and canvas:getWidth() == w and canvas:getHeight() == h then
+    return canvas
+  end
+  if canvas and canvas.release then canvas:release() end
+  local ok, made = pcall(G.newCanvas, w, h)
+  if not ok or not made then return nil end
+  made:setFilter("nearest", "nearest")
+  self._feetCanvases[key] = made
+  return made
+end
+
+-- Blit BG tiles over a map-pixel region already in the current transform.
+function World:blitBgOverRegionLocal(mapDef, originX, originY, rx0, ry0, rx1, ry1,
+    keyed, tileFilter, scale)
+  local atlas, tileset = self:atlasFor(mapDef)
+  if not (atlas and tileset) then return end
+  local G = love.graphics
+  local cacheKey = self:mapCacheKey(self.map.id)
+  local bgSet = self.bgSets[cacheKey] or nil
+  local animCells = self.animCells and self.animCells[cacheKey] or nil
+  local tilesPerRow = tileset.tilesPerRow or 16
+  self.bgOverQuads = self.bgOverQuads or {}
+  local map = self.map
+  scale = scale or 1
+  G.setColor(1, 1, 1, 1)
+
+  for ty = math.floor(ry0 / 8) * 8, math.floor((ry1 - 1) / 8) * 8, 8 do
+    for tx = math.floor(rx0 / 8) * 8, math.floor((rx1 - 1) / 8) * 8, 8 do
+      local info = self:bgTileAttrAt(map, tileset, tx, ty)
+      if info and tileFilter(info) then
+        local attr = info.attr
+        local drawX = math.floor(originX + (tx - rx0) * scale)
+        local drawY = math.floor(originY + (ty - ry0) * scale)
+        local animList = self:animListAt(animCells, tx, ty)
+
+        local function blitTile(img, quad, drawAttr)
+          TileAttrs.drawFlippedTile(img, quad, drawX, drawY, drawAttr, scale, scale)
+        end
+
+        local paletteSlot = attr.palette
+        if animList and animList.slot then paletteSlot = animList.slot end
+        local set = bgSet and bgSet[paletteSlot]
+
+        local function runBlit(img, quad)
+          local function body() blitTile(img, quad, attr) end
+          if set and GbcPalette.available() then
+            if keyed then GbcPalette.keyedWith(set, body)
+            else GbcPalette.with(set, body) end
+          else
+            body()
+          end
+        end
+
+        if animList then
+          local layer = animList.layer
+          local sheet
+          if layer.kind == "scroll" then
+            sheet = self:scrollStrip(mapDef, tileset, animList.tile, layer.scroll)
+          else
+            sheet = self:animSheet(layer.sheet)
+          end
+          if sheet then
+            local row = self:animRow(layer)
+            local quad = self:animQuad(
+              layer.sheet or ("scroll|" .. animList.tile), row, layer.frames)
+            runBlit(sheet, quad)
+          else
+            local tile = info.tileId
+            local quad = TileAttrs.quadFor(
+              atlas, tile, attr, tilesPerRow, self.bgOverQuads)
+            runBlit(atlas, quad)
+          end
+        else
+          local tile = info.tileId
+          local quad = TileAttrs.quadFor(
+            atlas, tile, attr, tilesPerRow, self.bgOverQuads)
+          runBlit(atlas, quad)
+        end
+      end
+    end
+  end
+end
+
+-- Whether (tx, ty) is repainted by this map's tileset anim program.
+function World:animListAt(animCells, tx, ty)
+  if not animCells then return nil end
+  for _, list in pairs(animCells) do
+    local xy = list.cells
+    for i = 1, #xy, 2 do
+      if xy[i] == tx and xy[i + 1] == ty then return list end
+    end
+  end
+  return nil
+end
+
+-- Shared BG-over-OBJ blit.  Each intersecting 8x8 cell is drawn whole; the
+-- hardware clips to the region via scissor (scanline compositing), not sub-quad
+-- viewports.  `keyed` selects the OBJ-behind-BG rule for IN_GRASS feet;
+-- BG_PRIO tiles draw fully opaque.
+function World:blitBgOverRegion(mapDef, ox, oy, s, rx0, ry0, rx1, ry1, keyed, tileFilter)
+  local G = love.graphics
+  local pfX, pfY = playfieldOrigin()
+  local scissorX = pfX + math.floor(ox + rx0 * s)
+  local scissorY = pfY + math.floor(oy + ry0 * s)
+  local scissorW = math.ceil((rx1 - rx0) * s)
+  local scissorH = math.ceil((ry1 - ry0) * s)
+  local prevScissor = G.getScissor and G.getScissor()
+  local clipX, clipY, clipW, clipH =
+    intersectScissor(scissorX, scissorY, scissorW, scissorH, prevScissor)
+  if G.setScissor and clipX then G.setScissor(clipX, clipY, clipW, clipH) end
+
+  -- originX/Y is the screen position of map pixel (rx0, ry0): ox/oy are the
+  -- playfield-local offset of map (0,0), so a tile at (tx, ty) lands at
+  -- origin + (tx - rx0) * s — same convention as drawGrassOverGoldSilver's
+  -- ox + cx0 * s with absolute map coordinates.
+  self:blitBgOverRegionLocal(mapDef,
+    math.floor(ox + rx0 * s), math.floor(oy + ry0 * s),
+    rx0, ry0, rx1, ry1, keyed, tileFilter, s)
+
+  if G.setScissor then
+    if prevScissor then G.setScissor(prevScissor) else G.setScissor() end
+  end
+end
+
+-- IN_GRASS feet strip: bottom OAM + keyed grass on a 16x8 canvas, then one blit.
+-- Avoids scissor/transform bugs under Playfield letterboxing (issue #2080).
+function World:drawFeetComposite(entity, ox, oy, s, drawBottomOam)
+  local G = love.graphics
+  local x0, y0, x1, y1 = OamFootprint.feetStrip(entity)
+  local fw, fh = x1 - x0, y1 - y0
+  local canvas = self:feetCompositeCanvas(fw, fh)
+  if not canvas then
+    drawBottomOam()
+    self:blitBgOverRegion(self.map.def, ox, oy, s,
+      x0, y0, x1, y1, true, function() return true end)
+    return
+  end
+
+  local prev = G.getCanvas()
+  G.push("all")
+  G.origin()
+  G.setCanvas(canvas)
+  G.clear(0, 0, 0, 0)
+  G.translate(-x0, -y0)
+  drawBottomOam()
+  self:blitBgOverRegionLocal(self.map.def, 0, 0, x0, y0, x1, y1,
+    true, function() return true end, 1)
+  G.setCanvas(prev)
+  G.pop()
+
+  G.setColor(1, 1, 1, 1)
+  G.draw(canvas, ox + x0 * s, oy + y0 * s, 0, s, s)
+end
+
+-- Gold/Silver: keyed grass atlas + feet-strip sub-quad blit (no attrmap / OAM split).
+function World:drawGrassOverGoldSilver(entity, ox, oy, s)
   local map = self.map
   if not (entity and entity.inGrass and map) then return end
   local atlas, tileset = self:grassAtlasFor(map.def)
@@ -7842,10 +9048,7 @@ function World:drawGrassOver(entity, ox, oy, s)
   local tilePalettes = tileset.tilePalettes
   local tilesPerRow = tileset.tilesPerRow or 16
   local aw, ah = atlas:getDimensions()
-  -- Only draw the bottom 8px tile row of the cell (ty = py + 8) over the feet,
-  -- matching Gen 1's drawCellBottomRaw.  Starting at py + 4 sampled the top
-  -- tile row and drew grass tufts over the face and torso.
-  local rx, ry = entity.px, entity.py + 8
+  local rx, ry = entity.px, entity.py + 4
   self.grassQuad = self.grassQuad or G.newQuad(0, 0, 8, 8, aw, ah)
   local quad = self.grassQuad
   G.setColor(1, 1, 1, 1)
@@ -7878,6 +9081,38 @@ function World:drawGrassOver(entity, ox, oy, s)
   end
 end
 
+-- Crystal: attrmap tiles, full 8x8 cells, keyed BG-over-OAM in the feet strip.
+function World:drawGrassOverCrystal(entity, ox, oy, s)
+  if not (entity and entity.inGrass and self.map) then return end
+  local x0, y0, x1, y1 = OamFootprint.feetStrip(entity)
+  self:blitBgOverRegion(self.map.def, ox, oy, s,
+    x0, y0, x1, y1, true, function() return true end)
+end
+
+function World:drawGrassOver(entity, ox, oy, s)
+  if self:isCrystal() then
+    self:drawGrassOverCrystal(entity, ox, oy, s)
+  else
+    self:drawGrassOverGoldSilver(entity, ox, oy, s)
+  end
+end
+
+-- wAttrmap BG_PRIO (attribute bit 7): BG draws over the full sprite footprint.
+function World:drawBgPriorityOver(entity, ox, oy, s)
+  if not self:isCrystal() then return end
+  local x0, y0, x1, y1 = OamFootprint.spriteBBox(entity)
+  self:blitBgOverRegion(self.map.def, ox, oy, s,
+    x0, y0, x1, y1, false, function(info) return info.attr.priority end)
+end
+
+function World:drawPriorityOver(entity, ox, oy, s)
+  if not self:isCrystal() then return end
+  self:drawBgPriorityOver(entity, ox, oy, s)
+  if entity.inGrass and not (entity.grassShake and entity.moving) then
+    self:drawGrassOver(entity, ox, oy, s)
+  end
+end
+
 -- ShakeGrass' object (engine/overworld/map_objects.asm:2031): FacingGrass1 is
 -- the tile at (0,+8) and (+8,+8) from the sprite's origin, FacingGrass2 at
 -- (-1,+9) and (+9,+9), and SetFacingGrassShake's `and 4` alternates them every
@@ -7905,6 +9140,30 @@ function World:drawGrassShake(entity, ox, oy, s)
     G.draw(sheet, math.floor(ox + (entity.px + x1) * s), y, 0, s, s)
     -- OAM_XFLIP on the second entry of both facings, so it draws right to left.
     G.draw(sheet, math.floor(ox + (entity.px + x2 + 8) * s), y, 0, -s, s)
+  end
+  if colors and GbcPalette.available() then
+    GbcPalette.with(colors, blit)
+  else
+    blit()
+  end
+end
+
+-- engine/overworld/map_objects.asm:1995, :879-893, facings.asm:161-164
+function World:drawJumpShadow(entity, ox, oy, s)
+  local sheet = self.jumpShadowImage
+  if not (sheet and entity and entity.jumping) then return end
+  local G = love.graphics
+  local facing = entity.facing
+  local dy = (facing == "left" or facing == "right") and 8 or 10
+  local colors = Palettes.spritePalette(self.palettes,
+    self.daytime or Palettes.daytimeFor(self.map and self.map.def,
+      self:hour(), self.flashUsed),
+    { paletteId = 5 })
+  local function blit()
+    G.setColor(1, 1, 1, 1)
+    local y = math.floor(oy + (entity.py + dy) * s)
+    G.draw(sheet, math.floor(ox + entity.px * s), y, 0, s, s)
+    G.draw(sheet, math.floor(ox + (entity.px + 16) * s), y, 0, -s, s)
   end
   if colors and GbcPalette.available() then
     GbcPalette.with(colors, blit)
@@ -7971,7 +9230,8 @@ function World:borderImageFor(mapId)
   -- stale bake (#1418).
   local waterFrame = self:borderWaterFrame(def, tileset)
   local cacheKey = BorderFill.cacheKey(mapId .. "|" .. tostring(daytime)
-    .. "|" .. tostring(GbcPalette.mode) .. "|" .. tostring(flicker)
+    .. "|" .. tostring(GbcPalette.mode) .. "|" .. tostring(GbcPalette.customRamp)
+    .. "|" .. tostring(flicker)
     .. "|" .. tostring(BorderFill.voidFill or "fade")
     .. "|" .. tostring(blockId)
     .. "|" .. tostring(waterFrame and waterFrame.row or 0))
@@ -8410,8 +9670,10 @@ function World:setMap(mapId, cx, cy, facing, opts)
   -- MAPCALLBACK_NEWMAP runs, because the Cycling Road's callback is what sets
   -- them straight back again: leaving them set is how one visit to Route 17
   -- would keep the player glued to the bike for the rest of the game.
-  self:setEngineFlag(Bike.ENGINE_ALWAYS_ON_BIKE, false)
-  self:setEngineFlag(Bike.ENGINE_DOWNHILL, false)
+  self:setEngineFlag(World.engineFlagId(
+    self, "ENGINE_ALWAYS_ON_BIKE", Bike.ENGINE_ALWAYS_ON_BIKE), false)
+  self:setEngineFlag(World.engineFlagId(
+    self, "ENGINE_DOWNHILL", Bike.ENGINE_DOWNHILL), false)
   -- "Respawn in Pokemon Centers" (home/map.asm, LoadMapAttributes' .SetSpawn):
   -- walking from an OUTDOOR map into an INDOOR one whose tileset is
   -- TILESET_POKECENTER rewrites wLastSpawnMapGroup / wLastSpawnMapNumber, and
@@ -8455,6 +9717,7 @@ function World:setMap(mapId, cx, cy, facing, opts)
   self.fade = nil
   self.shake = nil
   self.map = Map.new(def, tileset)
+  self:rebuildAttrGrid()
   -- A follow pairing points at two live objects, and a map load rebuilds them
   -- (RefreshMapSprites); nothing on the cart survives that either.
   self.followState = nil
@@ -8470,13 +9733,13 @@ function World:setMap(mapId, cx, cy, facing, opts)
   -- GetWarpDestCoords / EnterMapConnection / EnterMapSpawnPoint write wXCoord
   -- and wYCoord BEFORE HandleNewMap (data/maps/setup_scripts.asm:79-106).
   local face = facing or (self.player and self.player.facing) or "down"
-  local chris = self.sprites and self.sprites[PLAYER_SPRITE]
+  local playerDef = self.sprites and self.sprites[self:playerSpriteName()]
   if self.player then
     self.player.cellX, self.player.cellY = cx, cy
     self.player.px, self.player.py = cx * 16, cy * 16
     self.player.facing = face
-    if chris and not self.player.sprite then
-      self.player:setSprite(chris)
+    if playerDef and not self.player.sprite then
+      self.player:setSprite(playerDef)
     end
     if not opts.seamless then
       self.player.moving = false
@@ -8484,7 +9747,7 @@ function World:setMap(mapId, cx, cy, facing, opts)
       self.player.targetX, self.player.targetY = nil, nil
     end
   else
-    self.player = Player.new(cx, cy, face, chris)
+    self.player = Player.new(cx, cy, face, playerDef)
   end
   -- LoadMapObjects rebuilds OBJECT_FLAGS2 from scratch, so IN_GRASS is decided
   -- by the cell the player arrives on (engine/overworld/map_objects.asm:247).
@@ -8546,16 +9809,7 @@ function World:setMap(mapId, cx, cy, facing, opts)
   self:rebuildPeople({ seamless = opts.seamless })
   -- rebuildPeople may have pooled fresh NPCs; give them their colors too.
   self:applyPalettes()
-  local audio = self.game and self.game.data and self.game.data.audio
-  -- PlayMapMusicBike / SpecialMapMusic (home/audio.asm:335, :397): a biking
-  -- player keeps the bike theme; Music.play dedupes seamless edge crossings.
-  if audio and audio.runtime then
-    if not (FieldMoves.isBiking(self.playerState) and self:playBikeMusic()) then
-      Music.playMap(self.game.data, mapId, nil,
-                    FieldMoves.isSurfing(self.playerState), nil,
-                    self:mapMusicSong(mapId))
-    end
-  end
+  self:setMapMusic(mapId, opts.seamless)
   -- Fires with the map fully built and BEFORE the map's own scene script, so a
   -- listener sees exactly the state that script does -- the position Gen 1's
   -- emit takes ahead of its onEnter chain.  `via` carries the same four words
@@ -8564,21 +9818,24 @@ function World:setMap(mapId, cx, cy, facing, opts)
   -- Ahead of the emit, so a map.entered listener already sees this load's
   -- follower (src/world/OverworldController.lua:446's position).
   Follower.onMapEntered(self.game, self, opts, true)
+  local via = opts.via
+    or (opts.continue and "continue")
+    or (opts.seamless and "connection")
+    or (fromMapId and "warp" or "boot")
+  -- ../pokecrystal/engine/overworld/warp_connection.asm:317
+  -- ../pokecrystal/data/maps/setup_scripts.asm:93
+  MapNameSign.init(self, via)
   Runtime.emit("map.entered", {
     mapId = mapId, map = self.map, fromMapId = fromMapId,
-    via = opts.via
-          or (opts.continue and "continue")
-          or (opts.seamless and "connection")
-          or (fromMapId and "warp" or "boot"),
+    via = via,
   })
   -- Map-enter scene scripts (e.g. Elm lab walk-up at scene 0).
   if not opts.seamless then
     self.pendingSceneScript = true
   end
-  -- StartMap (engine/overworld/events.asm): `farcall InitCallReceiveDelay` on
-  -- every map entry, connections included -- which is why a player who keeps
-  -- warping is never rung (src/core/gen2/Phone.lua's receive timer).
-  if self.game and self.game.save then
+  -- engine/overworld/events.asm:98
+  if not self.startedOverworld and self.game and self.game.save then
+    self.startedOverworld = true
     require("src.core.gen2.Phone").onMapLoad(self.game.save,
       self:stepContext().phone)
   end
@@ -8819,8 +10076,7 @@ function World:tryConnection(dir)
   local destMap = self:connectionMap(conn.mapId)
   if not destMap then return false end
   -- home/map.asm:1946 GetMovementPermissions side-wall arm
-  if dir == "down"
-     and Permissions.neighborBlocksDown(dir, destMap:cellCollision(x, y)) then
+  if Permissions.neighborBlocks(dir, destMap:cellCollision(x, y)) == dir then
     return false
   end
   -- A surfing crossing lands on water, which isWalkable refuses; the arm the
@@ -8841,6 +10097,7 @@ function World:tryConnection(dir)
   p.facing = dir
   p.targetX, p.targetY = x, y
   p.moving = true
+  p.bumpFrames = nil
   p.progress = 0
   FixedStep:discardCatchup()
   return true
@@ -8904,6 +10161,7 @@ function World:tryLedgeJump(dir)
   p.targetX, p.targetY = tx, ty
   p.moving = true
   p.jumping = true
+  p.bumpFrames = nil
   -- JumpStep res IN_GRASS_F and calls neither UpdateTallGrassFlags nor
   -- ShakeGrass (engine/overworld/movement.asm:741-770).
   p.inGrass, p.grassShake = false, nil
@@ -8999,6 +10257,9 @@ function World:movePlayer(dir)
   elseif result == "blocked" or result == "edge" then
     self.turningDirection = nil
   end
+  -- .NotMoving and .Ice's own arm (player_movement.asm:102 and :87), which
+  -- .TryJump's carry (:376) returns above.
+  if result == "blocked" then self:bumpSound() end
   -- NormalStep, in order (engine/overworld/movement.asm:657-674): InitStep has
   -- already moved OBJECT_TILE_COLLISION onto the destination.
   if result == "moved" then self:playerStepGrass() end
@@ -9194,8 +10455,10 @@ function World:stepContext()
   local def = self.map and self.map.def
   return {
     data = self.game and self.game.data,
+    -- CheckTime reads wTimeOfDay (engine/events/checktime.asm:2), so the
+    -- caller windows follow the clock even inside a pinned-palette room.
     phone = {
-      map = def, maps = self.maps, daytime = self.daytime,
+      map = def, maps = self.maps, daytime = self.tod,
       clock = self.game and self.game.clock,
     },
     -- GetMapPhoneService: zero means the map HAS service, which maps.lua has
@@ -9330,7 +10593,8 @@ function World:hatchEggs()
       return
     end
     self:showText("Huh?", function()
-      local hatched, effects = Breeding.hatch(data, save, index)
+      local hatched, effects =
+        Breeding.hatch(data, save, index, nil, self:caughtDataOpts())
       if not hatched then return nextEgg() end
       -- Breeding.hatch already ran SetSeenAndCaughtMon; the Togepi flag is the
       -- one side effect it hands back rather than setting, because wEventFlags
@@ -9507,6 +10771,7 @@ end
 
 function World:stepBody()
   if not self.map or not self.player then return end
+  self.stepFinished = false
   self:pollTimeOfDay()
   -- ShakeScreen and the `musicfadeout` tail both run UNDER a script (the VM is
   -- parked on the earthquake's own waitFrames while the screen is still
@@ -9518,6 +10783,8 @@ function World:stepBody()
     self:updateMapSetup()
     return
   end
+  -- ../pokecrystal/engine/overworld/events.asm:212
+  MapNameSign.tick(self)
   if self.pendingMusic then self:updateMusicFade() end
   if self.moveState then self:updateMovement() end
   -- Above the VM tick: a `waitbutton` under a `pokepic` is parked on this
@@ -9587,6 +10854,7 @@ function World:stepBody()
   -- it ticks here above the input gate the same way the emote does; its
   -- last flash's onDone is what resumes the nurse.
   if self.healAnim then self:stepHealAnim() end
+  if self.flyAnim then self:stepFlyAnim() end
 
   -- HandleCmdQueue sits in the overworld loop, once a frame, above the input
   -- gate: it is what drops a boulder that is already sitting on a hole, and it
@@ -9607,8 +10875,9 @@ function World:stepBody()
 
   -- Freeze player input while a script / textbox / cutscene move is up.
   if self:busy() then
-    -- Keep scripted entities animating mid-step.
-    if self.player and self.player.moving then
+    -- Keep scripted entities animating mid-step.  A step_dig spin has the
+    -- player standing still, so it has to tick here too.
+    if self.player and (self.player.moving or self.player.spinFrames) then
       self:playerStepGrass()
       if self.player:update() then
         self.player.inGrass =
@@ -9622,6 +10891,7 @@ function World:stepBody()
   local p = self.player
   self:playerStepGrass()
   local landed = p:update()
+  self.stepFinished = landed
   -- CopyCoordsTileToLastCoordsTile -> SetTallGrassFlags, which is what a step
   -- ENDS on (engine/overworld/map_objects.asm:196-208, :247).
   if landed then p.inGrass = self:grassAt(p.cellX, p.cellY) end
@@ -9683,6 +10953,11 @@ function World:stepBody()
   local dir = self.heldDir
   if not p.moving then
     local coll = self:playerCollision()
+    -- .CheckTile tests CheckWhirlpoolTile above the nybble ladder
+    -- -- engine/overworld/player_movement.asm:117-123 (#1716)
+    if Permissions.isWhirlpool(coll) and self:runForcedMovement() then
+      return
+    end
     local current = Permissions.currentDirection(coll)
       or Permissions.doorForcedDirection(coll)
     if current then
@@ -9696,6 +10971,8 @@ function World:stepBody()
   end
   if not dir then
     p.turnArmed = true
+    -- engine/overworld/player_movement.asm:108
+    p.bumpFrames = nil
     return
   end
   if p.moving then return end
@@ -9704,7 +10981,8 @@ function World:stepBody()
 
   local result = self:movePlayer(dir)
   if result == "edge" then
-    self:tryConnection(dir)
+    -- A border block is a wall: engine/overworld/player_movement.asm:264
+    if not self:tryConnection(dir) then self:bumpSound() end
   elseif result == "blocked" and p.facing == dir then
     -- .CheckNPC came back 2: something movable is in the way.  The step is
     -- lost either way, and the boulder is what moves.
@@ -9791,22 +11069,57 @@ end
 -- takes a foot point in flat screen pixels and a draw callback, and slides the
 -- draw onto that point's projection: only the ground tilts, so a standing
 -- thing stays upright and unscaled and the one thing that moves is its anchor.
+-- GoldSilverIntro order for one standing map object: optional jump shadow,
+-- bottom OAM (when IN_GRASS), keyed grass feet, top OAM, then BG_PRIO + shake.
+-- Exposed for World:drawPipeline mods so 3D passes reuse the same compositor.
+function World:drawEntityComposite(entity, ox, oy, s, drawSpriteFn, withExtras)
+  if not self:isCrystal() then return end
+  local grassComposite = entity.inGrass
+    and not (entity.grassShake and entity.moving)
+  if grassComposite then
+    -- Pret / GoldSilverIntro: composite on the framebuffer so keyed grass shade
+    -- 0 reveals the bottom-OAM pixels already there.  An offscreen feet canvas
+    -- left shade-0 holes transparent and showed baked ground through the legs
+    -- instead of grass over the feet (issue #2080).
+    drawSpriteFn("bottom", ox, oy, s)
+    self:drawGrassOver(entity, ox, oy, s)
+    drawSpriteFn("top", ox, oy, s)
+  else
+    drawSpriteFn(nil, ox, oy, s)
+  end
+  if withExtras then
+    self:drawBgPriorityOver(entity, ox, oy, s)
+    self:drawGrassShake(entity, ox, oy, s)
+  end
+end
+
 function World:drawPeople(s, billboard)
   local G = love.graphics
   local p = self.player
   local cam = self.camera
-  local drawList = {
-    { kind = "player", py = p.py, ox = 0, oy = 0 },
-  }
-  for _, npc in ipairs(self.npcs) do
-    drawList[#drawList + 1] = {
-      kind = "npc", npc = npc, ox = 0, oy = 0, py = npc.py,
-    }
-  end
-  for _, g in ipairs(self.ghosts) do
-    drawList[#drawList + 1] = {
-      kind = "npc", npc = g.npc, ox = g.ox, oy = g.oy, py = g.oy + g.npc.py,
-    }
+  local hideAll, hidePlayer = self:flyHides()
+  -- ../pokecrystal/engine/overworld/map_objects.asm:2191-2205
+  local filter = self.spriteFilter
+  local drawList = {}
+  if not hideAll then
+    if not hidePlayer then
+      drawList[1] = { kind = "player", py = p.py, ox = 0, oy = 0 }
+    end
+    for _, npc in ipairs(self.npcs) do
+      if not filter or filter(npc) then
+        drawList[#drawList + 1] = {
+          kind = "npc", npc = npc, ox = 0, oy = 0, py = npc.py,
+        }
+      end
+    end
+    for _, g in ipairs(self.ghosts) do
+      if not filter or filter(g.npc) then
+        drawList[#drawList + 1] = {
+          kind = "npc", npc = g.npc, ox = g.ox, oy = g.oy,
+          py = g.oy + g.npc.py,
+        }
+      end
+    end
   end
   table.sort(drawList, function(a, b) return a.py < b.py end)
 
@@ -9815,20 +11128,33 @@ function World:drawPeople(s, billboard)
     local oy = math.floor((entry.oy - cam.y) * s)
     local entity = entry.kind == "player" and p or entry.npc
     local function body()
-      if entry.kind == "player" then
-        self.player:draw(ox, oy, s)
-      else
-        entry.npc:draw(ox, oy, s)
-      end
-      -- ShakeGrass rustle only while moving; drawGrassOver when standing/in grass
-      -- so the BG tuft covers the feet.
-      -- Only the current map's own entities: a ghost's cells belong to a
-      -- neighbour's block list.
-      if entry.ox == 0 and entry.oy == 0 then
-        if entity.inGrass and not (entity.grassShake and entity.moving) then
-          self:drawGrassOver(entity, ox, oy, s)
+      -- map_objects.asm:221-227
+      self:drawJumpShadow(entity, ox, oy, s)
+      local onMap = entry.ox == 0 and entry.oy == 0
+      if self:isCrystal() then
+        local function drawSprite(oamRow, localOx, localOy, localS)
+          local lx = localOx or ox
+          local ly = localOy or oy
+          local ls = localS or s
+          if entry.kind == "player" then
+            self.player:draw(lx, ly, ls, oamRow)
+          else
+            entry.npc:draw(lx, ly, ls, oamRow)
+          end
         end
-        self:drawGrassShake(entity, ox, oy, s)
+        self:drawEntityComposite(entity, ox, oy, s, drawSprite, onMap)
+      else
+        if entry.kind == "player" then
+          self.player:draw(ox, oy, s)
+        else
+          entry.npc:draw(ox, oy, s)
+        end
+        if onMap then
+          if entity.inGrass and not (entity.grassShake and entity.moving) then
+            self:drawGrassOver(entity, ox, oy, s)
+          end
+          self:drawGrassShake(entity, ox, oy, s)
+        end
       end
     end
     if billboard then
@@ -9841,6 +11167,7 @@ function World:drawPeople(s, billboard)
 
   self:drawEmote(s, billboard)
   self:drawHealAnim(s, billboard)
+  self:drawFlyAnim(s, billboard)
 end
 
 -- Split out of drawPeople so World:drawPipeline composites the one copy the
@@ -9888,7 +11215,8 @@ end
 
 function World:drawWorldBody(s)
   self:drawGround(s)
-  self:drawPeople(s)
+  if self.bgOverlay then self.bgOverlay(s) end
+  if not self.peopleHidden then self:drawPeople(s) end
 end
 
 -- Gold's half of the world-pipeline seam: same ctx keys, same order and the
@@ -9908,12 +11236,17 @@ function World:drawPipeline(id, w, h, s)
     -- the art: nil, like Gen 1 returns in its true-colour modes.
     paletteFor = function() return nil end,
     spriteColors = function() return nil end,
-    -- Gold's only standing effects; it has no dust/cutTree/bird/rod overlay,
-    -- and Gen 1's `at` skips a nil body, so those keys are simply absent.
+    -- Gold's only standing effects; it has no dust/cutTree/rod overlay, and
+    -- Gen 1's `at` skips a nil body, so those keys are simply absent.
     fx = {
       emote = function() self:drawEmote(1, nil) end,
       heal = function() self:drawHealAnim(1, nil) end,
+      bird = function() self:drawFlyAnim(1, nil) end,
     },
+    -- Crystal-only: IN_GRASS OAM split + attrmap BG_PRIO (not on Gold/Silver).
+    drawEntity = self:isCrystal() and function(entity, ox, oy, scale, drawSpriteFn, withExtras)
+      self:drawEntityComposite(entity, ox, oy, scale or s, drawSpriteFn, withExtras)
+    end or nil,
   }
   -- `project(wx, wy)` -> canvas pixels, nil behind the camera.  s = 1 lays the
   -- closures out in world pixels off the flat foot, the unit Gen 1 uses.
@@ -9930,6 +11263,7 @@ function World:drawPipeline(id, w, h, s)
     end
     self:drawEmote(1, at)
     self:drawHealAnim(1, at)
+    self:drawFlyAnim(1, at)
   end
   local override = Pipelines.drawWorld(id, ctx)
   -- world post-processes fold in here, so they never touch the text box on top
@@ -9977,6 +11311,7 @@ function World:drawTilted(w, h, s, gw, gh)
   G.push()
   G.origin()
   self:drawGround(s)
+  if self.bgOverlay then self.bgOverlay(s) end
   G.pop()
   G.setCanvas(previous)
 
@@ -10009,15 +11344,78 @@ end
 -- The COLOR option can change under a standing world (the hotkey, or the
 -- OPTION screen closing), and the map is a baked canvas rather than a live
 -- draw -- so the cached references have to be re-fetched when it does.  The
--- bakes themselves are keyed by mode in imageFor, so this is a pointer swap
--- after the first time each mode is seen, not a re-bake.
 function World:refreshColorMode()
   local mode = GbcPalette.mode
-  if self.colorMode == mode then return end
+  local ramp = GbcPalette.customRamp
+  if self.colorMode == mode and self.colorRamp == ramp then return end
   self.colorMode = mode
+  self.colorRamp = ramp
   if not self.map then return end
   self.mapImage = self:imageFor(self.map.id)
   self:rebuildNeighbors()
+end
+
+-- engine/tilesets/timeofday_pals.asm:65-91
+function World:drawFadeRemap(s, w, h)
+  local row = World.fadeRampRow(self.fade, self.fadeLevel)
+  if not row then return false end
+  local byte = World.fadeRampByte(row)
+  if byte == GbcPalette.BGP_IDENTITY then
+    self:drawWorldBody(s)
+    return true
+  end
+  if not GbcPalette.remapShader() then return false end
+  local def = self.map and self.map.def
+  if not (def and self.palettes) then return false end
+  local cache = self.fadeRemapCache
+  if not (cache and cache.byte == byte and cache.def == def
+      and cache.daytime == self.daytime and cache.palettes == self.palettes
+      and cache.mode == GbcPalette.mode
+      and cache.custom == GbcPalette.customRamp) then
+    local bg = Palettes.bgSet(self.palettes, def, self.daytime)
+    if not bg then return false end
+    -- home/fade.asm:32-38
+    local pals = {}
+    for _, colors in ipairs(bg) do pals[#pals + 1] = colors end
+    for _, colors in ipairs(Palettes.objectSet(self.palettes, self.daytime)
+        or {}) do
+      pals[#pals + 1] = colors
+    end
+    local uniforms = GbcPalette.remapUniforms(pals, byte)
+    if not uniforms then return false end
+    cache = { byte = byte, def = def, daytime = self.daytime,
+      palettes = self.palettes, mode = GbcPalette.mode,
+      custom = GbcPalette.customRamp, uniforms = uniforms }
+    self.fadeRemapCache = cache
+  end
+  local canvas = self.fadeCanvas
+  if canvas and (canvas:getWidth() ~= w or canvas:getHeight() ~= h) then
+    if canvas.release then canvas:release() end
+    canvas = nil
+    self.fadeCanvas = nil
+  end
+  if not canvas then
+    local ok, made = pcall(love.graphics.newCanvas, w, h)
+    if not ok or not made then return false end
+    made:setFilter("nearest", "nearest")
+    canvas = made
+    self.fadeCanvas = canvas
+  end
+  local G = love.graphics
+  local previous = G.getCanvas()
+  G.push()
+  G.origin()
+  G.setCanvas(canvas)
+  G.clear(0, 0, 0, 1)
+  self:drawWorldBody(s)
+  G.setCanvas(previous)
+  G.pop()
+  local bound = GbcPalette.useRemapUniforms(cache.uniforms)
+  G.setColor(1, 1, 1, 1)
+  G.draw(canvas, 0, 0)
+  if not bound then return false end
+  GbcPalette.clear()
+  return true
 end
 
 function World:draw()
@@ -10068,6 +11466,15 @@ function World:draw()
   if self.shake then
     self.camera.y = self.camera.y + (self.shake.phase or 0)
   end
+  local ScreenPosition = require("src.core.ScreenPosition")
+  local posLift = 0
+  if not ScreenPosition.skinActive(w, h) then
+    posLift = ScreenPosition.lift(h, 144 * self:fitScale(),
+      ScreenPosition.safeTop())
+  end
+  if posLift > 0 then
+    self.camera.y = self.camera.y + posLift / s
+  end
 
   local override = pipelineId and self:drawPipeline(pipelineId, w, h, s) or nil
 
@@ -10076,14 +11483,22 @@ function World:draw()
   -- quad.  Everything after -- the encounter pic and the survey HUD -- stays
   -- flat, the same split the Gen 1 renderer makes; a pipeline's finished image
   -- lands in exactly the same place.
+  local fadeStepped = false
   if override then
     G.setColor(1, 1, 1, 1)
     G.draw(override, 0, 0)
   elseif tilt then
     self:drawTilted(w, h, s, gw, gh)
   else
-    self:drawWorldBody(s)
+    if self.fade and (self.fadeLevel or 1) < 1 then
+      fadeStepped = self:drawFadeRemap(s, w, h)
+    end
+    if not fadeStepped then self:drawWorldBody(s) end
   end
+
+  -- ../pokecrystal/engine/events/map_name_sign.asm:114
+  -- ../pokecrystal/constants/ram_constants.asm:389
+  MapNameSign.draw(self, w, h, posLift)
 
   -- Pokepic (engine/events/pokepic.asm:1-28): MenuBox at the header's coords,
   -- then the padded 7x7 frontpic at top+1, left+1.  UI, so fitScale not zoom.
@@ -10093,7 +11508,7 @@ function World:draw()
     local pad = POKEPIC.pad[math.floor(pw / 8)] or POKEPIC.pad[7]
     G.push()
     G.translate(math.floor((w - 160 * sPic) / 2),
-      math.floor((h - 144 * sPic) / 2))
+      math.floor((h - 144 * sPic) / 2) - posLift)
     G.scale(sPic, sPic)
     G.setColor(1, 1, 1, 1)
     local function body()
@@ -10127,7 +11542,7 @@ function World:draw()
   -- doors, the Radio Tower takeover, Lugia's chamber); the port has no
   -- palette-cycle fade, so the honest stand-in is the flat sheet the cart's own
   -- fade ends on, over the world and under the text box the script is running.
-  if self.fade then
+  if self.fade and not fadeStepped then
     -- fadeLevel is the map setup chain's four-step ramp; a fade special sets it
     -- to 1 because RotateThreePalettes* has already finished by the time the
     -- script that called it runs on.
@@ -10162,5 +11577,11 @@ end
 -- exported for the Gen 1 FieldDefaults facade (src/mods/Gen2Compat.lua)
 -- rather than duplicated there
 World.PLAYER_SPRITE = PLAYER_SPRITE
+
+World.FLY_MAP_BUILD_FRAMES = FLY_MAP_BUILD_FRAMES
+World.MENU_EXIT_RELOAD_FRAMES = MENU_EXIT_RELOAD_FRAMES
+World.MENU_EXIT_WHITE_FRAMES = MENU_EXIT_WHITE_FRAMES
+World.FLY_EXIT_WHITE_FRAMES = FLY_EXIT_WHITE_FRAMES
+World.FLY_FROM_PREROLL = FLY.FROM_PREROLL
 
 return World

@@ -92,7 +92,7 @@ mkdir -p "$GAME_SRC"
   main.lua conf.lua src libs data assets tools/save-editor \
   tools/rom_manifest.json tools/rom_manifest_blue.json \
   tools/rom_manifest_yellow.json tools/rom_manifest_gold.json \
-  tools/rom_manifest_silver.json \
+  tools/rom_manifest_silver.json tools/rom_manifest_crystal.json \
   -x '*.DS_Store' 'data/generated/*' 'assets/generated/*')
 payload_list="$(unzip -Z1 "$WORK/game-payload.zip")"
 printf '%s\n' "$payload_list" \
@@ -102,6 +102,8 @@ printf '%s\n' "$payload_list" | grep -qxF "tools/rom_manifest_gold.json" \
   || fail "payload is missing tools/rom_manifest_gold.json"
 printf '%s\n' "$payload_list" | grep -qxF "tools/rom_manifest_silver.json" \
   || fail "payload is missing tools/rom_manifest_silver.json"
+printf '%s\n' "$payload_list" | grep -qxF "tools/rom_manifest_crystal.json" \
+  || fail "payload is missing tools/rom_manifest_crystal.json"
 unzip -q "$WORK/game-payload.zip" -d "$GAME_SRC"
 rm -f "$WORK/game-payload.zip"
 
@@ -153,6 +155,20 @@ cp "$LOVE_BIN" "$PORT_ROOT/$PORT_DIR_NAME/bin/love.aarch64"
 chmod +x "$PORT_ROOT/$PORT_DIR_NAME/bin/love.aarch64"
 cp "$LOVE_LIB" "$LUAJIT_LIB" "$MODPLUG_LIB" "$OGG_LIB" \
   "$PORT_ROOT/$PORT_DIR_NAME/libs.aarch64/"
+
+BRIDGE_LIB="liblibrashader_bridge.so"
+BRIDGE_SRC="${SHADERFX_BRIDGE_LINUX_ARM64:-}"
+if [ -z "$BRIDGE_SRC" ] && [ -f "$ROOT/dist/native/linux-arm64/$BRIDGE_LIB" ]; then
+  BRIDGE_SRC="$ROOT/dist/native/linux-arm64/$BRIDGE_LIB"
+fi
+if [ -n "$BRIDGE_SRC" ] && [ -f "$BRIDGE_SRC" ]; then
+  cp "$BRIDGE_SRC" "$PORT_ROOT/$PORT_DIR_NAME/libs.aarch64/$BRIDGE_LIB"
+  say "bundled $BRIDGE_LIB for SHADER FX preset conversion"
+elif [ "${SHADERFX_BRIDGE_REQUIRED:-}" = "1" ]; then
+  fail "$BRIDGE_LIB not found: set SHADERFX_BRIDGE_LINUX_ARM64 or stage it at dist/native/linux-arm64/$BRIDGE_LIB"
+else
+  warn "$BRIDGE_LIB not found: this port can run converted presets but not CONVERT new ones"
+fi
 
 # Drop a short license pointer for the bundled LÖVE bits.
 cat > "$PORT_ROOT/$PORT_DIR_NAME/licenses/LICENSE.love2d.txt" <<'EOF'
@@ -228,11 +244,6 @@ export LD_LIBRARY_PATH="$GAMEDIR/libs.aarch64:${LD_LIBRARY_PATH:-}"
 export SDL_GAMECONTROLLERCONFIG="${sdl_controllerconfig:-}"
 # Mali / H700: prefer GLES where available
 export LOVE_GRAPHICS_USE_OPENGLES="${LOVE_GRAPHICS_USE_OPENGLES:-1}"
-# Same GPU class as a phone, but getOS() here says "Linux", so the Android
-# gate (issue #136) would not fire on its own: refuse GBC FX explicitly.
-# Hides the OPTIONS row, pins the level to OFF, and heals a level already
-# persisted in options.lua.
-export POKEPORT_GBCFX="${POKEPORT_GBCFX:-0}"
 
 $ESUDO chmod a+x ./bin/love.aarch64 2>/dev/null || chmod a+x ./bin/love.aarch64
 $ESUDO chmod 666 /dev/uinput 2>/dev/null || true
@@ -322,13 +333,6 @@ Native LÖVE 11.5 port of gen1recomp for Anbernic RG34XXSP on
 | Start / Select | Play or Choose ROM |
 
 In-game controls use the normal PortMaster / SDL pad map (rebind under OPTIONS → CONTROLS).
-
-### Display options
-
-GBC FX is disabled on this device (the H700's Mali GPU compiles that present
-pass and then shows a black frame), so the OPTIONS row is hidden. COLORS,
-TILT, ZOOM, VOID FILL and MAX FPS all work. To try it anyway, launch with
-`POKEPORT_GBCFX=1`.
 
 ### First run
 

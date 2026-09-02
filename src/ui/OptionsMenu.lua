@@ -4,24 +4,28 @@
 -- quirks), plus the port's audio rows and display rows: music/SFX
 -- volume (0-7), PIKACHU VOL (0-7, Yellow only: trims the PCM voice clips
 -- under SFX VOL), music low-pass filter (OFF/1X/2X/3X), COLORS / TILT /
--- GBC FX / ZOOM / VOID FILL / VIDEO MODE, and the MODS row that opens
+-- SHADER FX / ZOOM / VOID FILL / VIDEO MODE, and the MODS row that opens
 -- the mod manager.
 -- Rows are descriptors fed through the ui.options.rows hook, so mods can
 -- add their own; CANCEL is appended after the hook and stays fixed on the
 -- bottom line like pokered's.
 
 local PaletteFX = require("src.render.PaletteFX")
+local Palette = require("src.render.Palette")
 local Pipelines = require("src.render.Pipelines")
 local Tilt = require("src.render.Tilt")
-local GBCFX = require("src.render.GBCFX")
+local ShaderFX = require("src.render.ShaderFX")
 local Zoom = require("src.render.Zoom")
+local Letterbox = require("src.render.Letterbox")
 local TileRenderer = require("src.render.TileRenderer")
 local GameSpeed = require("src.core.GameSpeed")
 local GameVersion = require("src.core.GameVersion")
 local VideoMode = require("src.core.VideoMode")
 local Orientation = require("src.core.Orientation")
 local FaithfulRes = require("src.core.FaithfulRes")
+local ScreenPosition = require("src.core.ScreenPosition")
 local FrameCap = require("src.core.FrameCap")
+local VSync = require("src.core.VSync")
 local Performance = require("src.core.Performance")
 local Logger = require("src.core.Logger")
 local Runtime = require("src.mods.Runtime")
@@ -32,6 +36,15 @@ local Strings = require("src.core.Strings")
 local OptionsMenu = {}
 OptionsMenu.__index = OptionsMenu
 OptionsMenu.isOpaque = true
+
+-- Shared by the three GameSpeed rows below (overworld/battle/menu): mirrors
+-- src/ui/gen2/OptionsMenu.lua's own speed row so the translated "NORMAL"/
+-- "%dX" catalog keys apply on both generations' options screens.
+local function gameSpeedLabel(v)
+  local speed = tonumber(v) or GameSpeed.DEFAULT
+  if speed == 1 then return Strings("NORMAL") end
+  return Strings("%dX", speed)
+end
 
 -- Opaque full-screen menu: own MEWMON so opening OPTION from the title
 -- (or over the overworld) does not inherit TitleState's LOGO1 band -- that
@@ -126,14 +139,6 @@ local function stepVolume(v, dir)
   return math.max(0, math.min(7, (v or 7) + dir))
 end
 
-local function colorIndex(opts)
-  local cur = opts.colors or "gbc"
-  for i, m in ipairs(PaletteFX.MODES) do
-    if m == cur then return i end
-  end
-  return 1
-end
-
 local function wrapIndex(i, n)
   i = i % n
   if i < 0 then i = i + n end
@@ -141,6 +146,25 @@ local function wrapIndex(i, n)
 end
 
 local function sameRows(_, rows) return rows end
+
+-- "OFF" plus every entry's display name, extension stripped -- a
+-- Strings() lookup like RULESET's own record.name so a translation catalog
+-- could rewrite "OFF" without needing to know about arbitrary preset
+-- filenames.
+local function shaderfxLabel(entry)
+  if not entry then return Strings("OFF") end
+  return Strings((entry.name:gsub("%.slangp$", "")))
+end
+
+-- Dual-shader slots: "main" backs the original SHADER
+-- FX row (unchanged save key, unchanged default OFF), "secondary" backs the
+-- new SHADER FX 2 row below it -- when both are set, ShaderFX.render() runs
+-- main's chain into secondary's, same as stacking two RetroArch presets.
+
+local function bgLocked(o)
+  return o.battleLayout == "wide" and o.battleFit == "fill"
+     and o.battleHud == "extended"
+end
 
 -- the vanilla rows as descriptors; each step body is the old per-index
 -- ladder's, so the save.options mutations are unchanged
@@ -182,8 +206,6 @@ local function buildRows(game)
         o.battleLayout = o.battleLayout == "wide" and "og" or "wide"
         if o.battleLayout ~= "wide" then
           o.battleHud = "standard"
-        elseif o.battleFit == "fill" and o.battleHud == "extended" then
-          o.battleBg = "white"
         end
         return true
       end },
@@ -200,10 +222,6 @@ local function buildRows(game)
       step = function(g)
         local o = g.save.options
         o.battleFit = o.battleFit == "fill" and "fixed" or "fill"
-        if o.battleFit == "fill" and o.battleLayout == "wide"
-           and o.battleHud == "extended" then
-          o.battleBg = "white"
-        end
         return true
       end },
     { id = "battleHud", label = Strings("BATTLE HUD"),
@@ -222,9 +240,6 @@ local function buildRows(game)
           return false
         end
         o.battleHud = o.battleHud == "extended" and "standard" or "extended"
-        if o.battleHud == "extended" and o.battleFit == "fill" then
-          o.battleBg = "white"
-        end
         return true
       end },
     -- What sits behind and around the battle.  WHITE is the classic paper
@@ -234,11 +249,7 @@ local function buildRows(game)
     { id = "battleBg", label = Strings("BATTLE BG"),
       value = function(g)
         local o = g.save.options
-        if o.battleLayout == "wide" and o.battleFit == "fill"
-           and o.battleHud == "extended" then
-          o.battleBg = "white"
-          return Strings("AUTO")
-        end
+        if bgLocked(o) then return Strings("AUTO (FILL HUD)") end
         local m = o.battleBg
         if m == "black" then return Strings("BLACK") end
         if m == "world" then return Strings("WORLD") end
@@ -246,11 +257,7 @@ local function buildRows(game)
       end,
       step = function(g, dir)
         local o = g.save.options
-        if o.battleLayout == "wide" and o.battleFit == "fill"
-           and o.battleHud == "extended" then
-          o.battleBg = "white"
-          return false
-        end
+        if bgLocked(o) then return false end
         local order = { "white", "black", "world" }
         local cur = 1
         for i, m in ipairs(order) do if o.battleBg == m then cur = i break end end
@@ -322,10 +329,10 @@ local function buildRows(game)
         return true
       end },
     -- Heads the port's display group: one tier that scales the heavy extras
-    -- (TILT / GBC FX / survey ZOOM) and the FPS ceiling for weaker devices.
+    -- (TILT / survey ZOOM) and the FPS ceiling for weaker devices.
     -- AUTO picks a default from the hardware; every tier is overridable.
     -- Re-applies live so the extras clamp (or, on a higher tier, restore to
-    -- the player's stored TILT / GBC FX / ZOOM) the moment the row changes.
+    -- the player's stored TILT / ZOOM) the moment the row changes.
     { id = "performance", label = Strings("PERFORMANCE"),
       value = function(g)
         return Strings(Performance.label(g.save.options.performance))
@@ -338,15 +345,14 @@ local function buildRows(game)
       end },
     { id = "colors", label = Strings("COLORS"),
       value = function(g)
+        local id = g.save.options.palette
+        if id and id ~= "" then
+          return Palette.label(id) or PaletteFX.modeLabel(g.save.options.colors or "gbc")
+        end
         return PaletteFX.modeLabel(g.save.options.colors or "gbc")
       end,
-      step = function(g, dir)
-        local o = g.save.options
-        local i = colorIndex(o)
-        i = wrapIndex(i - 1 + dir, #PaletteFX.MODES) + 1
-        o.colors = PaletteFX.MODES[i]
-        PaletteFX.setMode(o.colors)
-        return true
+      activate = function(g)
+        require("src.ui.Screens").push(g, "PaletteScreen")
       end },
     { id = "tilt", label = Strings("TILT"),
       value = function(g) return Tilt.levelLabel(g.save.options.tilt or 0) end,
@@ -365,29 +371,49 @@ local function buildRows(game)
         end
         return true
       end },
-    { id = "gbcfx", label = Strings("GBC FX"),
+    -- The generalized slang-shader-preset feature: a picker over
+    -- ShaderFX.list()'s real drop-in presets -- replaced GBCFX.lua's fixed
+    -- level ladder entirely (GBCFX.lua removed). A pushes a real list
+    -- screen -- OFF plus one row per .slangp found -- the same
+    -- "activate, not step" shape CONTROLS/MODS already use, rather than
+    -- cycling in place on this row.
+    -- ShaderFXScreen.lua does the actual list/activate; this row only opens
+    -- it and shows what is currently active.
+    { id = "uiLetterbox", label = Strings("UI LETTERBOX"),
       value = function(g)
-        return GBCFX.levelLabel(g.save.options.gbcfx or 0)
+        return Strings(Letterbox.label(g.save.options.uiLetterbox))
       end,
       step = function(g, dir)
         local o = g.save.options
-        o.gbcfx = wrapIndex((o.gbcfx or 0) + dir, 5)
-        GBCFX.setLevel(o.gbcfx)
+        o.uiLetterbox = Letterbox.cycle(o.uiLetterbox, dir)
+        Letterbox.setMode(o.uiLetterbox)
         return true
+      end },
+    { id = "shaderfx", label = Strings("SHADER FX"),
+      value = function(g)
+        return shaderfxLabel(ShaderFX.activeEntry("main"))
+      end,
+      activate = function(g)
+        require("src.ui.Screens").push(g, "ShaderFXScreen", "main")
+      end },
+    -- The secondary slot: same picker screen, opened on "secondary" instead
+    -- -- its own row so both slots are visible/settable independently
+    -- without a submenu inside a submenu.
+    { id = "shaderfx2", label = Strings("SHADER FX 2"),
+      value = function(g)
+        return shaderfxLabel(ShaderFX.activeEntry("secondary"))
+      end,
+      activate = function(g)
+        require("src.ui.Screens").push(g, "ShaderFXScreen", "secondary")
       end },
     { id = "zoom", label = Strings("ZOOM"),
       value = function(g)
-        return Zoom.offsetLabel(g.save.options.zoom or 0)
+        local offset = math.floor(tonumber(g.save.options.zoom) or 0)
+        if offset == 0 then return Strings("FIT") end
+        return offset < 0 and Strings("OUT%d", -offset) or Strings("IN%d", offset)
       end,
       step = function(g, dir)
-        local o = g.save.options
-        local S = Renderer:fitScale()
-        local lo, hi = Zoom.offsetRange(S)
-        local off = (o.zoom or 0) + dir
-        if off > hi then off = lo
-        elseif off < lo then off = hi end
-        o.zoom = off
-        Zoom.offset = off
+        Zoom.nudgeOptions(g.save.options, dir, Renderer:fitScale())
         return true
       end },
     { id = "voidFill", label = Strings("VOID FILL"),
@@ -443,17 +469,52 @@ local function buildRows(game)
         FaithfulRes.apply(o.faithfulRes)
         return true
       end },
+    { id = "screenPos", label = Strings("SCREEN POS"),
+      value = function(g)
+        return Strings(ScreenPosition.label(g.save.options.screenPos))
+      end,
+      step = function(g, dir)
+        local o = g.save.options
+        o.screenPos = ScreenPosition.cycle(o.screenPos, dir)
+        ScreenPosition.setMode(o.screenPos)
+        return true
+      end },
     -- hard render cap (issue #88): bounds the present rate so a
     -- driver-forced vsync-off run cannot spin at thousands of FPS.  Logic
     -- is fixed-step off dt, so this touches presentation only.
     { id = "fpsCap", label = Strings("MAX FPS"),
       value = function(g)
-        return FrameCap.label(g.save.options.fpsCap)
+        local value = FrameCap.normalize(g.save.options.fpsCap)
+        if value == FrameCap.DISPLAY then
+          local label = FrameCap.label(value)
+          local hz = tonumber(label:match("^DISPLAY %((%d+)HZ%)$"))
+          return hz and Strings("DISPLAY (%dHZ)", hz) or Strings("DISPLAY")
+        end
+        return FrameCap.label(value)
       end,
       step = function(g, dir)
         local o = g.save.options
         o.fpsCap = FrameCap.cycle(o.fpsCap, dir)
         FrameCap.apply(o.fpsCap)
+        return true
+      end },
+    { id = "vsync", label = Strings("VSYNC"),
+      value = function(g)
+        local ok, PS = pcall(require, "src.core.PresentSync")
+        if ok and PS.vsyncEnableBlocked and PS.vsyncEnableBlocked() then
+          return Strings("UNAVAILABLE")
+        end
+        return Strings(VSync.label(g.save.options.vsync))
+      end,
+      step = function(g, dir)
+        local ok, PS = pcall(require, "src.core.PresentSync")
+        if ok and PS.vsyncStepAllowed
+           and not PS.vsyncStepAllowed(g.save.options.vsync, dir) then
+          return false
+        end
+        local o = g.save.options
+        o.vsync = VSync.cycle(o.vsync, dir)
+        VSync.apply(o.vsync)
         return true
       end },
     -- fast-forward the logic clock only; music and sfx keep their tempo
@@ -463,7 +524,7 @@ local function buildRows(game)
     -- source of truth for which three rows exist.
     { id = "speedOverworld", label = Strings("OVERWORLD SPEED"),
       value = function(g)
-        return GameSpeed.levelLabel(g.save.options.speedOverworld)
+        return gameSpeedLabel(g.save.options.speedOverworld)
       end,
       step = function(g, dir)
         local o = g.save.options
@@ -472,7 +533,7 @@ local function buildRows(game)
       end },
     { id = "speedBattle", label = Strings("BATTLE SPEED"),
       value = function(g)
-        return GameSpeed.levelLabel(g.save.options.speedBattle)
+        return gameSpeedLabel(g.save.options.speedBattle)
       end,
       step = function(g, dir)
         local o = g.save.options
@@ -481,7 +542,7 @@ local function buildRows(game)
       end },
     { id = "speedMenu", label = Strings("MENU SPEED"),
       value = function(g)
-        return GameSpeed.levelLabel(g.save.options.speedMenu)
+        return gameSpeedLabel(g.save.options.speedMenu)
       end,
       step = function(g, dir)
         local o = g.save.options
@@ -560,20 +621,30 @@ local function buildRows(game)
         TC.buzz(o.haptics)
         return true
       end },
+    { id = "hotbar", label = Strings("KEY BAR"),
+      value = function(g)
+        return g.save.options.hotbar == false and Strings("OFF")
+               or Strings("ON")
+      end,
+      step = function(g)
+        local o = g.save.options
+        o.hotbar = o.hotbar == false
+        require("src.core.TouchControls"):applyOptions(o)
+        return true
+      end },
   }
-  -- issue #136: hide GBC FX on Android/iOS -- the present shader soft-bricks
-  if not GBCFX.isSupported() then
-    local filtered = {}
-    for _, row in ipairs(rows) do
-      if row.id ~= "gbcfx" then filtered[#filtered + 1] = row end
-    end
-    rows = filtered
-  end
-  -- ORIENTATION only on Android, the one platform Orientation.apply reaches.
-  if not Orientation.isAndroid() then
+  -- ORIENTATION only on the platforms Orientation.apply reaches (#1638).
+  if not (Orientation.isAndroid() or Orientation.isIOS()) then
     local filtered = {}
     for _, row in ipairs(rows) do
       if row.id ~= "orientation" then filtered[#filtered + 1] = row end
+    end
+    rows = filtered
+  end
+  if require("src.core.Platform").isNX() then
+    local filtered = {}
+    for _, row in ipairs(rows) do
+      if row.id ~= "videoMode" then filtered[#filtered + 1] = row end
     end
     rows = filtered
   end
@@ -589,7 +660,8 @@ local function buildRows(game)
     if not show then
       local filtered = {}
       for _, row in ipairs(rows) do
-        if row.id ~= "touchControls" and row.id ~= "haptics" then
+        if row.id ~= "touchControls" and row.id ~= "haptics"
+           and row.id ~= "hotbar" then
           filtered[#filtered + 1] = row
         end
       end
@@ -630,8 +702,90 @@ local function buildRows(game)
   return rows
 end
 
+-- Grouping runs AFTER the ui.options.rows hook and never touches self.rows,
+-- so a mod still sees and edits the flat list it always did; a row in no
+-- group stays where it is, which is where a mod's own additions land.
+local GROUPS = {
+  { id = "group.battle", label = "BATTLE OPTIONS",
+    members = { "animations", "battleStyle", "battleLayout", "battleFit",
+                "battleHud", "battleBg" } },
+  { id = "group.audio", label = "AUDIO",
+    members = { "musicVol", "sfxVol", "pikaVol", "musicFilter" } },
+  { id = "group.video", label = "VIDEO",
+    members = { "uiLayout", "videoMode", "orientation", "faithfulRes",
+                "screenPos", "fpsCap", "vsync" } },
+  { id = "group.speed", label = "SPEED",
+    members = { "textSpeed", "speedOverworld", "speedBattle", "speedMenu" } },
+  { id = "group.graphics", label = "GRAPHICS",
+    members = { "colors", "uiLetterbox", "shaderfx", "shaderfx2" } },
+  -- A mod's Pipelines row splices in after TILT and is in no group, so it
+  -- stays on the top level rather than being swallowed into this page.
+  { id = "group.extras", label = "EXTRAS",
+    members = { "tilt", "zoom", "voidFill" } },
+}
+
+-- The top level's order, groups and singles alike.  Anything not named here
+-- (a mod's row, the touch rows) keeps its flat position after these.
+local ORDER = {
+  "group.speed", "group.video", "group.graphics", "group.audio",
+  "performance", "ruleset", "group.battle", "group.extras", "mods",
+}
+
+-- Each group replaced by one opener.
+local function groupRows(game, rows)
+  local owner, picked = {}, {}
+  for _, group in ipairs(GROUPS) do
+    for _, id in ipairs(group.members) do owner[id] = group end
+    picked[group.id] = {}
+  end
+  for _, row in ipairs(rows) do
+    local group = row.id and owner[row.id]
+    if group then picked[group.id][#picked[group.id] + 1] = row end
+  end
+  local made = {}
+  for _, group in ipairs(GROUPS) do
+    local members = picked[group.id]
+    if #members > 0 then
+      made[group.id] = {
+        id = group.id, label = Strings(group.label), group = true,
+        value = function() return Strings("%d OPTIONS", #members) end,
+        -- No onCancel: BACK out of a page returns here, it does not close
+        -- OPTIONS, so the caller's close callback must not fire.
+        activate = function(g)
+          g.stack:push(OptionsMenu.new(g, { rows = members }))
+        end,
+      }
+    end
+  end
+  local byId, view, taken = {}, {}, {}
+  for _, row in ipairs(rows) do
+    if row.id and not owner[row.id] then byId[row.id] = row end
+  end
+  for _, id in ipairs(ORDER) do
+    local row = made[id] or byId[id]
+    if row then
+      view[#view + 1] = row
+      taken[id] = true
+    end
+  end
+  -- Whatever ORDER does not name, in the order the flat list had it: a mod's
+  -- own rows, and the platform rows that come and go.
+  for _, row in ipairs(rows) do
+    local id = row.id
+    if not (id and (owner[id] or taken[id])) then view[#view + 1] = row end
+  end
+  return view
+end
+
+-- opts.rows makes a submenu: a fixed row list, no hook and no regrouping, so
+-- a group's page is this same screen driving the rows it was handed.
 function OptionsMenu.new(game, opts)
   opts = opts or {}
+  if opts.rows then
+    return setmetatable({ game = game, rows = opts.rows, view = opts.rows,
+                          index = 1, scroll = 0, sub = true,
+                          onCancel = opts.onCancel }, OptionsMenu)
+  end
   local rows = buildRows(game)
   local hooked = Runtime.call("ui.options.rows", sameRows, game, rows)
   if type(hooked) == "table" then
@@ -640,14 +794,44 @@ function OptionsMenu.new(game, opts)
     Logger.error("ui.options.rows returned %s; keeping the vanilla rows",
                  type(hooked))
   end
-  return setmetatable({ game = game, rows = rows, index = 1, scroll = 0,
-                        onCancel = opts.onCancel }, OptionsMenu)
+  local self = setmetatable({ game = game, rows = rows, index = 1, scroll = 0,
+                              onCancel = opts.onCancel }, OptionsMenu)
+  self.view = groupRows(game, rows)
+  return self
+end
+
+-- Cursor onto a row by id, opening its group page first if it lives in one.
+-- Returns the screen the row ended up on, so a caller can keep driving it.
+function OptionsMenu:focusRow(id)
+  local rows = self.view or self.rows
+  for i, row in ipairs(rows) do
+    if row.id == id then
+      self.index = i
+      self.scroll = OptionRows.clampScroll(i, self.scroll or 0, #rows, #rows + 1)
+      return self
+    end
+  end
+  for i, row in ipairs(rows) do
+    if row.group and row.activate then
+      local group
+      for _, g in ipairs(GROUPS) do if g.id == row.id then group = g end end
+      for _, member in ipairs(group and group.members or {}) do
+        if member == id then
+          self.index = i
+          row.activate(self.game)
+          local sub = self.game.stack:top()
+          return sub.focusRow and sub:focusRow(id) or sub
+        end
+      end
+    end
+  end
+  return nil
 end
 
 function OptionsMenu:update(dt)
   local input = self.game.input
-  local rows = self.rows
-  -- CANCEL sits below the hook-built rows so a mod cannot orphan the exit
+  local rows = self.view or self.rows
+  -- BACK sits below the hook-built rows so a mod cannot orphan the exit
   local cancelRow = #rows + 1
   local changed = false
   if input:wasPressed("up") then
@@ -689,14 +873,15 @@ function OptionsMenu:update(dt)
 end
 
 function OptionsMenu:draw()
-  -- Through Strings, like every other label on this menu.  CANCEL is
+  -- Through Strings, like every other label on this menu.  BACK is
   -- appended AFTER the rows hook (see the header), which is what keeps a mod
   -- from orphaning the exit -- but it also means a translation mod never sees
   -- this string, and cannot: there is no row for it to rewrite.  So the one
   -- word a Spanish player could not read on a fully translated OPTIONS menu
   -- was the way out of it.
-  OptionRows.draw(self.game, self.rows, self.index, self.scroll or 0,
-                  Strings("CANCEL"), #self.rows + 1)
+  local rows = self.view or self.rows
+  OptionRows.draw(self.game, rows, self.index, self.scroll or 0,
+                  Strings("BACK"), #rows + 1)
 end
 
 return OptionsMenu

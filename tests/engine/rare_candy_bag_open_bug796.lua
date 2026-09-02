@@ -23,7 +23,7 @@
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
 local T = require("tests.harness")
-local check, eq = T.check, T.eq
+local check, eq, same = T.check, T.eq, T.same
 love = love or require("tests.love_stub")
 
 -- Lazily-required inside the use branches, so seeding package.loaded before
@@ -34,8 +34,15 @@ package.loaded["src.core.Sound"] = {
 }
 -- Real TextBoxes want a Font atlas.  This flow only cares that a message
 -- opened, what it says, and what its onDone does.
+local jingles = {}
 package.loaded["src.render.TextBox"] = {
   new = function(_, text, done) return { textBox = true, text = text, done = done } end,
+  soundOpts = function(_, sound, opts)
+    jingles[#jingles + 1] = sound
+    opts = opts or {}
+    opts.auto = { sound = sound, wait = true }
+    return opts
+  end,
 }
 -- BagMenu and PartyMenu bind TextBox at require time, so they load against
 -- the stub; Screens caches its factory per id and must be told to forget.
@@ -133,18 +140,20 @@ end
 -- The bug: three candies in the bag, use one in the field.
 do
   local game, mon = freshGame(3)
+  jingles = {}
   local list, why = useFromBag(game, nil, "RARE_CANDY")
   if check(list ~= nil, "the bag opened and reached the picker: " .. tostring(why)) then
     eq(mon.level, 6, "the candy leveled the mon 5 -> 6")
-    check(not inStack(game.stack, isPicker),
-          "the pickOnly picker popped itself before onSwitch")
+    -- .useRareCandy over the party list (item_effects.asm:1392-1418) #1594
+    check(inStack(game.stack, isPicker),
+          "the party picker is still up under the level text (#1594)")
     check(inStack(game.stack, function(s) return s == list end),
           "the bag list is STILL on the stack (.useItem_partyMenu re-enters "
           .. "StartMenu_Item, it does not CloseStartMenu) (#796)")
 
     local row = rowFor(list, "RARE_CANDY")
     if check(row ~= nil, "the RARE CANDY row survived the use") then
-      eq(list.items[row].right, "x2", "and its count followed the inventory")
+      eq(list.items[row].count, 2, "and its count followed the inventory")
       eq(list.index, row, "with the cursor left on it (wBagSavedMenuItem), "
                           .. "so the next candy is one A press away")
     end
@@ -155,7 +164,61 @@ do
       check(box.text:find("level 6", 1, true) ~= nil,
             "and it names the new level: " .. tostring(box.text))
     end
+    -- RareCandyText: text_far, sound_get_item_1, text_promptbutton
+    -- (engine/menus/party_menu.asm:289-293)
+    same(jingles, { "Get_Item1" },
+         "the level-up line carries sound_get_item_1 and nothing else")
   end
+end
+
+-- .useRareCandy: TryEvolvingMon runs over the party list
+-- (item_effects.asm:1392-1418) (#1594)
+do
+  local evolveCalls = {}
+  package.loaded["src.pokemon.Evolution"] = {
+    pendingFor = function() return "FIXMON_B", { method = "LEVEL" } end,
+    evolve = function(_, _, to, onDone, via)
+      evolveCalls[#evolveCalls + 1] = { to = to, onDone = onDone, via = via }
+    end,
+  }
+  package.loaded["src.battle.BattleState"] = {
+    StatBox = { new = function(_, _, cb, keepOpen)
+      return { statBox = true, cb = cb, keepOpen = keepOpen }
+    end },
+  }
+  local game = freshGame(3)
+  local list = useFromBag(game, nil, "RARE_CANDY")
+  if check(list ~= nil, "the bag reached the picker (evolution case)") then
+    local box = game.stack:top()
+    check(isBox(box), "the level line prints first")
+    game.stack:pop() -- a real TextBox pops itself before onDone
+    box.done()
+    local stat = game.stack:top()
+    if check(stat and stat.statBox, "then the stat window") then
+      -- ../pokered/engine/pokemon/evos_moves.asm:126-128
+      eq(stat.keepOpen, true,
+         "which stays up: nothing wipes rows 0-11 until ClearScreenArea, "
+         .. "inside TryEvolvingMon and 50 frames after 'is evolving!'")
+      stat.cb()
+      eq(#evolveCalls, 1, "the pending evolution starts")
+      check(inStack(game.stack, function(s) return s == stat end),
+            "with the stat window STILL up under the evolution movie")
+      check(inStack(game.stack, isPicker),
+            "with the party picker STILL up: the evolution prints over it, "
+            .. "not over the bag list (#1594)")
+      check(type(evolveCalls[1].onDone) == "function",
+            "closePicker rides the evolution's completion callback")
+      evolveCalls[1].onDone()
+      check(not inStack(game.stack, function(s) return s == stat end),
+            "and the stat window comes down with the picker")
+      check(not inStack(game.stack, isPicker),
+            "and the picker comes down once the evolution flow completes")
+      check(inStack(game.stack, function(s) return s == list end),
+            "while the bag list survives (#796)")
+    end
+  end
+  package.loaded["src.pokemon.Evolution"] = nil
+  package.loaded["src.battle.BattleState"] = nil
 end
 
 -- The last candy: the row goes away (RemoveUsedItem empties the slot) and the

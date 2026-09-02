@@ -154,8 +154,51 @@ local function newSfxSource(data, key, def, pitch, tempo, plain)
   return newFileSource(def)
 end
 
+local function deviceSuspended()
+  local ChipAudio = package.loaded["src.core.ChipAudio"]
+  return ChipAudio ~= nil and ChipAudio.isSuspended()
+end
+
+-- Optional one-shot playback rate (Source:setPitch multiplier), capped the
+-- way the cart's audio engine clamps under frame-skip (home/vblank.asm:58-72).
+-- GAME SPEED does NOT drive this: the port keeps SFX at natural pitch at
+-- every multiplier (#1990/#1991/#1997).  Callers may still set it for tests
+-- or a future opt-in; SessionLifecycle resets it on teardown.
+local FF_PITCH_MAX = 4
+local rate = 1
+
+function Sound.setRate(n)
+  n = tonumber(n)
+  if n and n == n and n > 0 then
+    rate = math.min(n, FF_PITCH_MAX)
+  else
+    rate = 1
+  end
+end
+
+function Sound.rate() return rate end
+
+local function applyRate(src, base)
+  if not src then return src end
+  pcall(src.setPitch, src, (base or 1) * rate)
+  return src
+end
+
+-- WaitForSoundToFinish budget in 60 Hz frames (home/delay.asm:14).
+function Sound.waitFrames(src, fallback)
+  if not src then return 0 end
+  local okd, dur = pcall(src.getDuration, src)
+  if not okd or type(dur) ~= "number" or dur ~= dur or dur <= 0 then
+    return fallback or 180
+  end
+  local okp, pitch = pcall(src.getPitch, src)
+  if okp and type(pitch) == "number" and pitch > 0 then dur = dur / pitch end
+  return math.ceil(dur * 60 * rate) + 2
+end
+
 local function playPath(data, key, def, pitch, tempo, plain)
   if not love.audio or not def then return nil end
+  if deviceSuspended() then return nil end
   local src = cache[key]
   if src == false then return nil end -- known bad, already logged
   if not src then
@@ -170,6 +213,7 @@ local function playPath(data, key, def, pitch, tempo, plain)
     src = s
   end
   pcall(src.stop, src)
+  applyRate(src, type(def) == "table" and def.pitch or 1)
   pcall(src.play, src)
   return src
 end
@@ -357,6 +401,49 @@ function Sound.sfxBusy()
   return true
 end
 
+-- home/audio.asm:225
+function Sound.sfxRemaining()
+  if not curSfx then return 0 end
+  local ok, playing = pcall(curSfx.src.isPlaying, curSfx.src)
+  if not (ok and playing) then
+    curSfx = nil
+    return 0
+  end
+  local okd, dur = pcall(curSfx.src.getDuration, curSfx.src)
+  local okt, pos = pcall(curSfx.src.tell, curSfx.src)
+  if not (okd and okt) then return nil end
+  if type(dur) ~= "number" or type(pos) ~= "number" then return nil end
+  return math.max(0, dur - pos)
+end
+
+-- home/joypad.asm:292
+function Sound.playPress(data)
+  local src = Sound.play(data, "Press_AB")
+  if src and curSfx and curSfx.src == src then curSfx.press = true end
+  return src
+end
+
+function Sound.dropPressSfx()
+  if not (curSfx and curSfx.press) then return end
+  pcall(curSfx.src.stop, curSfx.src)
+  curSfx = nil
+end
+
+-- WaitSFX (home/audio.asm), the drain above GiveItemScript's `specialsound`
+-- (engine/overworld/scripting.asm:445), so ch5-ch8 are free for it (#1483).
+function Sound.waitSfxDone()
+  if not curSfx then return end
+  pcall(curSfx.src.stop, curSfx.src)
+  curSfx = nil
+end
+
+-- SFXChannelsOff (home/audio.asm:545)
+function Sound.sfxChannelsOff()
+  if not curSfx then return end
+  pcall(curSfx.src.stop, curSfx.src)
+  curSfx = nil
+end
+
 local function startSfx(data, name, def)
   local src = playPath(data, name, def)
   if not src then return end
@@ -484,6 +571,32 @@ local function remainingFrames(src)
   return math.max(0, math.ceil((dur - pos) * 60))
 end
 
+-- home/delay.asm:15 WaitForSoundToFinish polls CHAN5/CHAN6/CHAN8
+function Sound.moveSfxBusy()
+  pruneMoveSfx()
+  for _ in pairs(moveSfxChannels) do return true end
+  return false
+end
+
+function Sound.moveSfxWaitFrames()
+  pruneMoveSfx()
+  local worst = 0
+  for _, cur in pairs(moveSfxChannels) do
+    local n = remainingFrames(cur.src)
+    if n then
+      local okp, pitch = pcall(cur.src.getPitch, cur.src)
+      if okp and type(pitch) == "number" and pitch > 0 then
+        n = math.ceil(n / pitch * rate)
+      end
+      n = n + 2
+    else
+      n = Sound.waitFrames(cur.src, 0)
+    end
+    if n > worst then worst = n end
+  end
+  return worst
+end
+
 -- audio/engine_2.asm:1077-1096, :991-1013, :1015-1033
 local function plainMoveFrames(data, def, channels)
   local id = sfxHeaderId(def)
@@ -602,6 +715,7 @@ end
 -- cache carries no clips (Red/Blue) or headless.
 function Sound.playPikaCry(data, n)
   if not love.audio then return nil end
+  if deviceSuspended() then return nil end
   local count = data.audio and data.audio.pikaCries
   if not count then return nil end
   n = math.max(1, math.min(count, n or 1))
@@ -624,6 +738,7 @@ function Sound.playPikaCry(data, n)
     src = s
   end
   pcall(src.stop, src)
+  applyRate(src, 1)
   pcall(src.play, src)
   played("cry", "PIKACHU_PCM_" .. n, "PIKACHU")
   return src
@@ -633,6 +748,7 @@ end
 -- like the original's PlayCry -> WaitForSoundToFinish can poll it
 function Sound.playCry(data, species, pikaClip)
   if not love.audio then return nil end
+  if deviceSuspended() then return nil end
   -- Yellow voices every Pikachu cry with the PCM clips (the chip cry is
   -- never used for the species there).  Which clip is a property of the
   -- call site in the original -- every caller of PlayPikachuSoundClip sets
@@ -664,6 +780,7 @@ function Sound.playCry(data, species, pikaClip)
     src = s
   end
   pcall(src.stop, src)
+  applyRate(src, 1)
   pcall(src.play, src)
   played("cry", species, species)
   return src
@@ -682,7 +799,7 @@ end
 function Sound.playMoveCry(data, species, tempoMod)
   local src = Sound.playCry(data, species)
   if src and tempoMod and tempoMod ~= 0x80 then
-    pcall(src.setPitch, src, 256 / (128 + tempoMod))
+    applyRate(src, 256 / (128 + tempoMod))
   end
   return src
 end
@@ -695,6 +812,13 @@ function Sound.isPlaying(name)
   if not src then return false end
   local ok, playing = pcall(src.isPlaying, src)
   return ok and playing or false
+end
+
+-- home/delay.asm:14
+function Sound.waitFramesFor(name, fallback)
+  local src = cached(name)
+  if not src then return 0 end
+  return Sound.waitFrames(src, fallback)
 end
 
 -- cut a one-shot short (the SFX_STOP_ALL_MUSIC beats around the

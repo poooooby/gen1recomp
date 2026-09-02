@@ -285,8 +285,10 @@ function UnownPuzzle:loadGfx()
   end
 end
 
+-- WaitPlaySFX (home/audio.asm:220)
 function UnownPuzzle:sfx(name)
   local data = self.game and self.game.data
+  Sound.waitSfxDone()
   if data then Sound.play(data, name) end
 end
 
@@ -576,12 +578,10 @@ function UnownPuzzle:drawsWidescreen() return true end
 
 function UnownPuzzle:drawWidescreen(winW, winH)
   local G = love.graphics
-  G.setColor(0, 0, 0, 1)
-  G.rectangle("fill", 0, 0, winW, winH)
+  Chrome.letterbox(winW, winH, 0, 0, 0)
   local scale = Chrome.fitScale(winW, winH)
   G.push()
-  G.translate(math.floor((winW - 160 * scale) / 2),
-    math.floor((winH - 144 * scale) / 2))
+  G.translate(Chrome.fitOrigin(winW, winH, scale))
   G.scale(scale, scale)
   self:drawPanel()
   G.pop()

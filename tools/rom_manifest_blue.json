@@ -20243,6 +20243,10 @@
       12,
       17536
     ],
+    "ED_Tile": [
+      1,
+      26471
+    ],
     "EeveePicBack": [
       11,
       26149
@@ -20934,6 +20938,10 @@
     "MoltresPicFront": [
       10,
       31660
+    ],
+    "MonNestIcon": [
+      28,
+      22206
     ],
     "MonPartyData": [
       28,
@@ -21735,6 +21743,18 @@
       24,
       22665
     ],
+    "SSAnneKitchenCook7EelsAuBarbecueText": [
+      32,
+      21107
+    ],
+    "SSAnneKitchenCook7PrimeBeefSteakText": [
+      32,
+      21158
+    ],
+    "SSAnneKitchenCook7SalmonDuSaladText": [
+      32,
+      21043
+    ],
     "SSAnneKitchen_h": [
       24,
       22439
@@ -21947,6 +21967,18 @@
       21,
       25848
     ],
+    "SilphCo9FNurseDontGiveUpText": [
+      33,
+      19513
+    ],
+    "SilphCo9FNurseThankYouText": [
+      33,
+      19528
+    ],
+    "SilphCo9FNurseYouLookTiredText": [
+      33,
+      19467
+    ],
     "SilphCo9F_h": [
       23,
       22447
@@ -22051,6 +22083,10 @@
       19,
       20787
     ],
+    "TMNotebookText": [
+      34,
+      19453
+    ],
     "TamerPic": [
       19,
       23374
@@ -22106,6 +22142,10 @@
     "TownMapCursor": [
       28,
       20288
+    ],
+    "TownMapUpArrow": [
+      28,
+      20627
     ],
     "TradeBubbleIconGFX": [
       28,
@@ -22334,6 +22374,18 @@
     "VileplumePicFront": [
       13,
       27425
+    ],
+    "ViridianCityFisherYouCanHaveThisText": [
+      41,
+      17898
+    ],
+    "ViridianCityYoungster2CaterpieAndWeedleDescriptionText": [
+      41,
+      17627
+    ],
+    "ViridianCityYoungster2OkThenText": [
+      41,
+      17613
     ],
     "ViridianCity_h": [
       6,
@@ -34048,7 +34100,17 @@
       ]
     },
     "labels": [
+      "SSAnneKitchenCook7EelsAuBarbecueText",
+      "SSAnneKitchenCook7PrimeBeefSteakText",
+      "SSAnneKitchenCook7SalmonDuSaladText",
       "SilphCo2FSilphWorkerFPleaseTakeThisText",
+      "SilphCo9FNurseDontGiveUpText",
+      "SilphCo9FNurseThankYouText",
+      "SilphCo9FNurseYouLookTiredText",
+      "TMNotebookText",
+      "ViridianCityFisherYouCanHaveThisText",
+      "ViridianCityYoungster2CaterpieAndWeedleDescriptionText",
+      "ViridianCityYoungster2OkThenText",
       "_AIBattleUseItemText",
       "_AIBattleWithdrawText",
       "_AbandonLearningText",

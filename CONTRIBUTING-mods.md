@@ -130,18 +130,28 @@ keeps validating with the value it has shipped since before the taxonomy
 existed.
 
 A translation may also set `"language": true` in the manifest. That is the
-one claim online play acts on: an install running nothing but verified
-translations may take an ONLINE MATCH or a TOURNAMENT instead of being
-asked to restart vanilla. The claim is checked, not taken -- the mod
+one claim online play acts on. Online rooms, spectating and tournaments live
+in the launcher's ONLINE tab, and a match is played in an **arena boot**: the
+game starts with the mod loader in `disableAll` (nothing runs) or `cartOnly`
+(one sealed cart and nothing else), never in the enable state the player has
+saved. A verified translation is the single exception `disableAll` carves
+out, so an install running nothing but translations still enters rooms and
+tournaments. The claim is checked, not taken -- the mod
 qualifies only if every record it writes lands in `text`, `strings` or
 `font`, it wraps no hook, subscribes to no event and requests no
 permission. Anything else and it is an ordinary content mod that happens to
-ship text.
+ship text, and it simply does not load in an arena.
+
+A mod is not shut out of link play by any of that: it just cannot ride the
+launcher's rooms. `LinkState.newFromSession(game, transport, mode, isHost,
+opts)` still adopts an already-paired transport of the mod's own and runs a
+LAN-style battle or trade on it, hello and fingerprint check intact (see
+`docs/modding.md`).
 
 ### 4. `games` (and the legacy `gen2compat`)
 
-Pokemon Gold and Silver are Gen 2, and they run their own battle engine,
-overworld, script VM and save format. The mod API is shared across both
+Pokemon Gold, Silver and Crystal are Gen 2, and they run their own battle
+engine, overworld, script VM and save format. The mod API is shared across both
 generations (same hook names, same event names, same registry names) but Gen 2
 cannot serve all of it yet, so it is opt-in. Say which games the mod is for:
 
@@ -150,19 +160,20 @@ cannot serve all of it yet, so it is opt-in. Say which games the mod is for:
 ```
 
 Each entry is a version id (`"red"`, `"blue"`, `"yellow"`, `"gold"`,
-`"silver"`), a generation (`"gen1"`, `"gen2"`) or `"all"`;
+`"silver"`, `"crystal"`), a generation (`"gen1"`, `"gen2"`) or `"all"`;
 `src/mods/ModTargets.lua` resolves them off `GameVersion.ORDER` so nothing
-restates the game list. `python3 tools/modkit.py scaffold my_mod --games
-gen1,gen2` writes the key for you. The mod still installs to one directory,
-`mods/<id>/`, shared by every game -- targeting is declared, never filed.
+restates the game list, which is why `"gen2"` covers Crystal as well as Gold
+and Silver. `python3 tools/modkit.py scaffold my_mod --games gen1,gen2` writes
+the key for you. The mod still installs to one directory, `mods/<id>/`, shared
+by every game -- targeting is declared, never filed.
 
 Absent means Gen 1 only, which is what every mod written before the key existed
 was tested as. `"gen2compat": true` is the legacy spelling, still accepted and
 purely additive (it *adds* the Gen 2 games), so no manifest can lose a game it
-already ran on. On a Gold or Silver boot a mod claiming no Gen 2 game is not
-loaded at all: the manager lists it as `ENABLED (NOT THIS GAME)` and says why,
-because a mod that half-applies reads as a broken mod. Claim Gen 2 once you
-have actually run your mod on Gold or Silver.
+already ran on. On a Gen 2 boot a mod claiming no Gen 2 game is not loaded at
+all: the manager lists it as `ENABLED (NOT THIS GAME)` and says why, because a
+mod that half-applies reads as a broken mod. Claim Gen 2 once you have actually
+run your mod on Gold, Silver or Crystal.
 
 Every token is enforced, per game: the loader gates on the same
 `ModTargets.supports` answer both mod surfaces draw, so `"games": ["blue"]`
@@ -172,10 +183,11 @@ manifest with neither key still covers every Gen 1 game, so nothing written
 before the key existed changes behavior; list both generations or say `"all"`
 when you mean everywhere.
 
-`docs/mod-api-gen2-compat.md` is the compatibility matrix: what works on Gold
-and Silver today (40 of the 46 registries, 40 event and 43 hook names shared with Gen 1,
-and 24 Gen 2-only ones), which registries have no Gen 2 home and drop their
-writes with a report, and which hooks and events are still to come.
+`docs/mod-api-gen2-compat.md` is the compatibility matrix: what works on Gold,
+Silver and Crystal today (40 of the 46 registries, 40 event and 44 hook names
+shared with Gen 1, and 24 Gen 2-only ones), which registries have no Gen 2 home
+and drop their writes with a report, and which hooks and events are still to
+come.
 `docs/preparing-your-mod-for-gen2.md` is the step-by-step migration guide for a
 Gen 1 mod, and it is the one to start from.
 

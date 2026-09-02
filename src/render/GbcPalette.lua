@@ -18,8 +18,6 @@
 -- colour IS its palettes -- so one substitution at this seam recolours the
 -- whole game without a single screen knowing about it:
 --
---   GBC      the cart's own palettes.  The default: this is a Game Boy
---            Color game and its colour is the point.
 --   DMG      the original grey Game Boy.  Every palette collapses to the
 --            four hardware shades, and the sheets that are drawn straight
 --            (chrome, text) are already those shades, so the screen is
@@ -32,8 +30,11 @@
 local GbcPalette = {}
 
 GbcPalette.MODES = { "gbc", "dmg", "classic" }
-GbcPalette.MODE_LABELS = { gbc = "GBC", dmg = "DMG", classic = "CLASSIC" }
+GbcPalette.MODE_LABELS = { gbc = "GEN 2", dmg = "DMG", classic = "CLASSIC",
+                            custom = "GBC" }
 GbcPalette.mode = "gbc"
+
+GbcPalette.CUSTOM_MODE = "custom"
 
 -- rBGP's four shades as the hardware shows them.
 local DMG_SHADES = {
@@ -65,6 +66,30 @@ vec4 effect(vec4 tint, Image tex, vec2 uv, vec2 screen) {
 }
 ]]
 
+-- BG drawn over OBJ with OAM priority: palette index 0 is transparent to the
+-- sprite underneath (hardware OBJ-behind-BG rule), colours 1-3 are opaque.
+local KEYED_SHADER_SOURCE = [[
+extern vec3 pal0;
+extern vec3 pal1;
+extern vec3 pal2;
+extern vec3 pal3;
+
+vec4 effect(vec4 tint, Image tex, vec2 uv, vec2 screen) {
+  vec4 px = Texel(tex, uv);
+  float shade = floor((1.0 - px.r) * 3.0 + 0.5);
+  vec3 rgb = pal0;
+  if (shade > 2.5) {
+    rgb = pal3;
+  } else if (shade > 1.5) {
+    rgb = pal2;
+  } else if (shade > 0.5) {
+    rgb = pal1;
+  }
+  float alpha = shade < 0.5 ? 0.0 : px.a;
+  return vec4(rgb, alpha) * tint;
+}
+]]
+
 -- rBGP, the DMG background palette register, as a remap of an ALREADY DRAWN
 -- texture.
 --
@@ -84,14 +109,14 @@ vec4 effect(vec4 tint, Image tex, vec2 uv, vec2 screen) {
 local REMAP_SOURCE = [[
 extern int remapCount;
 extern float remapTol;
-extern vec3 remapSrc[32];
-extern vec3 remapDst[32];
+extern vec3 remapSrc[64];
+extern vec3 remapDst[64];
 
 vec4 effect(vec4 tint, Image tex, vec2 uv, vec2 screen) {
   vec4 px = Texel(tex, uv);
   vec3 mapped = px.rgb;
   float best = remapTol;
-  for (int i = 0; i < 32; i++) {
+  for (int i = 0; i < 64; i++) {
     if (i >= remapCount) { break; }
     vec3 d = px.rgb - remapSrc[i];
     float dist = dot(d, d);
@@ -107,14 +132,17 @@ vec4 effect(vec4 tint, Image tex, vec2 uv, vec2 screen) {
 }
 ]]
 
--- The compiled-in array length above.  A map's eight BG palettes are 32
--- colours before dedupe, which is the worst case this has to hold.
-GbcPalette.REMAP_MAX = 32
+-- The compiled-in array length above.  A map's eight BG palettes plus its
+-- eight OBJ palettes are 64 colours before dedupe, which is the worst case
+-- this has to hold (home/fade.asm:32-38).
+GbcPalette.REMAP_MAX = 64
 -- Squared RGB distance, in 0..1 units: three 8-bit steps.
 GbcPalette.REMAP_TOLERANCE = (3 / 255) ^ 2
 
 local shader = nil
 local failed = false
+local keyedShader = nil
+local keyedFailed = false
 local remapShader = nil
 local remapFailed = false
 
@@ -133,6 +161,21 @@ function GbcPalette.shader()
   end
   shader = result
   return shader
+end
+
+function GbcPalette.keyedShader()
+  if keyedShader or keyedFailed then return keyedShader end
+  if not (love and love.graphics and love.graphics.newShader) then
+    keyedFailed = true
+    return nil
+  end
+  local ok, result = pcall(love.graphics.newShader, KEYED_SHADER_SOURCE)
+  if not ok then
+    keyedFailed = true
+    return nil
+  end
+  keyedShader = result
+  return keyedShader
 end
 
 -- The same contract as GbcPalette.shader for the backwards pass: nil rather
@@ -162,11 +205,22 @@ local function channel(colors, index)
   return (c[1] or 0) / 255, (c[2] or 0) / 255, (c[3] or 0) / 255
 end
 
+GbcPalette.customRamp = nil
+
+function GbcPalette.setCustomRamp(ramp)
+  local prev = GbcPalette.customRamp
+  GbcPalette.customRamp = ramp
+  if (prev ~= nil) ~= (ramp ~= nil) or prev ~= ramp then
+    pcall(function() require("src.render.SpriteRenderer").invalidate() end)
+  end
+end
+
 -- What a palette actually draws as under the current COLOR mode.  Anything
 -- that reads a colour out of a palette directly -- a canvas cleared to BG
 -- colour 0, say -- has to go through this too, or the backdrop would keep its
 -- cart colour while everything on top of it went grey.
 function GbcPalette.resolve(colors)
+  if GbcPalette.customRamp then return GbcPalette.customRamp end
   if GbcPalette.mode == "gbc" then return colors end
   return DMG_SHADES
 end
@@ -249,6 +303,10 @@ function GbcPalette.presentColors()
 end
 
 function GbcPalette.setMode(mode)
+  if mode == GbcPalette.CUSTOM_MODE then
+    GbcPalette.mode = mode
+    return mode
+  end
   for _, name in ipairs(GbcPalette.MODES) do
     if name == mode then
       GbcPalette.mode = mode
@@ -260,7 +318,7 @@ function GbcPalette.setMode(mode)
 end
 
 function GbcPalette.modeLabel(mode)
-  return GbcPalette.MODE_LABELS[mode or GbcPalette.mode] or "GBC"
+  return GbcPalette.MODE_LABELS[mode or GbcPalette.mode] or "GEN 2"
 end
 
 -- Advance GBC -> DMG -> CLASSIC -> GBC.  `delta` may be -1 to step back, so
@@ -273,11 +331,20 @@ function GbcPalette.cycle(delta)
   local count = #GbcPalette.MODES
   at = (at - 1 + (delta or 1)) % count + 1
   GbcPalette.mode = GbcPalette.MODES[at]
+  GbcPalette.setCustomRamp(nil)
   return GbcPalette.mode
 end
 
 function GbcPalette.applyOptions(opts)
-  return GbcPalette.setMode(opts and opts.color or "gbc")
+  local mode = GbcPalette.setMode(opts and opts.color or "gbc")
+  local id = opts and opts.palette
+  if id and id ~= "" then
+    local ok, Palette = pcall(require, "src.render.Palette")
+    GbcPalette.setCustomRamp(ok and Palette.ramp(id) or nil)
+  else
+    GbcPalette.setCustomRamp(nil)
+  end
+  return mode
 end
 
 -- Point the shader at one 4-color palette. Colors are 0-255 triples, matching
@@ -299,6 +366,18 @@ function GbcPalette.useRaw(colors)
   if not sh then return false end
   for i = 0, 3 do
     local r, g, b = channel(colors, i + 1)
+    sh:send("pal" .. i, { r, g, b })
+  end
+  love.graphics.setShader(sh)
+  return true
+end
+
+function GbcPalette.useKeyed(colors)
+  local sh = GbcPalette.keyedShader()
+  if not sh then return false end
+  local resolved = GbcPalette.remap(GbcPalette.resolve(colors), GbcPalette.bgp)
+  for i = 0, 3 do
+    local r, g, b = channel(resolved, i + 1)
     sh:send("pal" .. i, { r, g, b })
   end
   love.graphics.setShader(sh)
@@ -337,11 +416,10 @@ end
 -- order -- the reading that matches "the whole picture flashes".  Nothing here
 -- is approximate when `ambiguous` is 0.
 --
--- A map's eight BG palettes are 32 entries, which is REMAP_MAX exactly, so a
--- map whose palettes share nothing at all fills the array and the OBJ list is
--- dropped.  BG is walked first for that reason too: losing the sprite guard
--- costs a few sprite pixels, losing a BG palette would cost the effect.
-function GbcPalette.remapTable(bgPalettes, byte, objPalettes)
+-- BG and OBJ together are 64 entries before dedupe, which is REMAP_MAX.  BG
+-- is walked first anyway: losing the sprite guard costs a few sprite pixels,
+-- losing a BG palette would cost the effect.
+function GbcPalette.remapTable(bgPalettes, byte, objPalettes, ramp, objRamped)
   local src, dst = {}, {}
   local seen = {}
   local ambiguous = 0
@@ -366,13 +444,23 @@ function GbcPalette.remapTable(bgPalettes, byte, objPalettes)
     end
   end
 
+  -- ../pokecrystal/engine/battle/battle_transition.asm:592-607
+  local forced = ramp and GbcPalette.resolve(ramp)
+  local forcedBg = forced and GbcPalette.remap(forced, byte)
+
   for _, colors in ipairs(bgPalettes or {}) do
     local resolved = GbcPalette.resolve(colors)
-    add(resolved, GbcPalette.remap(resolved, byte))
+    add(resolved, forcedBg or GbcPalette.remap(resolved, byte))
   end
-  for _, colors in ipairs(objPalettes or {}) do
+  -- ../pokecrystal/engine/battle/battle_transition.asm:100-122
+  if forced then add(forced, forcedBg) end
+  for index, colors in ipairs(objPalettes or {}) do
     local resolved = GbcPalette.resolve(colors)
-    add(resolved, resolved)
+    if forced and objRamped and objRamped[index] then
+      add(resolved, forced)
+    else
+      add(resolved, resolved)
+    end
   end
 
   local count = #src
@@ -389,12 +477,16 @@ end
 -- false when there is no shader or no palette, so a caller can fall back to
 -- whatever approximation it had before; on success it also returns the
 -- `ambiguous` count, which is 0 when the pass is exact.
-function GbcPalette.useRemap(bgPalettes, byte, objPalettes)
-  local sh = GbcPalette.remapShader()
-  if not sh then return false end
+function GbcPalette.useRemap(bgPalettes, byte, objPalettes, ramp, objRamped)
+  if not GbcPalette.remapShader() then return false end
+  return GbcPalette.useRemapUniforms(
+    GbcPalette.remapUniforms(bgPalettes, byte, objPalettes, ramp, objRamped))
+end
+
+function GbcPalette.remapUniforms(bgPalettes, byte, objPalettes, ramp, objRamped)
   local src, dst, count, ambiguous =
-    GbcPalette.remapTable(bgPalettes, byte, objPalettes)
-  if count == 0 then return false end
+    GbcPalette.remapTable(bgPalettes, byte, objPalettes, ramp, objRamped)
+  if count == 0 then return nil end
   local sendSrc, sendDst = {}, {}
   for index = 1, GbcPalette.REMAP_MAX do
     sendSrc[index] = { src[index][1] / 255, src[index][2] / 255,
@@ -402,13 +494,19 @@ function GbcPalette.useRemap(bgPalettes, byte, objPalettes)
     sendDst[index] = { dst[index][1] / 255, dst[index][2] / 255,
       dst[index][3] / 255 }
   end
-  -- pcall rather than an assert: a driver that will not take a 32-entry vec3
+  return { src = sendSrc, dst = sendDst, count = count, ambiguous = ambiguous }
+end
+
+function GbcPalette.useRemapUniforms(uniforms)
+  local sh = GbcPalette.remapShader()
+  if not (sh and uniforms) then return false end
+  -- pcall rather than an assert: a driver that will not take a 64-entry vec3
   -- array should drop the effect, not take the battle down with it.
   local ok = pcall(function()
-    sh:send("remapCount", count)
+    sh:send("remapCount", uniforms.count)
     sh:send("remapTol", GbcPalette.REMAP_TOLERANCE)
-    sh:send("remapSrc", unpack(sendSrc))
-    sh:send("remapDst", unpack(sendDst))
+    sh:send("remapSrc", unpack(uniforms.src))
+    sh:send("remapDst", unpack(uniforms.dst))
   end)
   if not ok then
     remapFailed = true
@@ -416,7 +514,7 @@ function GbcPalette.useRemap(bgPalettes, byte, objPalettes)
     return false
   end
   love.graphics.setShader(sh)
-  return true, ambiguous
+  return true, uniforms.ambiguous
 end
 
 -- Run `body` with `colors` active, restoring whatever shader was set before.
@@ -425,6 +523,26 @@ function GbcPalette.with(colors, body)
   local previous = love and love.graphics and love.graphics.getShader
     and love.graphics.getShader() or nil
   local applied = GbcPalette.use(colors)
+  local ok, err = pcall(body)
+  if love and love.graphics then love.graphics.setShader(previous) end
+  if not ok then error(err, 0) end
+  return applied
+end
+
+function GbcPalette.keyedWith(colors, body)
+  local previous = love and love.graphics and love.graphics.getShader
+    and love.graphics.getShader() or nil
+  local applied = GbcPalette.useKeyed(colors)
+  local ok, err = pcall(body)
+  if love and love.graphics then love.graphics.setShader(previous) end
+  if not ok then error(err, 0) end
+  return applied
+end
+
+function GbcPalette.withRaw(colors, body)
+  local previous = love and love.graphics and love.graphics.getShader
+    and love.graphics.getShader() or nil
+  local applied = GbcPalette.useRaw(colors)
   local ok, err = pcall(body)
   if love and love.graphics then love.graphics.setShader(previous) end
   if not ok then error(err, 0) end

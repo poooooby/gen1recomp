@@ -34,6 +34,28 @@ DATASETS = (
     "text", "field", "battle_anims",
 )
 
+# Sound is decoded by the Lua importer (src/import/RomExtractor.lua), not here,
+# so --clean must step around it rather than delete what it cannot rebuild.
+UNOWNED_DATA = ("audio.lua",)
+UNOWNED_ASSETS = ("audio",)
+
+
+def clean_generated(out_dir, assets_dir):
+    """Empty the generated dirs, keeping artifacts this tool never writes."""
+    kept = []
+    for path, spared in ((out_dir, UNOWNED_DATA), (assets_dir, UNOWNED_ASSETS)):
+        if not os.path.isdir(path):
+            continue
+        for name in os.listdir(path):
+            target = os.path.join(path, name)
+            if name in spared:
+                kept.append(target)
+            elif os.path.isdir(target):
+                shutil.rmtree(target)
+            else:
+                os.remove(target)
+    return kept
+
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSION_MANIFESTS = {
     "red": os.path.join(_TOOLS_DIR, "rom_manifest.json"),
@@ -53,6 +75,26 @@ GB_SHADES = (
     (85, 85, 85, 255),
     (0, 0, 0, 255),
 )
+
+
+def _apply_title_obp0(image):
+    """Title rOBP0=%11100000 ($E0): OBJ shades 1 and 2 → white, 3 → black.
+
+    Eye OAM is baked into the MEWMON-colored BG PNG; without this remap the
+    shade-1 glints become body yellow under the title palette
+    (pokeyellow engine/movie/title.asm after PlacePikachu).
+    """
+    pixels = image.load()
+    w, h = image.size
+    mid, dark = GB_SHADES[1][0], GB_SHADES[2][0]
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = pixels[x, y]
+            if a == 0:
+                continue
+            if abs(r - mid) <= 2 or abs(r - dark) <= 2:
+                pixels[x, y] = GB_SHADES[0]
+    return image
 
 
 def _symbol(symbols, name):
@@ -1858,11 +1900,32 @@ def extract_field(rom, symbols, manifest, out_dir, assets_dir):
                 (3, 24, 24, True), (2, 32, 24, True),
                 (0, 56, 16, False), (1, 64, 16, False),
                 (2, 56, 24, False), (3, 64, 24, False)):
-            eye = ob_clear[ob_index]
+            eye = ob_clear[ob_index].copy()
+            _apply_title_obp0(eye)
             if flip:
                 eye = eye.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
             pikachu.paste(eye, (px, py), eye)
         _save_png(pikachu, os.path.join(assets_dir, "title/pikachu.png"))
+
+        # Blink overlays (half/closed) — same OBP remap as open eyes.
+        eye_layout = (
+            (1, 24, 16, True), (0, 32, 16, True),
+            (3, 24, 24, True), (2, 32, 24, True),
+            (0, 56, 16, False), (1, 64, 16, False),
+            (2, 56, 24, False), (3, 64, 24, False),
+        )
+        # Re-compose blank-face pika for overlays (open eyes already baked).
+        blank_face = matte_color0(compose(13, 9, pika_cells))
+        for suffix, base in (("eyes_half", 4), ("eyes_closed", 8)):
+            overlay = Image.new("RGBA", (48, 16), (255, 255, 255, 0))
+            overlay.paste(blank_face.crop((24, 16, 72, 32)), (0, 0))
+            for ob_index, px, py, flip in eye_layout:
+                eye = ob_clear[base + ob_index].copy()
+                _apply_title_obp0(eye)
+                if flip:
+                    eye = eye.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+                overlay.paste(eye, (px - 24, py - 16), eye)
+            _save_png(overlay, os.path.join(assets_dir, f"title/{suffix}.png"))
 
     falling_star = raw_2bpp(
         "FallingStar", 8, 8, "intro/falling_star.png",
@@ -2037,8 +2100,52 @@ def extract_field(rom, symbols, manifest, out_dir, assets_dir):
         _decode_2bpp(bytes(reordered), 40, 16),
         os.path.join(assets_dir, "credits/the_end.png"))
 
-    raw_2bpp(
-        "WorldMapTileGraphics", 32, 32, "townmap/tiles.png")
+    if _has_symbol(symbols, "SurfingPikachu1Graphics1"):
+        raw_2bpp("SurfingPikachu1Graphics1", 40, 104, "minigame/surf_1a.png", transparent=False)
+        raw_2bpp("SurfingPikachu1Graphics2", 128, 128, "minigame/surf_1b.png", transparent=True)
+        raw_2bpp("SurfingPikachu1Graphics3", 96, 96, "minigame/surf_1c.png", transparent=True)
+
+        beach_sym = _symbol(symbols, "SurfingMinigame_BeachIntroTilemap")
+        use_ctrl_sym = _symbol(symbols, "SurfingMinigame_UseControlPadTilemap")
+        to_surf_sym = _symbol(symbols, "SurfingMinigame_ToSurfRadTilemap")
+        title_sym = _symbol(symbols, "SurfingMinigame_TitleTilemap")
+        beach_intro = rom.bytes(beach_sym.bank, beach_sym.address, 240)
+        use_ctrl_pad = rom.bytes(use_ctrl_sym.bank, use_ctrl_sym.address, 15)
+        to_surf_rad = rom.bytes(to_surf_sym.bank, to_surf_sym.address, 13)
+        title_map = rom.bytes(title_sym.bank, title_sym.address, 72)
+        screen = [0xff] * (20 * 18)
+        for i in range(240):
+            screen[6 * 20 + i] = beach_intro[i]
+        for r in range(6):
+            for c in range(12):
+                screen[r * 20 + (4 + c)] = title_map[r * 12 + c]
+        for r in range(3):
+            for c in range(15):
+                screen[(7 + r) * 20 + (3 + c)] = 0xff
+        for i in range(15):
+            screen[7 * 20 + 3 + i] = use_ctrl_pad[i]
+        for i in range(13):
+            screen[9 * 20 + 4 + i] = to_surf_rad[i]
+
+        sym3 = _symbol(symbols, "SurfingPikachu1Graphics3")
+        raw_gfx3 = rom.bytes(sym3.bank, sym3.address, 144 * 16)
+        tiles = [_decode_2bpp(raw_gfx3[i*16:(i+1)*16], 8, 8) for i in range(144)]
+        blank = Image.new("RGBA", (8, 8), (255, 255, 255, 255))
+        title_bg = Image.new("RGBA", (160, 144), (255, 255, 255, 255))
+        for r in range(18):
+            for c in range(20):
+                t_id = screen[r * 20 + c]
+                if t_id == 0xff:
+                    tile_img = blank
+                elif t_id >= 0x80:
+                    idx = t_id - 0x80
+                    tile_img = tiles[idx] if idx < 144 else blank
+                else:
+                    idx = 128 + t_id
+                    tile_img = tiles[idx] if idx < 144 else blank
+                title_bg.paste(tile_img, (c * 8, r * 8))
+        _save_png(title_bg, os.path.join(assets_dir, "minigame/title_bg.png"))
+    raw_2bpp("WorldMapTileGraphics", 32, 32, "townmap/tiles.png")
     raw_1bpp(
         "TownMapCursor", 16, 16, "townmap/cursor.png",
         transparent=True)
@@ -2167,9 +2274,9 @@ def main(argv=None):
     out_dir = args.out or prefix + os.path.join("data", "generated")
     assets_dir = args.assets or prefix + os.path.join("assets", "generated")
     if args.clean:
-        for path in (out_dir, assets_dir):
-            if os.path.isdir(path):
-                shutil.rmtree(path)
+        kept = clean_generated(out_dir, assets_dir)
+        for path in kept:
+            print(f"kept {path} (not produced by this tool)")
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(assets_dir, exist_ok=True)
     datasets = tuple(args.only) if args.only else DATASETS

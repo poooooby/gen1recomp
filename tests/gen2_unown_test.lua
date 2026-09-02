@@ -452,6 +452,49 @@ press(screen, "a")
 check("A after the fanfare closes it", closed.count, 1)
 check("reporting solved", closed.solved, true)
 
+-- WaitPlaySFX (home/audio.asm:220)
+do
+  local Sound = require("src.core.Sound")
+  local realPlay, realWait = Sound.play, Sound.waitSfxDone
+  local log = {}
+  Sound.play = function(_data, name) log[#log + 1] = name end
+  Sound.waitSfxDone = function() log[#log + 1] = "wait" end
+
+  screen = newPuzzle(2)
+  for cell = 1, UnownPuzzle.CELLS do
+    screen.pieces[cell] = UnownPuzzle.SOLVED[cell]
+  end
+  screen.pieces[pc(4, 4) + 1] = 0
+  screen.pieces[pc(0, 0) + 1] = 16
+  screen.cursor = pc(0, 0)
+  press(screen, "a")
+  screen.cursor = pc(4, 4)
+  press(screen, "a")
+
+  check("the solve drains the channels before the fanfare",
+    table.concat(log, ","),
+    "wait,Sfx_MegaKick,wait,Sfx_PlacePuzzlePieceDown,wait,Sfx_1stPlace")
+  check("and the board really is solved", screen.solved, true)
+
+  -- UnownPuzzle_InvalidAction (unown_puzzle.asm:339)
+  log = {}
+  screen = newPuzzle(2)
+  screen.pieces[pc(0, 0) + 1] = 0
+  screen.cursor = pc(0, 0)
+  press(screen, "a")
+  check("a refused click is not stopped on the frame it starts",
+    table.concat(log, ","), "wait,Sfx_Wrong")
+
+  log = {}
+  screen.pieces[pc(0, 0) + 1] = 16
+  press(screen, "a")
+  press(screen, "right")
+  check("nor is the pickup, and the move click drains before it",
+    table.concat(log, ","), "wait,Sfx_MegaKick,wait,Sfx_MovePuzzlePiece")
+
+  Sound.play, Sound.waitSfxDone = realPlay, realWait
+end
+
 -- A panel cannot be dropped on an occupied cell.
 screen = newPuzzle(0)
 screen.cursor = 0
@@ -525,6 +568,94 @@ for _, id in ipairs(Screens.GEN2_IDS) do
   if id == "Gen2UnownPuzzle" then registered = true end
 end
 check("Gen2UnownPuzzle is a screen id", registered, true)
+
+-- ================================================= Crystal's flag skew (#1834)
+--
+-- pokecrystal constants/engine_flags.asm:25 ENGINE_MOBILE_SYSTEM shifts the
+-- unlock flags to 43-46 (:57-60); pokegold keeps 42-45 (:56-59).
+do
+  local World = require("src.world.gen2.World")
+  local crystalOrder = {}
+  for _, set in ipairs(Unown.UNLOCK_SETS) do
+    crystalOrder[set.flag + 2] = set.name
+  end
+  local function stubWorld(engineFlags, order)
+    return setmetatable({
+      constants = { engineFlagOrder = order },
+      game = { save = { engineFlags = engineFlags } },
+    }, { __index = World })
+  end
+
+  -- what a Crystal save's raw flags used to feed Unown directly: L-Z only
+  local rawCrystal = { [43] = true, [44] = true, [45] = true, [46] = true }
+  local leaked = Unown.unlockedLetters(rawCrystal)
+  check("raw Crystal flags leak only 15 letters", #leaked, 15)
+  check("and the first survivor is L", leaked[1], 12)
+
+  local view = stubWorld(rawCrystal, crystalOrder):unownUnlockFlags()
+  local resolved = Unown.unlockedLetters(view)
+  check("the resolved view unlocks all 26", #resolved, 26)
+  check("A included", resolved[1], 1)
+
+  -- the same distribution through wildDVs itself
+  math.randomseed(1)
+  local function roll()
+    return { attack = math.random(0, 15), defense = math.random(0, 15),
+      speed = math.random(0, 15), special = math.random(0, 15) }
+  end
+  local seenOld, seenNew = {}, {}
+  for _ = 1, 4000 do
+    seenOld[Unown.letterFromDVs(Unown.wildDVs(rawCrystal, roll))] = true
+    seenNew[Unown.letterFromDVs(Unown.wildDVs(view, roll))] = true
+  end
+  local countOld, countNew = 0, 0
+  for _ in pairs(seenOld) do countOld = countOld + 1 end
+  for _ in pairs(seenNew) do countNew = countNew + 1 end
+  check("raw flags roll only 15 letters", countOld, 15)
+  check("raw flags never roll A", seenOld[1], nil)
+  check("the resolved view rolls all 26", countNew, 26)
+
+  -- one chamber: Crystal's setflag 43 is Kabuto's A-K, not L-R
+  local kabuto = Unown.unlockedLetters(
+    stubWorld({ [43] = true }, crystalOrder):unownUnlockFlags())
+  check("Crystal flag 43 is A-K", #kabuto, 11)
+  check("starting at A", kabuto[1], 1)
+
+  -- Crystal's 42 is ENGINE_EARTHBADGE and must not unlock a chamber
+  check("Crystal flag 42 unlocks nothing", Unown.anyUnlocked(
+    stubWorld({ [42] = true }, crystalOrder):unownUnlockFlags()), false)
+
+  -- a Gold cache has no engineFlagOrder and keeps its own ids
+  local gold = Unown.unlockedLetters(
+    stubWorld({ [42] = true }, nil):unownUnlockFlags())
+  check("Gold flag 42 stays A-K", #gold, 11)
+end
+
+-- ============================================= the letters table's keys (#1834)
+--
+-- RomExtractorGen2 keys `letters` by "A".."Z"; monLetter answers a number, so
+-- the anim lookup must convert or every letter animates as A.
+do
+  local BattleState = require("src.ui.gen2.BattleState")
+  local SummaryMenu = require("src.ui.gen2.SummaryMenu")
+  local animA = { sheet = "sheet-a", tiles = 5 }
+  local animI = { sheet = "sheet-i", tiles = 5 }
+  data.pokemon.UNOWN.anim = animA
+  data.pokemon.UNOWN.letters.I.anim = animI
+  local screen = { pokemon = data.pokemon }
+  check("animData picks the mon's own letter",
+    BattleState.animData(screen, unown), animI)
+  local plain = Mon.new(data, "UNOWN", 5, { dvs = Unown.dvsForLetter(2) })
+  check("a letter with no anim row falls back to the species'",
+    BattleState.animData(screen, plain), animA)
+  -- StatsScreen_PlaceFrontpic reads the same letter row
+  -- (../pokecrystal/engine/pokemon/stats_screen.asm:889-901)
+  local asked
+  local summary = { mon = unown, pokemon = data.pokemon,
+    picImage = function(_, sheet) asked = sheet return nil end }
+  SummaryMenu.startPicAnim(summary)
+  check("the summary menu reads the same letter row", asked, "sheet-i")
+end
 
 print(("gen2 unown: %d checks, %d failures"):format(checks, failures))
 -- Raise rather than os.exit: tests/run_tests.lua dofiles this file, so an exit

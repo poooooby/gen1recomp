@@ -18,6 +18,8 @@ local Chrome = require("src.ui.gen2.Chrome")
 local Clock = require("src.core.gen2.Clock")
 local FixedStep = require("src.core.FixedStep")
 local Font = require("src.render.Font")
+local GamepadMap = require("src.core.GamepadMap")
+local GameVersion = require("src.core.GameVersion")
 local Input = require("src.core.Input")
 local Music = require("src.core.Music")
 local Save = require("src.core.gen2.Save")
@@ -31,6 +33,7 @@ local TextBox = require("src.render.TextBox")
 -- finds it in the same place in Gold.
 local TouchControls = require("src.core.TouchControls")
 local World = require("src.world.gen2.World")
+local MapNameSign = require("src.world.gen2.MapNameSign")
 
 -- The mod event/hook buses.  Gold reaches them through Runtime like every
 -- other engine file, so a call site here is the same call site Gen 1 has.
@@ -56,20 +59,6 @@ local Game2 = {}
 Game2.__index = Game2
 
 local function noop() end
-
-for _, name in ipairs({
-  "joystickpressed", "joystickreleased", "joystickaxis", "joystickhat",
-  "joystickadded",
-}) do
-  Game2[name] = noop
-end
-
--- Not a noop, because the overlay has to come back on its own: a player who
--- unplugs the only controller would otherwise have to tap a blind screen to
--- get the pad back (src/core/Game.lua:869 does the same).
-function Game2:joystickremoved()
-  TouchControls:joystickremoved()
-end
 
 -- THE FRAME AND INPUT SEAMS.
 --
@@ -185,6 +174,7 @@ function Game2.new()
     options = Save.loadOptions(),
   }, Game2)
   self.save.options = self.options
+  self.sessionStartedAt = os.time()
   anchorNewGameClock(self.save)
   return self
 end
@@ -215,6 +205,28 @@ function Game2:adoptSave(save, seedBuckets)
     end
   end
   loader.modSave = save.modData
+end
+
+function Game2:enterArena(spec)
+  local version = GameVersion.get()
+  if spec and spec.slotId then
+    pcall(SaveData.setActiveSlot, version, spec.slotId)
+  end
+  local ok, loaded = pcall(Save.load, version)
+  if ok and loaded then
+    local activeMods = self.modStatus and self.modStatus.loaded
+    SaveData.runMigrations(loaded, self.mods and self.mods.migrations, activeMods)
+    self.save = loaded
+    self.save.options = self.options
+    self:adoptSave(loaded)
+    require("src.battle.gen2.Mon").syncSaveIdentity(loaded, self.data)
+  else
+    require("src.core.Logger").warn("arena2: save slot %s could not be loaded",
+      tostring(spec and spec.slotId))
+  end
+  self.phase = "boot"
+  self.stack:clear()
+  self.stack:push(require("src.ui.gen2.ArenaState").new(self, spec))
 end
 
 function Game2:startWorld()
@@ -250,6 +262,7 @@ end
 function Game2:newGame()
   self.save = Save.newGame({ playerName = self.save.player.name })
   self.save.options = self.options
+  self.sessionStartedAt = os.time()
   -- InitClock re-anchors this the moment the player answers Oak; the default
   -- only has to hold for a run that skips the screen.
   anchorNewGameClock(self.save)
@@ -287,6 +300,7 @@ function Game2:continueGame(save)
   SaveData.runMigrations(save, self.mods and self.mods.migrations, activeMods)
   local modsDiff = SaveData.modsDiff(save, activeMods)
   self.save = save
+  self.sessionStartedAt = os.time()
   self:adoptSave(save)
   -- Editor species swaps used to leave mon.name on the previous species.
   -- CONTINUE rewrites party, boxes, and Day-Care copies from the live record.
@@ -301,8 +315,6 @@ function Game2:continueGame(save)
   self:startWorld()
   -- After the adopt and after the world is standing, which is where Gen 1
   -- emits it (src/core/Game.lua:1127, once the stack has been rebuilt).
-  -- `meta` stays absent on a Gold save, which stamps no meta block; modsDiff
-  -- is derived from it and so comes back empty rather than missing.
   if modsDiff then
     local notice = SaveData.modsDiffNotice(modsDiff, save.meta)
     if notice then require("src.core.Logger").warn("%s", notice) end
@@ -364,27 +376,43 @@ function Game2:showTitle()
     onContinue = function()
       self:showMainMenu()
     end,
+    -- engine/menus/intro_menu.asm:848-889
+    onTimeout = function()
+      self:showCopyright()
+    end,
   })
 end
 
+-- ../pokegold/engine/movie/intro.asm:1 GoldSilverIntro, and Crystal's own
+-- program at ../pokecrystal/engine/movie/intro.asm:1 CrystalIntro.
 function Game2:showIntro()
   self.stack:clear()
   self.phase = "boot"
-  Screens.push(self, "Gen2GoldSilverIntro", {
+  local id = (GameVersion.engine() == "crystal")
+    and "Gen2CrystalIntro" or "Gen2GoldSilverIntro"
+  Screens.push(self, id, {
     onDone = function()
       self:showTitle()
     end,
   })
 end
 
+-- ../pokegold/engine/menus/intro_menu.asm:848-851 IntroSequence, and Crystal's
+-- at ../pokecrystal/engine/menus/intro_menu.asm:964-967: a skip means the title.
 function Game2:showGameFreak()
   self.stack:clear()
   self.phase = "boot"
-  Screens.push(self, "Gen2GameFreakPresents", {
+  local id = (GameVersion.engine() == "crystal")
+    and "Gen2CrystalSplash" or "Gen2GameFreakPresents"
+  Screens.push(self, id, {
     title = self.titleData or {},
     oakSpeech = self.oakSpeechData or {},
-    onDone = function()
-      self:showIntro()
+    onDone = function(skipped)
+      if skipped then
+        self:showTitle()
+      else
+        self:showIntro()
+      end
     end,
   })
 end
@@ -404,6 +432,10 @@ end
 -- the start menu, matching .MenuReturns (most entries reopen it; SAVE and EXIT
 -- close it).
 function Game2:openStartMenu()
+  -- ../pokecrystal/engine/overworld/events.asm:284-285
+  if self.world and self.world.cancelMapNameSign then
+    self.world:cancelMapNameSign()
+  end
   Screens.push(self, "Gen2StartMenu", {
     save = self.save,
     onClose = function() self.stack:pop() end,
@@ -411,8 +443,29 @@ function Game2:openStartMenu()
   })
 end
 
+-- ../pokecrystal/engine/menus/start_menu.asm:444-518
 function Game2:openStartMenuItem(id)
-  local function back() self.stack:pop() end
+  local MenuFade = require("src.ui.gen2.MenuFade")
+  local party = self.save and self.save.party
+  local white = MenuFade.openWhite(id, party and #party or 0)
+  if not white then return self:pushStartMenuItem(id) end
+  Screens.push(self, "Gen2MenuFade", {
+    kind = "out", white = white,
+    onDone = function() self:pushStartMenuItem(id) end,
+  })
+end
+
+-- ../pokecrystal/home/map.asm:1919-1925
+function Game2:closeStartMenuItem(id)
+  local MenuFade = require("src.ui.gen2.MenuFade")
+  self.stack:pop()
+  local white = MenuFade.closeWhite(id)
+  if not white then return end
+  Screens.push(self, "Gen2MenuFade", { kind = "in", white = white })
+end
+
+function Game2:pushStartMenuItem(id)
+  local function back() self:closeStartMenuItem(id) end
   if id == "pokedex" then
     Screens.push(self, "Gen2PokedexMenu", { onClose = back })
   elseif id == "pokemon" then
@@ -496,8 +549,10 @@ function Game2:learnMoveOn(mon, moveId, onDone)
     if onDone then onDone(learned) end
   end
   if ok then
+    -- data/text/common_3.asm:119
     return self:say(("%s learned\n%s!"):format(name, moveName),
-      function() finish(true) end)
+      function() finish(true) end,
+      TextBox.soundOpts(self, "Sfx_DexFanfare5079"))
   end
   if reason ~= "full" then return finish(false) end
   local askForget, pickMove, askStop
@@ -526,12 +581,12 @@ function Game2:learnMoveOn(mon, moveId, onDone)
         return askForget()
       end }))
   end
-  -- The four-slot list ForgetMove draws under MoveAskForgetText, which is the
-  -- Blackthorn deleter's own SetUpMoveList box (learn.asm:135-146).
+  -- engine/pokemon/learn.asm:135-166
   local function pushList()
     Screens.push(self, "Gen2MoveDeleter", {
       mon = mon,
       moves = self.data.moves,
+      layout = "forget",
       onCancel = function()
         self.stack:pop() -- the move list
         self.stack:pop() -- the question it stood on
@@ -552,9 +607,13 @@ function Game2:learnMoveOn(mon, moveId, onDone)
         -- The slot is written here rather than through Mon.learnMove, so
         -- pokemon.move_learned is raised here too.
         ModRuntime.emit("pokemon.move_learned", { mon = mon, moveId = moveId })
-        self:say(("1, 2 and… Poof!\f%s forgot\n%s.\fAnd…\f%s learned\n%s!")
+        -- engine/pokemon/learn.asm:225-229, data/text/common_3.asm:165-173
+        self:say(("1, 2 and…" .. TextBox.PAUSE .. " Poof!" .. TextBox.PAUSE
+            .. "\f%s forgot\n%s.\fAnd…\f%s learned\n%s!")
           :format(name, oldName, name, moveName),
-          function() finish(true) end)
+          function() finish(true) end,
+          TextBox.soundOpts(self, "Sfx_DexFanfare5079",
+            { pauseSounds = { "Sfx_SwitchPokemon" } }))
       end,
     })
   end
@@ -628,6 +687,12 @@ function Game2:consumeItem(itemId)
   self.save.inventory[itemId] = left > 0 and left or nil
 end
 
+-- engine/pokemon/evolve.asm:333
+function Game2:restartMapMusicAfterEvolution()
+  local world = self.world
+  if world and world.restoreMapMusic then world:restoreMapMusic() end
+end
+
 -- RareCandyEffect's tail (engine/items/item_effects.asm): LearnLevelMoves at
 -- the new level, then EvolvePokemon.  LearnLevelMoves' .learn arm is `predef
 -- LearnMove` (engine/pokemon/evolve.asm), so a full set gets ForgetMove's ask
@@ -664,6 +729,7 @@ function Game2:afterRareCandy(mon, result, onDone)
       save = self.save,
       onDone = function()
         self.stack:pop()
+        self:restartMapMusicAfterEvolution()
         if onDone then onDone() end
       end,
     })
@@ -697,12 +763,20 @@ function Game2:usePartyItem(itemId)
     self:say(Strings("You don't have a\n#MON!"))
     return
   end
-  local function finish(result, mon)
+  -- engine/items/item_effects.asm:1748
+  local function openMenu()
+    local menu = self.stack.top and self.stack:top()
+    if menu and menu.showItemResult then return menu end
+    return nil
+  end
+  local function finish(result, mon, slot, before)
+    local menu = openMenu()
     if not result.used then
-      self:say(result.text)
+      self:say(result.text, menu and function() self.stack:pop() end or nil)
       return
     end
     if action == "stone" then
+      if menu then self.stack:pop() end
       local party = (self.save and self.save.party) or {}
       local index
       for i, member in ipairs(party) do
@@ -715,41 +789,61 @@ function Game2:usePartyItem(itemId)
         onDone = function(evolution)
           if evolution and evolution.evolved then self:consumeItem(itemId) end
           self.stack:pop()
+          self:restartMapMusicAfterEvolution()
         end,
       })
-    elseif action == "candy" then
-      self:consumeItem(itemId)
-      self:say(result.text, function() self:afterRareCandy(mon, result) end)
-    else
-      self:consumeItem(itemId)
-      self:say(result.text)
+      return
     end
+    self:consumeItem(itemId)
+    if not menu then
+      if action == "candy" then
+        -- data/text/common_1.asm:86
+        self:say(result.text, function() self:afterRareCandy(mon, result) end,
+          result.sfx and TextBox.soundOpts(self, result.sfx) or nil)
+      else
+        self:say(result.text)
+      end
+      return
+    end
+    -- engine/items/item_effects.asm:1663
+    local climbs = (action == "heal" or action == "revive")
+      and before and mon.hp and mon.hp ~= before
+    menu:showItemResult(slot, {
+      fromHp = climbs and before or nil,
+      toHp = climbs and mon.hp or nil,
+      sfx = climbs and "Sfx_Potion" or result.sfx,
+      text = result.text,
+      onDone = function()
+        self.stack:pop()
+        if action == "candy" then self:afterRareCandy(mon, result) end
+      end,
+    })
   end
   Screens.push(self, "Gen2PartyMenu", {
     prompt = "useItem",
     onCancel = function() self.stack:pop() end,
-    onChoose = function(_, mon)
+    onChoose = function(slot, mon)
+      local before = mon and mon.hp
       if action ~= "pp" then
-        self.stack:pop()
-        finish(ItemEffects.useOnMon(itemId, mon, self.data), mon)
+        finish(ItemEffects.useOnMon(itemId, mon, self.data), mon, slot, before)
         return
       end
       -- RestorePPEffect: the ELIXER pair needs no move pick; an EGG refuses
       -- before the move list ever opens (UseItem_SelectMon's `cp EGG`).
       local row = ItemEffects.RESTORE_PP[itemId] or {}
       if row.each or mon.isEgg then
-        self.stack:pop()
-        finish(ItemEffects.usePpItem(itemId, mon, nil, self.data), mon)
+        finish(ItemEffects.usePpItem(itemId, mon, nil, self.data), mon, slot,
+          before)
         return
       end
       Screens.push(self, "Gen2MoveDeleter", {
         mon = mon,
         moves = self.data.moves,
         onCancel = function() self.stack:pop() end,
-        onChoose = function(slot)
+        onChoose = function(moveSlot)
           self.stack:pop() -- the move list
-          self.stack:pop() -- the party list
-          finish(ItemEffects.usePpItem(itemId, mon, slot, self.data), mon)
+          finish(ItemEffects.usePpItem(itemId, mon, moveSlot, self.data), mon,
+            slot, before)
         end,
       })
     end,
@@ -778,8 +872,10 @@ function Game2:useSelectItem()
     local name = (items[itemId] and items[itemId].name) or itemId
     self:say(Strings("{PLAYER} used the\n%s.", name))
   elseif outcome == "trophy_sent" then
+    -- data/text/common_3.asm:372
     self:say(Strings(
-      "There was a trophy\ninside!\fThe trophy was\nsent home."))
+      "There was a trophy\ninside!\fThe trophy was\nsent home."),
+      nil, TextBox.soundOpts(self, "Sfx_DexFanfare5079"))
   end
   -- Anything else (a fishing bite, the ITEMFINDER's queued script) already
   -- drives its own presentation off World:step -- nothing left to print here.
@@ -791,9 +887,9 @@ end
 -- onDone that popped again ate the state UNDER the box: dismissing a message
 -- over the PACK closed the PACK with it, and over an empty overworld stack it
 -- was a silent extra pop.
-function Game2:say(text, onDone)
+function Game2:say(text, onDone, opts)
   local TextBox = require("src.render.TextBox")
-  self.stack:push(TextBox.new(self, text, onDone))
+  self.stack:push(TextBox.new(self, text, onDone, opts))
 end
 
 -- The landmark the player is standing in, for the Pokegear map's marker.
@@ -866,17 +962,41 @@ function Game2:writeSave()
     return false
   end
   local save = self:snapshotSave()
-  -- The snapshot is complete, so this payload carries exactly the table the
-  -- file gets; mods stash runtime state into their own keys now.  `meta` is
-  -- the Gen 1 key, absent rather than renamed: a Gold save stamps no meta
-  -- block yet (see save.loaded in continueGame).
+  save.meta = SaveData.buildMeta(
+    self.modStatus and self.modStatus.loaded, save.meta, self.sessionStartedAt)
   if ModRuntime.wants("save.writing") then
     ModRuntime.emit("save.writing", { save = save, meta = save.meta })
   end
-  return Save.save(save)
+  local written, err = Save.save(save)
+  if written then
+    local eng = self:syncEngine()
+    if eng then pcall(eng.noteSaveWritten, eng) end
+  end
+  return written, err
 end
 
-function Game2:load()
+function Game2:syncEngine()
+  if self._syncOff then return nil end
+  local eng = self._syncEngineRef
+  if not eng then
+    local ok, SyncEngine = pcall(require, "src.sync.SyncEngine")
+    if not ok or type(SyncEngine) ~= "table" then
+      self._syncOff = true
+      return nil
+    end
+    eng = SyncEngine.shared()
+    if not eng then
+      self._syncOff = true
+      return nil
+    end
+    self._syncEngineRef = eng
+  end
+  return eng
+end
+
+function Game2:load(opts)
+  opts = opts or {}
+  local arena = opts.arena
   Input:init()
   -- Before applyOptions, which is what pushes options.touchControls into it:
   -- init() decides whether the platform wants the overlay at all and loads the
@@ -948,6 +1068,12 @@ function Game2:load()
   self.data.gen2Scripts = loadGenerated("data/generated/scripts.lua")
   self.data.gen2StdScripts = loadGenerated("data/generated/std_scripts.lua")
   self.data.gen2Text = loadGenerated("data/generated/text.lua")
+  -- The engine's own strings, keyed by the disassembly's label.  gen2Text
+  -- above is the script text and is keyed by bank:address for the overworld
+  -- VM, so the two are different tables and both are loaded.  This one is
+  -- what src/core/RomText.lua reads, which is why it lands on `text`: that
+  -- helper is shared with Gen 1 and looks up data.text[label].
+  self.data.text = loadGenerated("data/generated/rom_text.lua") or {}
   -- data/generated/events.lua: the side tables a script command NAMES rather
   -- than carries -- the phone book, the in-game trades, the elevator's floor
   -- labels, the decoration descriptions.  Keyed for World's own `eventTables`
@@ -974,13 +1100,18 @@ function Game2:load()
   -- self.data and the ones without report instead of silently vanishing.  The
   -- whole thing is behind a pcall so a mod problem can never cost Gold its
   -- boot.
+  local modOpts = arena and {
+    mode = (arena.profile and arena.profile.kind == "cart")
+      and "cartOnly" or "disableAll",
+    cartId = opts.cartId,
+  } or nil
   local ok, loader = pcall(function()
     local mods = require("src.mods.Loader").new()
     -- the live service owner, before load: mod.world and mod.input resolve
     -- through this, and without it the facade would bind to the Gen 1
     -- src/core/Game.lua singleton that a Gold boot never loads
     mods.game = self
-    mods:load(self.data)
+    mods:load(self.data, modOpts)
     return mods
   end)
   if ok and loader then
@@ -1008,6 +1139,11 @@ function Game2:load()
   require("src.core.gen2.Phone").useRegistry(self.data)
   require("src.core.gen2.Decorations").useRegistry(self.data)
   require("src.core.gen2.Apricorns").useRegistry(self.data)
+  -- data.gen2Pokedex is a separate table from the `pokemon` registry's own
+  -- merge target (data.pokemon): a translation mod's
+  -- mod.content.pokemon:patch(id, { dexEntry = ... }) would otherwise never
+  -- reach the #DEX screen. See src/core/gen2/PokedexText.lua.
+  require("src.core.gen2.PokedexText").apply(self.data)
 
   -- Rendering pipelines: the engine half of the render_pipelines registry
   -- (src/render/Pipelines.lua).  install() points it at GOLD's merged dataset
@@ -1046,12 +1182,15 @@ function Game2:load()
   -- a mod to hold).  Emitted where Gen 1 emits it -- every service up, the
   -- stack still empty -- so a listener that pushes a state lands underneath
   -- the boot cinema rather than being buried by it.
+  pcall(function() require("src.core.DiscordPresence").init(self) end)
   ModRuntime.emit("game.ready", { game = self })
 
   -- Drivers that walk the overworld skip boot cinema so smoke stays stable.
   -- POKEPORT_BOOT_CINEMA=1 opts back in, which is how the boot-chain driver
   -- exercises copyright -> title -> intro menu -> Oak -> naming.
-  if os.getenv("POKEPORT_DRIVER")
+  if arena then
+    self:enterArena(arena)
+  elseif os.getenv("POKEPORT_DRIVER")
       and os.getenv("POKEPORT_BOOT_CINEMA") ~= "1" then
     self:startWorld()
   else
@@ -1094,18 +1233,26 @@ function Game2:load()
     -- The play clock only runs in the overworld, the way wGameTimerPaused is
     -- set while the intro menu is up.
     Save.tickPlayTime(self.save)
-    -- START and SELECT are read only at the tail of OWPlayerInput, which
-    -- PlayerEvents never reaches while a script is running or the player is
-    -- mid-step (World:acceptsMenuInput transcribes the three gates).  A press
-    -- that arrives under one of them is dropped, not queued -- and the frame
-    -- still runs, so world:step must not be skipped on the swallowed press.
-    if self.input:wasPressed("start") and self.world:acceptsMenuInput() then
-      self:openStartMenu()
-      return
-    end
-    if self.input:wasPressed("select") and self.world:acceptsMenuInput() then
-      self:useSelectItem()
-      return
+    -- MAPEVENTS_OFF skips GetJoypad for the whole of a step, so the hJoyDown
+    -- mirror is frozen -- events.asm:190-198, :211-227 (#525, #1718)
+    local accepts = self.world:acceptsMenuInput()
+    local latch = self.joyLatch
+    if accepts then
+      self.joyLatch = nil
+      if self.input:wasPressed("start")
+          or (latch and latch.start and self.input:isDown("start")) then
+        self:openStartMenu()
+        return
+      end
+      if self.input:wasPressed("select")
+          or (latch and latch.select and self.input:isDown("select")) then
+        self:useSelectItem()
+        return
+      end
+    else
+      if not latch then latch = {}; self.joyLatch = latch end
+      if self.input:wasPressed("start") then latch.start = true end
+      if self.input:wasPressed("select") then latch.select = true end
     end
     self.world:pollInput(self.input)
     if self.input:wasPressed("a") then
@@ -1121,6 +1268,12 @@ function Game2:inFillBoot()
   return self.phase == "boot" and self.stack:top() ~= nil
 end
 
+function Game2:logicSpeed()
+  return math.max(1,
+    tonumber(self.speedOverride) or tonumber(self.options and self.options.speed)
+    or 1)
+end
+
 function Game2:update(dt)
   -- _UpdateSound is a VBlank job, so it runs at 60Hz off real time whatever the
   -- logic multiplier is (audio/engine.asm:84, home/vblank.asm:141-143).
@@ -1129,6 +1282,8 @@ function Game2:update(dt)
   while self.audioAccum >= step do
     self.audioAccum = self.audioAccum - step
     Music.update(self.data)
+    -- ../pokecrystal/engine/overworld/events.asm:177-191
+    if self.world and self.world.map then MapNameSign.frame(self.world) end
   end
   -- TILT eases toward its new angle in real time, not on the logic clock, so
   -- fast-forward does not fling the camera over.
@@ -1137,28 +1292,27 @@ function Game2:update(dt)
   -- reason and at the same place Gen 1 ticks them (src/core/Game.lua:265):
   -- they are presentational, so fast-forward must not speed them up.
   require("src.render.Pipelines").update(dt)
+  pcall(function() require("src.core.DiscordPresence").update(dt) end)
   -- GAME SPEED scales the logic clock only, exactly as the Gen 1 path does:
   -- audio runs off its own real-time accumulator, so music and sfx keep their
-  -- tempo at every multiplier.  speedOverride is the driver/CLI hook and wins
-  -- over the saved option.
+  -- tempo at every multiplier (#1990/#1991/#1997).  speedOverride is the
+  -- driver/CLI hook and wins over the saved option.
   -- pokegold engine/menus/intro_menu.asm:848 IntroSequence: boot cinema runs on the same clock as the overworld
-  local speed = math.max(1,
-    tonumber(self.speedOverride) or tonumber(self.options and self.options.speed)
-    or 1)
+  local speed = self:logicSpeed()
   if self.phase == "boot" then
-    FixedStep.maxAccum = math.max(0.25, speed / 60 + 0.05)
-    FixedStep:update(dt * speed)
+    FixedStep.maxAccum = FixedStep.catchupLimit(speed)
+    FixedStep:update(dt, speed)
     return
   end
   if not self.world or not self.world.map then return end
-  FixedStep.maxAccum = math.max(0.25, speed / 60 + 0.05)
-  FixedStep:update(dt * speed)
+  FixedStep.maxAccum = FixedStep.catchupLimit(speed)
+  FixedStep:update(dt, speed)
 end
 
 -- The screen-pixels-per-GB-pixel scale the post passes need so their grid and
 -- shadow offsets stay window-size independent.  Always the plain letterbox
--- fit, never the survey zoom: GBC FX is simulating the PANEL the picture is
--- being shown on, and the panel does not resize when the player zooms the map
+-- fit, never the survey zoom: SHADER FX is simulating the PANEL the picture
+-- is being shown on, and the panel does not resize when the player zooms the map
 -- -- Gen 1 hands the same pass its `Renderer:fitScale()` for that reason
 -- (Renderer:endFrame's Sp).  Following the zoom used to shrink the LCD grid to
 -- one screen pixel a cell out at survey range.
@@ -1355,25 +1509,29 @@ end
 -- Gold's frame, and then the passes that run over it.
 --
 -- The Gen 1 path gets these for free because everything it draws goes through
--- src/render/Renderer.lua, which owns a present canvas and calls GBCFX there.
--- Gold draws straight to the screen instead, which is why its GBC FX row used
--- to change a number and nothing else: nothing ever presented a canvas for the
--- shader to read.  So compose into one here when a pass wants it, and skip the
--- canvas entirely when none does -- the common case, and one less full-screen
--- blit than the old path would have paid.
+-- src/render/Renderer.lua, which owns a present canvas and calls ShaderFX
+-- there.  Gold draws straight to the screen instead, which is why its SHADER
+-- FX row used to change a number and nothing else (back when it was GBC FX):
+-- nothing ever presented a canvas for the shader to read.  So compose into
+-- one here when a pass wants it, and skip the canvas entirely when none does
+-- -- the common case, and one less full-screen blit than the old path would
+-- have paid.
 --
--- CLASSIC runs first and GBC FX second, matching the Gen 1 order: the palette
--- IS the picture, and the screen effects are simulating the panel that picture
--- is being shown on.  Mod post-processes fold in between the two, where
--- Renderer.lua:1058 folds them -- a blur or a colour grade is what the LCD grid
--- is then drawn over, rather than something that smears the grid itself.
+-- CLASSIC runs first and SHADER FX second, matching the Gen 1 order: the
+-- palette IS the picture, and the screen effects are simulating the panel
+-- that picture is being shown on.  Mod post-processes fold in between the
+-- two, where Renderer.lua:1058 folds them -- a blur or a colour grade is
+-- what the LCD grid is then drawn over, rather than something that smears
+-- the grid itself.
 function Game2:drawViewportFrame()
   local G = love.graphics
   local w, h = GameViewport.dimensions()
-  local GBCFX = require("src.render.GBCFX")
+  local ShaderFX = require("src.render.ShaderFX")
   local GbcPalette = require("src.render.GbcPalette")
   local Pipelines = require("src.render.Pipelines")
-  local fx = GBCFX.active()
+  -- Same dispatch src/render/Renderer.lua:1185 already uses for Gen 1
+  -- (ShaderFX replaced GBCFX's slot; GBCFX.lua itself is removed).
+  local shaderfx = ShaderFX.active()
 
   -- render.zones, at the instant Gen 1 raises it: the palette list is settled
   -- and the blit has not happened yet.  Gen 1's list is the SGB packet zones
@@ -1396,14 +1554,14 @@ function Game2:drawViewportFrame()
   local zoned = type(zones) == "table" and zones[1] ~= nil
 
   -- A present canvas is paid for only when something reads it: the zone pass,
-  -- GBC FX, a mod post-process, render.compose, or an enabled render.output
+  -- SHADER FX, a mod post-process, render.compose, or an enabled render.output
   -- subscriber. With none of them the frame draws straight to the screen
   -- exactly as it always did.
   local composing = ModRuntime.wantsHook("render.compose")
   local hasOutputHook = ModRuntime.wantsHook("render.output")
     and ModRuntime.call("render.output_enabled", function() return false end) == true
   local scene = nil
-  if zoned or fx or composing or Pipelines.wantsPresent() or hasOutputHook then
+  if zoned or shaderfx or composing or Pipelines.wantsPresent() or hasOutputHook then
     scene = self:presentCanvas(1, w, h)
   end
   if not scene then
@@ -1431,11 +1589,11 @@ function Game2:drawViewportFrame()
   end
 
   -- The zone pass has to land in a texture whenever anything still reads one
-  -- after it: GBC FX and a post-process both sample the tinted image, not the
-  -- untinted one.  On its own the tint rides the final blit and no second
+  -- after it: SHADER FX and a post-process both sample the tinted image, not
+  -- the untinted one.  On its own the tint rides the final blit and no second
   -- canvas is paid for.
   local source = scene
-  local reread = fx or Pipelines.wantsPresent() or hasOutputHook
+  local reread = shaderfx or Pipelines.wantsPresent() or hasOutputHook
   if zoned and reread then
     local tinted = self:presentCanvas(2, w, h)
     if tinted then
@@ -1455,7 +1613,7 @@ function Game2:drawViewportFrame()
     -- Post-process pipelines run over the finished composite and before GBC
     -- FX.  Each hands back a canvas; with none registered this returns `source`
     -- unchanged and the frame is byte-identical (Renderer.lua:1058).
-    local scale, ox, oy, dpi = self:frameFit(w, h)
+    local scale, ox, oy, dpi, pw, ph = self:frameFit(w, h)
     source = Pipelines.present(source, { width = w, height = h, scale = scale,
       dpi = dpi, dpiX = dpi, dpiY = dpi }) or source
     local outputHandled = hasOutputHook
@@ -1469,8 +1627,30 @@ function Game2:drawViewportFrame()
     if not outputHandled then
       local cx, cy, cw, ch = Playfield.cutout(w, h)
       if cx then G.setScissor(cx, cy, cw, ch) end
-      if fx then
-        GBCFX.present(source, self:pixelScale(w, h))
+      if shaderfx then
+        -- rect is physical framebuffer pixels and source is the un-scaled
+        -- size, matching Renderer.lua's fxRectPx / fxSrc contract.
+        -- A live overworld draws edge to edge at World:zoomScale, so the
+        -- faithful 160*scale box would leave the rest of the map unshaded.
+        local rect, srcW, srcH
+        if self.frameWorldActive and self.world then
+          local s = self.world:zoomScale() * dpi
+          srcW = self.world.viewW or 160
+          srcH = self.world.viewH or 144
+          local rw, rh = srcW * s, srcH * s
+          rect = {
+            x = math.floor((pw - rw) / 2), y = math.floor((ph - rh) / 2),
+            w = rw, h = rh, scale = s,
+          }
+        else
+          srcW, srcH = 160, 144
+          rect = {
+            x = ox * dpi, y = oy * dpi,
+            w = 160 * scale * dpi, h = 144 * scale * dpi,
+            scale = scale * dpi,
+          }
+        end
+        ShaderFX.render(source, rect, { w = srcW, h = srcH }, dpi, dpi)
       else
         G.setColor(1, 1, 1, 1)
         G.draw(source, 0, 0)
@@ -1514,11 +1694,55 @@ function Game2:drawContained(w, h)
   if not ok then error(err, 0) end
 end
 
+local function panelBlit(stack, w, h)
+  local states = stack and stack.states or {}
+  for i = #states, 1, -1 do
+    local state = states[i]
+    if state then
+      if state.battlePanelScale then
+        local scale = state:battlePanelScale(w, h)
+        if scale then return scale, Chrome.fitOrigin(w, h, scale) end
+      end
+      if state.drawsWidescreen and state:drawsWidescreen() then break end
+    end
+  end
+  local scale = Chrome.fitScale(w, h)
+  local ox, oy = Chrome.fitOrigin(w, h, scale)
+  return scale, ox, oy
+end
+
+local function battleSurround(stack)
+  local states = stack and stack.states or {}
+  for i = #states, 1, -1 do
+    local state = states[i]
+    if state and state.bgMode then
+      return state:bgMode(), state.BG_WORLD_DIM or 0.55
+    end
+  end
+end
+
+function Game2:paintBattleSurround(w, h)
+  local mode, dim = battleSurround(self.stack)
+  if mode ~= "black" and mode ~= "world" then return end
+  local alpha = mode == "world" and dim or 1
+  if not alpha or alpha <= 0 then return end
+  local G = love.graphics
+  local scale, ox, oy = panelBlit(self.stack, w, h)
+  local pw, ph = 160 * scale, 144 * scale
+  G.setColor(0, 0, 0, alpha)
+  if oy > 0 then G.rectangle("fill", 0, 0, w, oy) end
+  if oy + ph < h then G.rectangle("fill", 0, oy + ph, w, h - oy - ph) end
+  if ox > 0 then G.rectangle("fill", 0, oy, ox, ph) end
+  if ox + pw < w then G.rectangle("fill", ox + pw, oy, w - ox - pw, ph) end
+  G.setColor(1, 1, 1, 1)
+end
+
 function Game2:drawScene(w, h)
   local G = love.graphics
   -- render.compose reads this after the scene is drawn; the plain overworld
   -- branch below is the only one where Gen 1 would call the world pass live.
   self.frameWorldActive = false
+  Chrome.worldSurround = false
 
   if self:inFillBoot() then
     local top = self.stack:top()
@@ -1582,13 +1806,18 @@ function Game2:drawScene(w, h)
       or (base and base.drawsWidescreen and base:drawsWidescreen()
         and base.drawWidescreen and base)
     if wide then
+      if battleSurround(self.stack) == "world" then
+        self.frameWorldActive = true
+        self:letterbox(w, h, true)
+        self.world:draw()
+        Chrome.worldSurround = true
+      end
       wide:drawWidescreen(w, h)
+      self:paintBattleSurround(w, h)
+      Chrome.worldSurround = false
       self:letterbox(w, h, false)
       if wide ~= top then
-        -- The pushed box blits at the same integer fit the widescreen layer
-        -- used, or it lands on a different grid than the panel underneath it.
-        local scale = Chrome.fitScale(w, h)
-        local ox, oy = Chrome.fitOrigin(w, h, scale)
+        local scale, ox, oy = panelBlit(self.stack, w, h)
         G.push()
         G.translate(ox, oy)
         G.scale(scale, scale)
@@ -1660,8 +1889,9 @@ function Game2:drawScene(w, h)
       -- row to opt into the step-down half, so CENTERED is the whole rule
       -- here.
       local s = self.world:fitScale()
+      local ox, oy = Chrome.fitOrigin(w, h, s)
       G.push()
-      G.translate(math.floor((w - 160 * s) / 2), math.floor((h - 144 * s) / 2))
+      G.translate(ox, oy)
       G.scale(s, s)
       self.stack:draw()
       G.pop()
@@ -1686,7 +1916,6 @@ end
 --   F1/F2  write / reload the save        1  GAME SPEED
 --   -  =   zoom one step out / in         2  COLOR
 --   4      cycle ZOOM                     3  TILT (mnemonic: 3D)
---                                         5  GBC FX
 --
 -- `2` is COLOR here rather than Gen 1's COLORS.  The Gen 1 row cycles SGB
 -- palette packs, which a CGB-native game has no use for; what it cycles here
@@ -1714,19 +1943,13 @@ function Game2:hotkey(key)
     local GbcPalette = require("src.render.GbcPalette")
     GbcPalette.setMode(options.color or "gbc")
     options.color = GbcPalette.cycle(1)
+    options.palette = ""
     persist()
     return true
   elseif key == "3" then
     local Tilt = require("src.render.Tilt")
     options.tilt = Tilt.cycle()
     persist()
-    return true
-  elseif key == "5" then
-    local GBCFX = require("src.render.GBCFX")
-    if GBCFX.isSupported() then
-      options.gbcfx = GBCFX.cycle()
-      persist()
-    end
     return true
   end
   if not (self.world and self.world.map) then
@@ -1962,13 +2185,19 @@ end
 
 -- Push the saved display options into the modules that own them.  Called
 -- whenever the options table changes hands (boot, CONTINUE, the OPTION
--- screen), so a reload comes back at the zoom, tilt and GBC FX the player left.
+-- screen), so a reload comes back at the zoom, tilt and SHADER FX the player
+-- left.
 function Game2:applyOptions()
   local options = self.options or {}
   Music.applyOptions(options)
   require("src.core.Sound").applyOptions(options)
-  require("src.render.Zoom").applyOptions(options)
+  local Zoom = require("src.render.Zoom")
+  Zoom.applyOptions(options)
+  local caps = require("src.core.Performance").applyOptions(options)
+  Zoom.allowSurvey = caps.survey
+  if not caps.survey and Zoom.offset < 0 then Zoom.offset = 0 end
   require("src.render.Tilt").applyOptions(options)
+  require("src.render.Letterbox").applyOptions(options)
   require("src.render.GbcPalette").applyOptions(options)
   -- engine/gfx/load_font.asm:29 LoadFrame, off options.lua's wTextboxFrame.
   Font.setFrame(options.frame or 1)
@@ -1980,15 +2209,42 @@ function Game2:applyOptions()
   TouchControls:applyOptions({
     touchControls = options.touchControls,
     haptics = options.haptics,
+    hotbar = options.hotbar,
   })
   require("src.core.VideoMode").applyOptions(options)
+  require("src.core.ScreenPosition").applyOptions(options)
+  require("src.core.VSync").applyOptions(options)
   require("src.core.FrameCap").applyOptions(options)
+  require("src.core.PresentSync").applyFixedStepPeriod()
   require("src.world.gen2.BorderFill").applyOptions(options)
-  local GBCFX = require("src.render.GBCFX")
-  if GBCFX.applyOptions(options) and self.save then
-    -- applyOptions returns true when it had to clear an unsupported level.
+  -- returns true when a persisted preset name no longer resolves (deleted
+  -- from the drop-in folder, or failed to (re)translate) and had to be
+  -- cleared back to OFF -- src\core\Game.lua:1215 mirrors this call for
+  -- Gen 1 (SHADER FX reaches Gen 2 too)
+  local shaderfxCleared = require("src.render.ShaderFX").applyOptions(options)
+  -- Scale the optional presentation extras to the device's performance
+  -- tier, same clamp src/core/Game.lua:1222-1230 applies for Gen 1 -- see
+  -- that site's comment for the full rationale.
+  local caps = require("src.core.Performance").applyOptions(options)
+  if not caps.tilt then require("src.render.Tilt").setLevel(0) end
+  if not caps.shaderfx then require("src.render.ShaderFX").deactivate() end
+  local Zoom = require("src.render.Zoom")
+  Zoom.allowSurvey = caps.survey
+  if not caps.survey and Zoom.offset < 0 then Zoom.offset = 0 end
+  if caps.fpsMax then
+    require("src.core.FrameCap").clampToPerformance(caps.fpsMax)
+  end
+  if shaderfxCleared and self.save then
+    -- applyOptions returns true when it had to clear an unresolved preset.
     self.save.options = options
   end
+end
+
+function Game2:_cycleSpeed(dir)
+  local GameSpeed = require("src.core.GameSpeed")
+  self.options.speed = GameSpeed.cycle(self.options.speed, dir)
+  if self.save then self.save.options = self.options end
+  self:persistOptions()
 end
 
 -- `back` -- SDL's name for the small left-hand menu button: Xbox VIEW, the PS
@@ -2001,33 +2257,144 @@ end
 -- the PACK's move-item, the party menu's reorder and half the soft-reset chord
 -- (A+B+SELECT+START) were all unreachable from a pad, and pressing the button
 -- to find out killed the process.  It reaches Input like every other button now.
-function Game2:gamepadpressed(_joystick, button)
+function Game2:gamepadpressed(joystick, button)
   -- a controller is being used: the touch overlay steps aside until the next
   -- screen touch (mobile only; a no-op elsewhere)
   TouchControls:noteGamepad()
-  -- The shoulders cycle GAME SPEED, as they do in the Gen 1 path.
-  if button == "rightshoulder" or button == "leftshoulder" then
-    local GameSpeed = require("src.core.GameSpeed")
-    local dir = button == "rightshoulder" and 1 or -1
-    self.options.speed = GameSpeed.cycle(self.options.speed, dir)
-    if self.save then self.save.options = self.options end
-    self:persistOptions()
+  local selectHeld = Input:isDown("select")
+  if not selectHeld and joystick and joystick.isGamepadDown then
+    local ok, down = pcall(function()
+      return joystick:isGamepadDown("back")
+    end)
+    selectHeld = ok and down == true
+  end
+  local top = self.stack and self.stack:top()
+  if top and top.onGamepadPressed then
+    top:onGamepadPressed(button)
     return
+  end
+  if not selectHeld then
+    local action = Input:padAction(button)
+    if action == "speedUp" then
+      self:_cycleSpeed(1)
+      return
+    elseif action == "speedDown" then
+      self:_cycleSpeed(-1)
+      return
+    end
+  end
+  if selectHeld then
+    local digit = GamepadMap.displayChordDigit(button)
+    if digit then
+      self:keypressed(digit)
+      return
+    end
   end
   -- START opens the start menu in the overworld; it used to quit, from before
   -- there was a menu to open.
 
-  Input:gamepadpressed(_joystick, button)
+  Input:gamepadpressed(joystick, button)
 end
 
 function Game2:gamepadreleased(joystick, button)
   Input:gamepadreleased(joystick, button)
+  local top = self.stack and self.stack:top()
+  if top and top.onGamepadReleased then top:onGamepadReleased(button) end
 end
 
 function Game2:gamepadaxis(joystick, axis, value)
   -- past-deadzone only, so resting-stick drift cannot hide the overlay
   if math.abs(value) > 0.5 then TouchControls:noteGamepad() end
   Input:gamepadaxis(joystick, axis, value)
+end
+
+-- The raw joystick road, same bodies as src/core/Game.lua:935 (#620, #632, #1570).
+local function isRawStick(joystick)
+  return not (joystick and joystick.isGamepad and joystick:isGamepad())
+end
+
+function Game2:joystickpressed(joystick, button)
+  if GamepadMap.isAccelerometer(joystick) then return end
+  TouchControls:noteGamepad()
+  local top = self.stack and self.stack:top()
+  if isRawStick(joystick) and top and top.onJoystickPressed then
+    top:onJoystickPressed(button)
+    return
+  end
+  Input:joystickpressed(joystick, button)
+end
+
+function Game2:joystickreleased(joystick, button)
+  if GamepadMap.isAccelerometer(joystick) then return end
+  Input:joystickreleased(joystick, button)
+  local top = self.stack and self.stack:top()
+  if isRawStick(joystick) and top and top.onJoystickReleased then
+    top:onJoystickReleased(button)
+  end
+end
+
+function Game2:joystickaxis(joystick, axis, value)
+  if GamepadMap.isAccelerometer(joystick) then return end
+  if math.abs(value) > 0.5 then TouchControls:noteGamepad() end
+  Input:joystickaxis(joystick, axis, value)
+end
+
+function Game2:joystickhat(joystick, hat, direction)
+  if GamepadMap.isAccelerometer(joystick) then return end
+  if direction ~= "c" then TouchControls:noteGamepad() end
+  Input:joystickhat(joystick, hat, direction)
+end
+
+-- src/core/Game.lua:1015 (#799)
+function Game2:recoverInput()
+  Input:reset()
+  Input:reconcile()
+  TouchControls:reset()
+  if self.mods and self.mods.releaseModInput then self.mods:releaseModInput() end
+  self:cancelPointers()
+end
+
+function Game2:joystickadded()
+  self:recoverInput()
+end
+
+-- The overlay comes back on its own when the last pad is unplugged
+-- (src/core/Game.lua:1044).
+function Game2:joystickremoved()
+  self:recoverInput()
+  TouchControls:joystickremoved()
+end
+
+-- In-process return-to-launcher (Android / intent_game): drop session fields
+-- so a later Game2.new() + load is not sharing a live stack or mod loader.
+-- Methods live on the class table; pairs(self) only sees instance state.
+-- Same rule as Gen1: only release known GPU owners -- never fan out
+-- arbitrary field:release() (shared modules use :release as a handle API).
+function Game2:reset()
+  if self.stack and self.stack.clear then
+    pcall(function() self.stack:clear() end)
+  end
+  if self.world and self.world.release then
+    pcall(function() self.world:release() end)
+  end
+  if self._canvases then
+    for _, canvas in pairs(self._canvases) do
+      if canvas and canvas.release then pcall(canvas.release, canvas) end
+    end
+  end
+  if self.renderer then
+    local release = self.renderer.releaseCanvases or self.renderer.release
+    if release then pcall(release, self.renderer) end
+  end
+  local keys = {}
+  for key, value in pairs(self) do
+    if type(value) ~= "function" then
+      keys[#keys + 1] = key
+    end
+  end
+  for _, key in ipairs(keys) do
+    self[key] = nil
+  end
 end
 
 return Game2

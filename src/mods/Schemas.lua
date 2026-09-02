@@ -521,6 +521,10 @@ Schemas.GEN2 = {
   -- its walkability as `collision` where Gen 1 says `walkable`.
   maps = "gen2Maps", tilesets = "gen2Tilesets", sprites = "gen2Sprites",
   text = "gen2Text",
+  -- Label-keyed engine prose is extracted separately from the VM's
+  -- bank:address script text.  Keep a distinct public registry name while
+  -- landing it on the shared RomText helper's data.text lookup table.
+  rom_text = "text",
   -- Namespaced AND differently shaped, and the shape is what these waited on.
   -- Each carries a Gen 2 record schema in its catalog entry now, so the id
   -- space is the one Gold actually keys by: the encounter KIND (.grass), the
@@ -636,6 +640,7 @@ Schemas.GEN2 = {
 Schemas.GEN1 = {
   held_items = false, phone_contacts = false, decorations = false,
   apricorns = false, landmarks = false, radio_channels = false,
+  rom_text = false,
 }
 
 -- The routing table for a generation: which one is consulted is the only
@@ -676,9 +681,10 @@ end
 --
 -- So beside `value` / `fields` / `keys` / `keyValue` a spec may carry
 -- `gen2Value` / `gen2Fields` / `gen2Keys` / `gen2KeyValue`, and beside
--- `semantics` / `extra` / `write` / `baseAt` / `baseIds` / `example` /
--- `notes` the matching `gen2*`.  Absent means "the Gen 1 shape is right here
--- too", which is the common case and why most registries carry none of this.
+-- `semantics` / `extra` / `write` / `baseAt` / `baseIds` / `reservedIds` /
+-- `example` / `notes` the matching `gen2*`.  Absent means "the Gen 1 shape is
+-- right here too", which is the common case and why most registries carry
+-- none of this.
 -- The registry NAME, the verbs and (wherever the id space allows it) the ids
 -- stay shared, exactly as the routing table keeps them shared.
 --
@@ -700,6 +706,7 @@ local GEN2_SHAPE = {
   gen2KeyValue = "keyValue", gen2Extra = "extra",
   gen2Semantics = "semantics", gen2Write = "write",
   gen2BaseAt = "baseAt", gen2BaseIds = "baseIds",
+  gen2ReservedIds = "reservedIds",
   gen2Example = "example", gen2Notes = "notes",
 }
 
@@ -757,6 +764,32 @@ end
 local R = {}
 Schemas.REGISTRIES = R
 
+-- Some generated Gen 2 modules keep extractor metadata beside their public
+-- record maps. These callbacks are the registry normalization boundary: the
+-- metadata remains available to engine consumers through Data, but is not an
+-- id a mod can read or overwrite through the record registry.
+local function recordMapExcept(...)
+  local excluded = {}
+  for index = 1, select("#", ...) do excluded[select(index, ...)] = true end
+  return function(base, id)
+    if excluded[id] then return nil end
+    return base[id]
+  end, function(base)
+    local ids = {}
+    for id in pairs(base) do
+      if not excluded[id] then ids[#ids + 1] = id end
+    end
+    return ids
+  end, excluded
+end
+
+local pokemonGen2BaseAt, pokemonGen2BaseIds, pokemonGen2ReservedIds =
+  recordMapExcept("growthRates", "tmhmMoves")
+local movesGen2BaseAt, movesGen2BaseIds, movesGen2ReservedIds =
+  recordMapExcept("generation", "source")
+local itemsGen2BaseAt, itemsGen2BaseIds, itemsGen2ReservedIds =
+  recordMapExcept("generation", "source", "pockets")
+
 -- ------- shared Gen 2 leaves
 --
 -- The ROM name spaces Gold's tables key by.  They are enums rather than
@@ -779,6 +812,8 @@ local gen2PaletteRow = f.list(gen2Color)
 
 R.pokemon = {
   semantics = "record", target = "pokemon",
+  gen2BaseAt = pokemonGen2BaseAt, gen2BaseIds = pokemonGen2BaseIds,
+  gen2ReservedIds = pokemonGen2ReservedIds,
   fields = {
     id = f.str, name = f.str, dex = f.int(1),
     index = f.opt(f.int(0, 255)),
@@ -796,14 +831,19 @@ R.pokemon = {
                                item = f.opt(f.id("items")),
                                species = f.id("pokemon") }),
     spriteFront = f.path, spriteBack = f.path, frontSize = f.int(1, 7),
+    -- text2 is the #DEX entry's second description page (Pokedex_asm's bare
+    -- `page` macro, engine/pokedex/pokedex.asm): PokedexMenu:drawEntryBody
+    -- shows `entry.text` on page 1 and `entry.text2` on page 2, so a
+    -- translation needs both to cover the whole entry.
     dexEntry = f.opt(f.rec{ kind = f.str, heightFt = f.int(0),
                             heightIn = f.int(0, 11), weight = f.num,
                             heightM = f.opt(f.num), weightKg = f.opt(f.num),
-                            text = f.str }),
+                            text = f.str, text2 = f.opt(f.str) }),
     icon = f.opt(f.union{ f.str, f.rec{ image = f.path,
                                         frames = f.opt(f.int(1)) } }),
     cry = f.opt(f.id("cries")), palette = f.opt(f.id("palettes")),
     trueColor = f.opt(f.bool),
+    battleTheme = f.opt(f.id("music")),
     -- battle-pic scale overrides for this species' own pics: front is the
     -- enemy pic (default 1x), back is the player pic (default 2x).  An
     -- image-level battle_sprite_scales entry for the same path beats these.
@@ -860,6 +900,7 @@ R.pokemon = {
     spriteFront = f.path, spriteBack = f.path, picSize = f.int(1, 7),
     source = f.opt(f.str),
     cry = f.opt(f.id("cries")), trueColor = f.opt(f.bool),
+    battleTheme = f.opt(f.id("music")),
     battleScaleFront = f.opt(f.numRange(0.25, 4.0)),
     battleScaleBack = f.opt(f.numRange(0.25, 4.0)),
   },
@@ -870,6 +911,8 @@ R.pokemon = {
 
 R.moves = {
   semantics = "record", target = "moves",
+  gen2BaseAt = movesGen2BaseAt, gen2BaseIds = movesGen2BaseIds,
+  gen2ReservedIds = movesGen2ReservedIds,
   fields = {
     id = f.str, name = f.str,
     index = f.opt(f.int(0, 255)),
@@ -894,6 +937,8 @@ R.moves = {
 
 R.items = {
   semantics = "record", target = "items",
+  gen2BaseAt = itemsGen2BaseAt, gen2BaseIds = itemsGen2BaseIds,
+  gen2ReservedIds = itemsGen2ReservedIds,
   fields = {
     id = f.str, name = f.str,
     index = f.opt(f.int(0, 255)),
@@ -1058,7 +1103,11 @@ R.encounters = {
     trees = f.map(f.str, f.str),
     rocks = f.map(f.str, f.str),
     treeSets = f.map(f.str, f.rec{ common = f.list(gen2TreeSlot),
-                                   rare = f.list(gen2TreeSlot) }),
+                                   rare = f.opt(f.list(gen2TreeSlot)) }),
+    -- ../pokecrystal/data/wild/treemons_asleep.asm:3 AsleepTreeMonsNite
+    treeMonsAsleep = f.opt(f.rec{ MORN = f.list(f.id("pokemon")),
+                                  DAY = f.list(f.id("pokemon")),
+                                  NITE = f.list(f.id("pokemon")) }),
     -- the Bug-Catching Contest pool (min/max level, not one level per slot)
     bugContest = f.list(f.rec{ species = f.id("pokemon"),
                                min = f.int(1), max = f.int(1),
@@ -1082,14 +1131,18 @@ R.trainers = {
     -- Full-color portrait: skip the 4-shade SGB/GBC remap, same flag pokemon
     -- and sprites already carry.
     trueColor = f.opt(f.bool),
+    palette = f.opt(f.id("palettes")),
     -- Optional Advanced-mode OBJ palette source for a custom trainer portrait.
     -- It follows the same ROM crosswalk form as sprites.paletteSource.
     paletteSource = f.opt(f.str),
     -- Reuse a base trainer class's portrait without redistributing its asset.
     basePic = f.opt(f.id("trainers")),
     baseMoney = f.opt(f.int(0)),
+    -- data/trainers/special_moves.asm:5
     parties = f.list(f.list(f.rec{ level = f.int(1),
-                                   species = f.id("pokemon") })),
+                                   species = f.id("pokemon"),
+                                   moves = f.opt(f.list(f.id("moves"))) })),
+    partyNames = f.opt(f.map(f.int(1), f.str)),
     aiMods = f.opt(f.any),
     aiClass = f.opt(f.id("ai_classes")),
     brain = f.opt(f.fn),
@@ -1139,10 +1192,11 @@ R.trainers = {
     -- trainers and pokemon already carry.
     trueColor = f.opt(f.bool),
     baseMoney = f.opt(f.int(0)),
-    -- the class's battle theme; Gen 1 spells the same idea `battleTheme`,
-    -- but this is the extractor's own key and a strict rename would reject
-    -- every one of Gold's 66 classes
+    -- data/trainers/encounter_music.asm: the walk-up jingle, not the
+    -- battle theme; the extractor's own key, and a strict rename would
+    -- reject every one of Gold's 66 classes
     encounterMusic = f.opt(f.id("music")),
+    battleTheme = f.opt(f.id("music")),
     -- the items the class's AI may use mid-battle, and the seven raw AI
     -- bytes behind them (pokegold data/trainers/attributes.asm)
     items = f.opt(f.list(f.id("items"))),
@@ -1215,6 +1269,16 @@ R.text = {
   semantics = "record", target = "text",
   value = f.str,
   example = 'mod.content.text:override("_PalletTownText1", "HELLO!")',
+}
+
+-- Gen 2's data/generated/text.lua is VM script text keyed by bank:address;
+-- data/generated/rom_text.lua is engine prose keyed by disassembly label.
+-- They deliberately do not share a registry: `text` keeps targeting
+-- data.gen2Text on Gold, while this Gen 2-only surface targets data.text.
+R.rom_text = {
+  semantics = "record",
+  value = f.str,
+  example = 'mod.content.rom_text:override("_WokeUpText", "%s se réveille !")',
 }
 
 -- The engine's own authored text, the half of the game `text` does not
@@ -2007,7 +2071,8 @@ R.field = {
       cursorOrder = f.opt(f.list(f.str)),
       locations = f.opt(f.map(f.str, f.rec{ x = f.int(0), y = f.int(0),
                                             name = f.opt(f.str) })),
-      nest = f.opt(f.any) },
+      nest = f.opt(f.any),
+      upArrow = f.opt(f.any) },
     flyOrder = f.list(f.str),
     -- the player's own trainer art (FieldDefaults.PLAYER_PICS): the battle
     -- back pic, the catch tutorial's old man, Yellow's PROF.OAK variant of
@@ -2102,6 +2167,11 @@ R.phone_contacts = {
     -- name are looked up by
     number = f.opt(f.int(0, 255)),
     class = f.opt(f.str), member = f.opt(f.str),
+    -- Optional display override.  The four non-trainer rows seed this from
+    -- NonTrainerCallerNames; trainer rows normally resolve their name from
+    -- the trainer table, but a translation or content mod may override it
+    -- without replacing the trainer identity used by rematches.
+    name = f.opt(f.str),
     map = f.opt(f.id("maps")),
     -- the SCRIPT1 / SCRIPT2 time masks: MORN | DAY | NITE, 0 for "never"
     calleeTime = f.opt(f.int(0, 7)), callerTime = f.opt(f.int(0, 7)),
@@ -2184,9 +2254,12 @@ R.landmarks = {
 R.radio_channels = {
   semantics = "record",
   fields = {
-    channel = f.int(0, 255),
-    -- the name quoted in the text box; without one the Pokegear's own
-    -- STATION_NAMES row is used, which is where the vanilla eight get theirs
+    -- MAPRADIO_* position for a wall-radio station.  Pokegear-only signals
+    -- (POKE_FLUTE_RADIO / EVOLUTION_RADIO) have no such byte and carry just
+    -- their display name.
+    channel = f.opt(f.int(0, 255)),
+    -- the name quoted in the text box; every vanilla Pokegear signal seeds
+    -- one, including the two that have no wall-radio channel
     name = f.opt(f.str),
   },
   example = 'mod.content.radio_channels:register("PIRATE_RADIO", '

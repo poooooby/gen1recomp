@@ -26,14 +26,10 @@ local WideBattle = {
   FIELD_BOTTOM = 104,
 }
 
--- The forced-mono display modes re-threshold the whole finished frame
--- through the shade shader, and picImage hands them raw DMG grays for that
--- (#207).  The wide layout has to know: it exposes a matching whole-surface
--- zone and leaves the HP bar fill gray, exactly like the zone pass does in
--- the classic layout (#229).  Keep in sync with picImage / ensureZones.
 local function monoMode()
   local m = PaletteFX.mode
   return m == "og" or m == "og_inv" or m == "classic"
+      or PaletteFX.forcesRawGrays()
 end
 
 local function shownHP(battler)
@@ -97,6 +93,19 @@ local function battleIsTopState(battle)
   return not (stack and stack.top) or stack:top() == battle
 end
 
+-- engine/menus/party_menu.asm:4
+local function coveredByOpaqueState(battle)
+  local stack = battle.game and battle.game.stack
+  local states = stack and stack.states
+  if not states then return false end
+  local above = false
+  for i = 1, #states do
+    if above and states[i] and states[i].isOpaque then return true end
+    if states[i] == battle then above = true end
+  end
+  return false
+end
+
 local function anchorHUD(battle, x, y, w, h, anchor)
   if not battle:extendedHUD() or not battleIsTopState(battle) then return end
   local renderer = battle.game and battle.game.renderer
@@ -149,6 +158,8 @@ local function drawIntroBalls(battle)
 end
 
 local function drawHUDs(battle, slide)
+  -- engine/menus/pokedex.asm:581-582
+  if battle.fieldCleared then return end
   local showStatus = battle:statusHUDVisible()
   if showStatus and battle.enemy and not battle.showEnemyTrainer
       and not battle.enemySendingOut and not battle:growInScale(battle.enemy)
@@ -161,8 +172,10 @@ local function drawHUDs(battle, slide)
   -- item, not a HUD element (DisplayBattleMenu prints wNumSafariBalls inside
   -- the battle menu box, engine/battle/core.asm:2074-2079), so it rides in
   -- drawCommandMenu below like the classic layout's (#540).
+  -- RemoveFaintedPlayerMon clears the player HUD (core.asm:1024-1026) (#1721)
   if showStatus and not battle.safari and battle.player and not battle.demo
-      and not battle.showPlayerBack and slide == 0 then
+      and not battle.showPlayerBack and slide == 0
+      and not battle.player.fainted then
     drawStatusPanel(battle, battle.player, 184, 56, true)
   end
 end
@@ -242,7 +255,12 @@ local function drawMoveDetails(battle, move)
   local maxPP = def.pp + (move.ppUps or 0) * math.floor(def.pp / 5)
   love.graphics.setColor(0, 0, 0, 1)
   Font.draw(("PP %2d/%2d"):format(move.pp or 0, maxPP), 232, 112)
-  Font.draw(fitName(TypeChart.displayName(def.type), 64), 232, 128)
+  -- battle.data is game.data by reference (BattleState:startBattle sets it
+  -- before TypeChart.load(game.data)), so this resolves through the exact
+  -- same merged table TypeChart's own cache already has -- a no-op today,
+  -- kept only for the same call convention as the pre-battle screens
+  -- (SummaryMenu, HallOfFame) that genuinely need the explicit data.
+  Font.draw(fitName(TypeChart.displayName(def.type, battle.data), 64), 232, 128)
 end
 
 local function drawMoveGrid(battle, moves, selected)
@@ -349,7 +367,7 @@ function WideBattle.draw(battle)
     g.rectangle("fill", 0, 0, WideBattle.WIDTH, WideBattle.HEIGHT)
   end
   -- AskName clears the field the same way the classic layout does
-  if battle.blankForAskName then return end
+  if battle.blankForAskName or coveredByOpaqueState(battle) then return end
 
   local fx = battle.fx
   local sx = (fx and fx.shakeX) or 0

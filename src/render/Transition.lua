@@ -65,16 +65,24 @@ end
 -- (ViridianGym.asm .afterBeat, RocketHideoutB4F BeatGiovanniScript) call
 -- GBFadeOutToBlack -> GBFadeInFromBlack instead, so the default keeps the
 -- symmetric 32-frame fade back in (home/fade.asm:21, b = 4).
-function Transition.new(game, onMidpoint, onDone, warp)
+--
+-- opts.color = {r,g,b} in 0..1 (default black).  opts.frames / opts.framesIn
+-- override duration.  Fly/Teleport/Dig/Escape Rope use white
+-- GBFadeOutToWhite / GBFadeInFromWhite (#1644).
+function Transition.new(game, onMidpoint, onDone, warp, opts)
+  opts = opts or {}
   local self = setmetatable({}, Transition)
   self.game = game
   self.onMidpoint = onMidpoint
   self.onDone = onDone
   self.t = 0
   self.phase = "out"
+  self.color = opts.color or { 0, 0, 0 }
   local style = styleOf(game, "warp_fade")
-  self.frames = style.frames or FRAMES
-  if warp then
+  self.frames = opts.frames or style.frames or FRAMES
+  if opts.framesIn ~= nil then
+    self.framesIn = opts.framesIn
+  elseif warp then
     -- a style may still ask for a fade in (mods, and the record is
     -- data-driven); the built-in warp is 0, matching hardware
     self.framesIn = style.framesIn or FRAMES_IN
@@ -85,7 +93,9 @@ function Transition.new(game, onMidpoint, onDone, warp)
 end
 
 function Transition:finish()
-  self.game.stack:pop()
+  if self.done then return end
+  self.done = true
+  if not self.offStack then self.game.stack:pop() end
   if self.onDone then self.onDone() end
 end
 
@@ -96,10 +106,16 @@ function Transition:update(dt)
     self.t = 0
     if self.phase == "out" then
       self.phase = "in"
-      if self.onMidpoint then self.onMidpoint() end
       -- LoadGBPal restores the palettes in one write, so with no fade in the
       -- map is simply there on the next frame
-      if (self.framesIn or 0) <= 0 then self:finish() end
+      if (self.framesIn or 0) <= 0 then
+        self.offStack = true
+        self.game.stack:pop()
+        if self.onMidpoint then self.onMidpoint() end
+        self:finish()
+      elseif self.onMidpoint then
+        self.onMidpoint()
+      end
     else
       self:finish()
     end
@@ -117,6 +133,7 @@ end
 
 function Transition:draw()
   local alpha = self:alpha()
+  local c = self.color or { 0, 0, 0 }
   -- Survey zoom draws the overworld into a window-filling world canvas
   -- while the UI pass stays the classic 160x144 letterbox.  A rect on the
   -- UI canvas only darkens that center box (issue #121); when the world
@@ -125,9 +142,10 @@ function Transition:draw()
   local r = self.game and self.game.renderer
   if r and r.worldActive then
     r.worldFadeAlpha = alpha
+    r.worldFadeColor = c
     return
   end
-  love.graphics.setColor(0, 0, 0, alpha)
+  love.graphics.setColor(c[1], c[2], c[3], alpha)
   love.graphics.rectangle("fill", 0, 0, 160, 144)
   love.graphics.setColor(1, 1, 1, 1)
 end
@@ -141,10 +159,14 @@ local WhiteFlash = {}
 WhiteFlash.__index = WhiteFlash
 WhiteFlash.isOpaque = true
 
+-- engine/pokemon/status_screen.asm:82
+function Transition.flashFrames(game)
+  return styleOf(game, "white_flash").frames or FLASH_FRAMES
+end
+
 function Transition.whiteFlash(game, frames, onDone)
   return setmetatable({ game = game,
-                        frames = frames or styleOf(game, "white_flash").frames
-                                 or FLASH_FRAMES,
+                        frames = frames or Transition.flashFrames(game),
                         onDone = onDone, t = 0 }, WhiteFlash)
 end
 

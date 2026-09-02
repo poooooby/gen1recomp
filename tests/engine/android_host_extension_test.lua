@@ -58,6 +58,43 @@ check(position("if (secondaryEnabled) registerSecondaryDisplayListener();") <
   "secondary display monitoring starts before initial discovery")
 check(source:find("!monitor.hasDisplay(display.getDisplayId())", 1, true),
   "a disconnected active display is rebound without replacing a live one")
+check(source:find("private static volatile boolean secondaryHostResumed = false;",
+    1, true), "secondary output tracks the primary activity lifecycle")
+check(source:find("if (on && secondaryHostResumed)", 1, true)
+    and source:find("self == null || !secondaryHostResumed || !secondaryEnabled",
+      1, true),
+  "paused hosts cannot reopen secondary output from a late mod frame")
+
+local pause = position("protected void onPause()")
+local paused = assert(source:find("secondaryHostResumed = false;", pause, true))
+local teardown = assert(source:find("teardownSecondaryDisplay();", pause, true))
+local pauseSuper = assert(source:find("super.onPause();", pause, true))
+check(pause < paused and paused < teardown and teardown < pauseSuper,
+  "pause blocks secondary setup before dismissing its output")
+
+local resume = position("public void onResume()")
+local resumeSuper = assert(source:find("super.onResume();", resume, true))
+local resumed = assert(source:find("secondaryHostResumed = true;", resume, true))
+local resumeSetup = assert(source:find("setupSecondaryDisplay();", resume, true))
+check(resume < resumeSuper and resumeSuper < resumed and resumed < resumeSetup,
+  "resume permits secondary setup only after the primary activity resumes")
+
+local destroy = position("protected void onDestroy()")
+local destroyTeardown = assert(source:find("teardownSecondaryDisplay();", destroy, true))
+local destroySuper = assert(source:find("super.onDestroy();", destroy, true))
+check(destroy < destroyTeardown and destroyTeardown < destroySuper,
+  "destroy always dismisses secondary output before SDL destruction")
+
+local mainFile = assert(io.open("main.lua", "rb"))
+local main = mainFile:read("*a")
+mainFile:close()
+check(main:find("SessionLifecycle.endGameSession", 1, true),
+  "returning from a game goes through SessionLifecycle.endGameSession")
+local lifecycleFile = assert(io.open("src/core/SessionLifecycle.lua", "rb"))
+local lifecycle = lifecycleFile:read("*a")
+lifecycleFile:close()
+check(lifecycle:find('require("src.render.SecondScreen").setEnabled(false)', 1, true),
+  "endGameSession disables mod-owned secondary output")
 
 check(not source:lower():find("openxr", 1, true),
   "generic Android activity must not require OpenXR")
@@ -81,8 +118,13 @@ local systemFile = assert(io.open(systemPath, "rb"))
 local system = systemFile:read("*a")
 systemFile:close()
 check(system:find('strcmp(kind, "required_import")', 1, true)
-    and system:find('dest = "picked_required_import.bin"', 1, true)
+    and system:find('destination != nullptr', 1, true)
+    and system:find('"picked_required_import.bin"', 1, true)
     and system:find('return "rom,mod,sav,required_import"', 1, true),
   "native Android bridge advertises and routes required imports")
+check(source:find('normalized.startsWith("mods/")', 1, true)
+    and source:find('/baseroms/', 1, true)
+    and source:find('PICK_COMPLETE_FILENAME', 1, true),
+  "direct required imports stay inside mod baseroms and publish completion")
 
 print("android_host_extension_test: ok")

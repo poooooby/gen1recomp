@@ -77,4 +77,67 @@ do
   check(Runtime.modRequire == nil, "Runtime.reset clears modRequire")
 end
 
+-- 4. returnToLauncher / closeEditor also clear Assets.loader (orphaned Loader)
+do
+  local Assets = require("src.render.Assets")
+  Assets.installLoader({
+    overrideOrder = function() return { { id = "x", path = "mods/x" } } end,
+    derivedPath = function() return nil end,
+  })
+  check(Assets.loader ~= nil, "Assets.loader installed for the session")
+  Assets.installLoader(nil)
+  check(Assets.loader == nil, "session teardown clears Assets.loader")
+end
+
+-- 5. Gen1 Game:reset exists so main.lua need not guess field names
+do
+  local Game = require("src.core.Game")
+  check(type(Game.reset) == "function", "Game:reset is defined for in-process return")
+  Game.mods = { stale = true }
+  Game:reset()
+  check(Game.mods == nil, "Game:reset clears session fields")
+  check(type(Game.load) == "function", "Game:reset keeps methods")
+end
+
+-- 6. Play-again after endGameSession: Game.load must still be callable
+--    (Android crash: main.lua bootGame → Game:load with load == nil)
+do
+  local Game = require("src.core.Game")
+  local SessionLifecycle = require("src.core.SessionLifecycle")
+  Game.save = {}
+  Game.stack = { clear = function() end }
+  -- Mimic a shared net module parked on the singleton (handle-style release).
+  Game.net = { release = function(id) end }
+  SessionLifecycle.endGameSession(Game)
+  check(package.loaded["src.core.Game"] == nil,
+    "endGameSession drops the Gen1 Game module cache")
+  local again = require("src.core.Game")
+  check(type(rawget(again, "load")) == "function",
+    "Play-again can call Game:load after endGameSession")
+  check(again ~= Game, "Play-again gets a fresh Gen1 Game module table")
+end
+
+-- 7. endGameSession must not join the ChipAudio worker (process-tier only).
+--    Joining on every EXIT GAME correlates with release-APK Game.load nil
+--    when reopening a version already played this process.
+do
+  local SessionLifecycle = require("src.core.SessionLifecycle")
+  local ChipAudio = require("src.core.ChipAudio")
+  local shutdownCalls, stopCalls = 0, 0
+  local origShutdown, origStop = ChipAudio.shutdown, ChipAudio.stopMusic
+  ChipAudio.shutdown = function(...)
+    shutdownCalls = shutdownCalls + 1
+    return origShutdown(...)
+  end
+  ChipAudio.stopMusic = function(...)
+    stopCalls = stopCalls + 1
+    return origStop(...)
+  end
+  local game = { reset = function() end, load = function() end }
+  SessionLifecycle.endGameSession(game)
+  ChipAudio.shutdown, ChipAudio.stopMusic = origShutdown, origStop
+  eq(shutdownCalls, 0, "endGameSession does not ChipAudio.shutdown")
+  check(stopCalls >= 1, "endGameSession stops chip music (Music.stop and/or stopMusic)")
+end
+
 T.finish("android_exit_to_launcher_test")

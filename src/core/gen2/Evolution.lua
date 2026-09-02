@@ -357,6 +357,7 @@ Evolution.MON_FIELDS = {
   experience = true, dvs = true, stats = true, hp = true, maxHp = true,
   types = true, moves = true, item = true, status = true, happiness = true,
   caughtLevel = true, shiny = true, gender = true,
+  caughtTime = true, caughtLocation = true, caughtByGender = true,
 }
 
 -- Turn `mon` into `entry.into`.  Returns the NEW record; the caller writes it
@@ -381,7 +382,9 @@ function Evolution.apply(data, mon, entry)
   local level = mon.level or 1
   -- CalcMonStats runs through the one builder, so an evolved mon's stats can
   -- never disagree with a freshly built one's.
-  local stats = Mon.stats(def.baseStats, mon.dvs, level, mon.statExp)
+  -- engine/pokemon/evolve.asm:261-264
+  local statExp = mon.statExp
+  local stats = Mon.stats(def.baseStats, mon.dvs, level, statExp)
   local previousMax = mon.maxHp or (mon.stats and mon.stats.hp) or stats.hp
   local hp = (mon.hp or previousMax) + (stats.hp - previousMax)
   -- The cart does not clamp; the bound only matters for data where an
@@ -397,6 +400,7 @@ function Evolution.apply(data, mon, entry)
 
   local evolved = Mon.new(data, species, level, {
     dvs = mon.dvs,
+    statExp = statExp,
     moves = mon.moves,
     hp = hp,
     item = heldItem,
@@ -410,6 +414,11 @@ function Evolution.apply(data, mon, entry)
   evolved.experience = mon.experience
   evolved.status = mon.status
   evolved.caughtLevel = mon.caughtLevel
+  -- Nothing between GetBaseData and the PARTYMON_STRUCT_LENGTH copy back
+  -- touches MON_CAUGHTDATA -- engine/pokemon/evolve.asm:291-293.
+  evolved.caughtTime = mon.caughtTime
+  evolved.caughtLocation = mon.caughtLocation
+  evolved.caughtByGender = mon.caughtByGender
   -- Anything a future field adds to a party record (mail, pokerus) rides along
   -- rather than being silently dropped.  Only fields Mon.new does NOT own may
   -- be carried: copying `nickname` back would undo

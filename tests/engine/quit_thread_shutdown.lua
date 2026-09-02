@@ -182,11 +182,30 @@ check(checkSrc:match('cmd%.cmd == "quit"%s*then%s*\n%s*break') ~= nil,
 local mainSrc = source("main.lua")
 local quitHook = mainSrc:match("\nfunction love%.quit%(%).-\nend\n")
 check(quitHook ~= nil, "love.quit is still a single top-level function")
-quitHook = quitHook or ""
-check(quitHook:find('package.loaded["src.core.ChipAudio"].shutdown', 1, true) ~= nil,
-      "love.quit shuts the chip worker down")
-check(quitHook:find('package.loaded["src.update.Check"].shutdown', 1, true) ~= nil,
-      "love.quit shuts the update worker down")
+check(mainSrc:find("SessionLifecycle.endProcess()", 1, true) ~= nil,
+      "love.quit shuts workers down via SessionLifecycle.endProcess")
+
+local lifecycleSrc = source("src/core/SessionLifecycle.lua")
+check(lifecycleSrc:find("registerProcessShutdown", 1, true) ~= nil,
+      "SessionLifecycle exposes registerProcessShutdown")
+check(lifecycleSrc:find("function SessionLifecycle.endProcess()", 1, true) ~= nil,
+      "SessionLifecycle.endProcess fans out registered hooks")
+check(source("src/core/ChipAudio.lua"):find("registerProcessShutdown(ChipAudio.shutdown)", 1, true) ~= nil,
+      "ChipAudio registers its shutdown hook at load")
+check(source("src/update/Check.lua"):find("registerProcessShutdown(Check.shutdown)", 1, true) ~= nil,
+      "Check registers its shutdown hook at load")
+check(source("src/net/Fetch.lua"):find("registerProcessShutdown(Fetch.shutdown)", 1, true) ~= nil,
+      "Fetch registers its shutdown hook at load")
+
+-- iOS EXIT GAME must share Android's in-process returnToLauncher: love.cpp
+-- under LOVE_IOS forces DONE_RESTART for every quit and warns that leftover
+-- threads make that restart unreliable (ChipAudio / Fetch / Check).
+check(quitHook:find('osName == "Android" or osName == "iOS"', 1, true) ~= nil,
+      "love.quit treats Android and iOS as in-process return platforms")
+check(quitHook:find("inProcessReturn", 1, true) ~= nil,
+      "love.quit gates returnToLauncher on inProcessReturn")
+check(quitHook:find('require("src.core.HostShell").restart()', 1, true) ~= nil,
+      "desktop return-to-launcher still reaches HostShell.restart")
 
 -- The Android half: LOVE keeps the JVM process after the native main returns,
 -- so the quit event exits the process outright.  It has to sit after the

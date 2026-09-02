@@ -31,6 +31,8 @@ local MOVE = {
   STANDING_LEFT = 8,
   STANDING_RIGHT = 9,
   SPINRANDOM_FAST = 10,
+  -- data/sprites/map_objects.asm:181-187
+  POKEMON = 0x16,
   SPINCOUNTERCLOCKWISE = 0x1e,
   SPINCLOCKWISE = 0x1f,
   -- The three rows whose palette-flags byte is `STRENGTH_BOULDER | BIG_OBJECT`
@@ -122,6 +124,10 @@ local SPIN_NEXT = {
 -- (_MovementSpinRepeat, map_objects.asm:809-823): a fixed sixteen frames on
 -- each quarter, no Random anywhere in the loop.
 local SPIN_TURN_FRAMES = 16
+
+-- map_object_action.asm:184-201, events.asm:175-189
+local BOUNCE_PERIOD = 32
+local BOUNCE_HALF = 16
 
 local function rand(a, b)
   if love and love.math and love.math.random then
@@ -252,6 +258,8 @@ function NPC.new(mapId, objDef, spriteDef)
     bigObject = BIG_OBJECT[movement] == true,
     bigFacing = NPC.bigFacing(movement, spriteDef and spriteDef.id),
     fixedFacing = FIXED_FACING_MOVE[movement] or nil,
+    bouncing = movement == MOVE.POKEMON or nil,
+    bounceStep = 0,
     timer = rand(30, 120),
     sprite = SpriteRenderer.new(spriteDef, string.format("%s_obj_%d", mapId, objDef.index or 0)),
     -- The sheet is grayscale and carries no alpha; PAL_OW_* crossed with the
@@ -501,6 +509,14 @@ function NPC:walkPhase()
   return (p >= frames / 4 and p < frames * 3 / 4) and 1 or 0
 end
 
+-- OBJECT_ACTION_BOUNCE's two columns, SetFacingBounce and
+-- SetFacingFreezeBounce -- engine/overworld/map_object_action.asm:184-201
+function NPC:bounceFrame()
+  if not self.bouncing then return nil end
+  if self.frozen then return 0 end
+  return ((self.bounceStep or 0) >= BOUNCE_HALF) and 1 or 0
+end
+
 -- Gen 1's seven-value entity pose (src/world/NPC.lua:124), on the class so a
 -- mod poses the object it is FOLLOWING, not only one it built itself.
 function NPC:pose()
@@ -521,6 +537,9 @@ function NPC:update(map, entities)
   if not self.spawnLatched and map then
     self.spawnLatched = true
     self.inGrass = NPC.grassAt(map, self.cellX, self.cellY)
+  end
+  if self.bouncing and not self.frozen then
+    self.bounceStep = ((self.bounceStep or 0) + 1) % BOUNCE_PERIOD
   end
   -- The teleport step type owns the object outright (it replaces
   -- STEP_TYPE_FROM_MOVEMENT until its last beat), so it runs above the frozen
@@ -722,12 +741,12 @@ function NPC:drawBigAsym()
   end
 end
 
-function NPC:draw(ox, oy, scale)
+function NPC:draw(ox, oy, scale, oamRow)
   -- Gen 1 spells this draw(camX, camY) and SpriteRenderer subtracts them
   -- (src/world/NPC.lua:129).  Two arguments means that call, not a missing
   -- scale: G.scale(nil, nil) would either raise or draw unscaled at an
   -- offset, which is the silent wrong answer.
-  if scale == nil then return self:draw(-(ox or 0), -(oy or 0), 1) end
+  if scale == nil then return self:draw(-(ox or 0), -(oy or 0), 1, oamRow) end
   local G = love.graphics
   G.push()
   G.translate(ox, oy)
@@ -750,7 +769,7 @@ function NPC:draw(ox, oy, scale)
     local facing = (q == 1 or q == 3) and "up" or "down"
     self.sprite:draw(
       self.px, self.py + yOffset, 0, 0,
-      facing, 0, false, false, q == 3)
+      facing, 0, false, false, q == 3, oamRow)
   elseif self.rockSmash then
     -- engine/overworld/map_objects.asm:1462
     if (self.rockSmash.frame % 2) == 0 then
@@ -759,11 +778,12 @@ function NPC:draw(ox, oy, scale)
     end
     self.sprite:draw(
       self.px, self.py + yOffset, 0, 0,
-      self.facing, self:walkPhase(), self.stepFlip)
+      self.facing, self:walkPhase(), self.stepFlip, nil, nil, nil, oamRow)
   else
     self.sprite:draw(
       self.px, self.py + yOffset, 0, 0,
-      self.facing, self:walkPhase(), self.stepFlip)
+      self.facing, self:walkPhase(), self.stepFlip,
+      false, false, self:bounceFrame(), oamRow)
   end
   G.pop()
 end

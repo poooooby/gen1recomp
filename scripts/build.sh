@@ -6,11 +6,12 @@
 #
 # Usage: scripts/build.sh [mac|win|linux|android|ios|all] [--version X.Y.Z] [--identity "Developer ID Application: ..."]
 #                          [--notary-profile NAME] [--no-notarize]
+#                          [--game-love PATH]  # fuse a prebuilt payload (scripts/pack_love.sh) instead of packing one
 #                          [--release]   # ios only: release config instead of debug
 #
 # Output: dist/mac/gen1recomp-macos.zip
 #         dist/win/gen1recomp-win64.zip
-#         dist/linux/gen1recomp-linux.zip (fused x86_64 AppImage)
+#         dist/linux/gen1recomp-linux-x86_64.AppImage (fused x86_64 AppImage)
 #         dist/android/debug/*.apk (full gradle output stays under
 #           mobile/android/app/build/outputs/apk/embedNoRecord/)
 #         dist/ios/<Config>-<sdk>/gen1recomp++.app (full xcodebuild output stays
@@ -36,6 +37,7 @@ NOTARY_PROFILE="notary-profile"
 NOTARIZE=true
 IOS_RELEASE=false
 IOS_IPA=false
+GAME_LOVE_IN=""
 
 say()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarn:\033[0m %s\n' "$*" >&2; }
@@ -48,6 +50,7 @@ while [ $# -gt 0 ]; do
     --identity) IDENTITY="$2"; shift ;;
     --notary-profile) NOTARY_PROFILE="$2"; shift ;;
     --no-notarize) NOTARIZE=false ;;
+    --game-love) GAME_LOVE_IN="${2:?--game-love needs a path}"; shift ;;
     --release) IOS_RELEASE=true ;;
     --ipa) IOS_IPA=true ;;
     *) fail "unknown argument: $1" ;;
@@ -62,17 +65,23 @@ mkdir -p "$CACHE" "$WORK" "$DIST/mac" "$DIST/win" "$DIST/linux"
 # launcher's Edit button on a save row opens it in-process (main.lua), and
 # `--editor` / POKEPORT_EDITOR=1 opens it standalone.  It is required through
 # love.filesystem's require path, so it has to live inside the archive.
-say "packing game.love"
 LOVE_FILE="$WORK/game.love"
 rm -f "$LOVE_FILE"
-# The launcher UI kit lives at src/ui/kit (inside src/, packed wholesale);
-# the vendored libs/flexlove tree it replaced is gone.
-(cd "$ROOT" && zip -q -9 -r "$LOVE_FILE" \
-  main.lua conf.lua src data assets tools/save-editor \
-  tools/rom_manifest.json tools/rom_manifest_blue.json \
-  tools/rom_manifest_yellow.json tools/rom_manifest_gold.json \
-  tools/rom_manifest_silver.json \
-  -x '*.DS_Store' 'data/generated/*' 'assets/generated/*')
+if [ -n "$GAME_LOVE_IN" ]; then
+  [ -f "$GAME_LOVE_IN" ] || fail "--game-love: no such file: $GAME_LOVE_IN"
+  say "using prebuilt payload: $GAME_LOVE_IN"
+  cp "$GAME_LOVE_IN" "$LOVE_FILE"
+else
+  say "packing game.love"
+  # The launcher UI kit lives at src/ui/kit (inside src/, packed wholesale);
+  # the vendored libs/flexlove tree it replaced is gone.
+  (cd "$ROOT" && zip -q -9 -r "$LOVE_FILE" \
+    main.lua conf.lua src data assets tools/save-editor \
+    tools/rom_manifest.json tools/rom_manifest_blue.json \
+    tools/rom_manifest_yellow.json tools/rom_manifest_gold.json \
+    tools/rom_manifest_silver.json tools/rom_manifest_crystal.json \
+    -x '*.DS_Store' 'data/generated/*' 'assets/generated/*')
+fi
 # Materialize the listing once and grep the file: piping unzip straight into
 # grep -q under `set -o pipefail` SIGPIPEs unzip when grep exits early on a
 # match, and the pipeline's failure reads as "missing <file>" for whichever
@@ -92,7 +101,8 @@ for required in tools/save-editor/App.lua tools/save-editor/Kit.lua \
                 src/ui/kit/Kit.lua \
                 tools/rom_manifest.json tools/rom_manifest_blue.json \
                 tools/rom_manifest_yellow.json tools/rom_manifest_gold.json \
-                tools/rom_manifest_silver.json; do
+                tools/rom_manifest_silver.json \
+                tools/rom_manifest_crystal.json; do
   grep -qxF "$required" "$LOVE_LISTING" \
     || fail "game.love is missing $required"
 done
@@ -107,18 +117,26 @@ say "game.love: $(du -h "$LOVE_FILE" | cut -f1)"
 # mistaken for a release. The stamp is then read back out of the archive and the
 # build fails if it did not take.
 if printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-  say "stamping engine version $VERSION into game.love"
-  stamp_dir="$WORK/stamp"
-  rm -rf "$stamp_dir"
-  mkdir -p "$stamp_dir/src/core"
-  sed -E "s/(engine[[:space:]]*=[[:space:]]*\")[^\"]*(\")/\1$VERSION\2/" \
-    "$ROOT/src/core/Version.lua" > "$stamp_dir/src/core/Version.lua"
-  (cd "$stamp_dir" && zip -q "$LOVE_FILE" src/core/Version.lua)
-  version_re="$(printf '%s' "$VERSION" | sed 's/\./\\./g')"
-  unzip -p "$LOVE_FILE" src/core/Version.lua \
-    | grep -Eq "engine[[:space:]]*=[[:space:]]*\"$version_re\"" \
-    || fail "version stamp failed: game.love does not report engine $VERSION"
-  say "stamped engine version: $VERSION"
+  if [ -n "$GAME_LOVE_IN" ]; then
+    version_re="$(printf '%s' "$VERSION" | sed 's/\./\\./g')"
+    unzip -p "$LOVE_FILE" src/core/Version.lua \
+      | grep -Eq "engine[[:space:]]*=[[:space:]]*\"$version_re\"" \
+      || fail "prebuilt payload does not report engine $VERSION (pack it with pack_love.sh --version $VERSION)"
+    say "prebuilt payload already stamped: $VERSION"
+  else
+    say "stamping engine version $VERSION into game.love"
+    stamp_dir="$WORK/stamp"
+    rm -rf "$stamp_dir"
+    mkdir -p "$stamp_dir/src/core"
+    sed -E "s/(engine[[:space:]]*=[[:space:]]*\")[^\"]*(\")/\1$VERSION\2/" \
+      "$ROOT/src/core/Version.lua" > "$stamp_dir/src/core/Version.lua"
+    (cd "$stamp_dir" && zip -q "$LOVE_FILE" src/core/Version.lua)
+    version_re="$(printf '%s' "$VERSION" | sed 's/\./\\./g')"
+    unzip -p "$LOVE_FILE" src/core/Version.lua \
+      | grep -Eq "engine[[:space:]]*=[[:space:]]*\"$version_re\"" \
+      || fail "version stamp failed: game.love does not report engine $VERSION"
+    say "stamped engine version: $VERSION"
+  fi
 else
   say "version '$VERSION' is not X.Y.Z,  shipping default engine (no stamp)"
 fi
@@ -150,6 +168,57 @@ make_ico() { # $1 = output .ico path
 }
 
 # --------------------------------------------------------------- macOS
+# ShaderFX's librashader bridge.  Only the CONVERT action needs it, so a build
+# without it still runs presets that were converted elsewhere.
+# SHADERFX_BRIDGE_<PLAT> or dist/native/<plat>/ points at a prebuilt library;
+# otherwise cargo builds it, host platform only.
+shader_bridge_host_plat() {
+  case "$(uname -s)-$(uname -m)" in
+    Darwin-*)             printf 'mac' ;;
+    Linux-x86_64)         printf 'linux-x64' ;;
+    Linux-aarch64|Linux-arm64) printf 'linux-arm64' ;;
+    *)                    printf '' ;;
+  esac
+}
+
+bundle_shader_bridge() {
+  local dest="$1" name="$2" plat="$3"
+  local crate="$ROOT/tools/shaderfx-bridge"
+  local src="" var
+  [ -n "$plat" ] || fail "bundle_shader_bridge: no platform key for $name"
+
+  var="SHADERFX_BRIDGE_$(printf '%s' "$plat" | tr 'a-z-' 'A-Z_')"
+  eval "src=\${$var:-}"
+
+  if [ -z "$src" ] && [ -f "$DIST/native/$plat/$name" ]; then
+    src="$DIST/native/$plat/$name"
+  fi
+  if [ -z "$src" ] && [ -n "${SHADERFX_BRIDGE:-}" ]; then
+    src="$SHADERFX_BRIDGE"
+  fi
+  if [ -z "$src" ] && [ "$plat" = "$(shader_bridge_host_plat)" ]; then
+    if [ -f "$crate/target/release/$name" ]; then
+      src="$crate/target/release/$name"
+    elif command -v cargo >/dev/null 2>&1; then
+      say "building the ShaderFX bridge with cargo"
+      if (cd "$crate" && cargo build --release >/dev/null 2>&1); then
+        src="$crate/target/release/$name"
+      fi
+    fi
+  fi
+
+  if [ -n "$src" ] && [ -f "$src" ]; then
+    mkdir -p "$dest"
+    cp "$src" "$dest/$name"
+    say "bundled $name for SHADER FX preset conversion ($plat)"
+    return 0
+  fi
+  if [ "${SHADERFX_BRIDGE_REQUIRED:-}" = "1" ]; then
+    fail "$name ($plat) not found: set $var or stage it at dist/native/$plat/$name"
+  fi
+  warn "$name not found: this build can run converted presets but not CONVERT new ones (set $var or install cargo)"
+}
+
 build_mac() {
   say "building macOS app"
   local love_app="${LOVE_APP:-/Applications/love.app}"
@@ -162,6 +231,7 @@ build_mac() {
   # drop any bundled placeholder .love and fuse ours in
   find "$out_app/Contents/Resources" -maxdepth 1 -name '*.love' -delete
   cp "$LOVE_FILE" "$out_app/Contents/Resources/game.love"
+  bundle_shader_bridge "$out_app/Contents/MacOS" "liblibrashader_bridge.dylib" mac
 
   local plist="$out_app/Contents/Info.plist"
   /usr/libexec/PlistBuddy -c "Set :CFBundleName $APP_NAME" "$plist" 2>/dev/null \
@@ -275,8 +345,10 @@ build_win() {
     cp "$tls_dll" "$out_dir/gen1tls.dll"
     say "bundled gen1tls.dll for Windows TLS (wss://)"
   else
-    warn "gen1tls.dll not found — Windows zip will not support wss:// (set GEN1TLS_DLL or build native/tls_dial)"
+    warn "gen1tls.dll not found: Windows zip will not support wss:// (set GEN1TLS_DLL or build native/tls_dial)"
   fi
+
+  bundle_shader_bridge "$out_dir" "librashader_bridge.dll" win-x64
 
   # The exe's icon lives in love.exe's PE resources, so it must be patched
   # BEFORE the .love is appended: peresed rewrites the whole file and would
@@ -373,6 +445,7 @@ build_linux() {
   unsquashfs -q -no-xattrs -o "$sfs_offset" -d "$appdir" "$love_appimage" >/dev/null
 
   cp "$LOVE_FILE" "$appdir/game.love"
+  bundle_shader_bridge "$appdir" "liblibrashader_bridge.so" linux-x64
 
   # Replace LÖVE's own desktop entry rather than keeping it: it says
   # Name=LÖVE / Icon=love, which is what appimaged, app menus and file
@@ -410,15 +483,31 @@ EOF
   # file-manager thumbnailers show for the file itself.
   [ -f "$ICON_SRC" ] || fail "missing icon source: $ICON_SRC"
   rm -f "$appdir/love.svg" "$appdir/love.png" "$appdir/.DirIcon"
-  sips -z 512 512 "$ICON_SRC" --out "$appdir/$APP_NAME.png" >/dev/null
+  if command -v sips >/dev/null 2>&1; then
+    sips -z 512 512 "$ICON_SRC" --out "$appdir/$APP_NAME.png" >/dev/null
+  elif command -v convert >/dev/null 2>&1; then
+    convert "$ICON_SRC" -resize 512x512 "$appdir/$APP_NAME.png"
+  else
+    fail "need sips (macOS) or ImageMagick convert to resize $ICON_SRC"
+  fi
   cp "$appdir/$APP_NAME.png" "$appdir/.DirIcon"
 
-  sed -i '' 's|^#FUSE_PATH="$APPDIR/my_game.love"$|FUSE_PATH="$APPDIR/game.love"|' "$appdir/AppRun"
+  # sed -i '' is BSD; GNU sed wants sed -i (no empty backup suffix).
+  if sed --version >/dev/null 2>&1; then
+    sed -i 's|^#FUSE_PATH="$APPDIR/my_game.love"$|FUSE_PATH="$APPDIR/game.love"|' "$appdir/AppRun"
+  else
+    sed -i '' 's|^#FUSE_PATH="$APPDIR/my_game.love"$|FUSE_PATH="$APPDIR/game.love"|' "$appdir/AppRun"
+  fi
   grep -q '^FUSE_PATH="\$APPDIR/game.love"$' "$appdir/AppRun" \
     || fail "failed to enable FUSE_PATH in AppRun (upstream AppRun changed?)"
 
-  sed -i '' 's|^exec "\$APPDIR/bin/love"|if [ -n "$WAYLAND_DISPLAY" ] \&\& [ -z "$SDL_VIDEODRIVER" ]; then export SDL_VIDEODRIVER=x11; fi\
-exec "$APPDIR/bin/love"|' "$appdir/AppRun"
+  local wayland_hook='if [ -n "$WAYLAND_DISPLAY" ] && [ -z "$SDL_VIDEODRIVER" ]; then export SDL_VIDEODRIVER=x11; fi\
+exec "$APPDIR/bin/love"'
+  if sed --version >/dev/null 2>&1; then
+    sed -i "s|^exec \"\$APPDIR/bin/love\"|$wayland_hook|" "$appdir/AppRun"
+  else
+    sed -i '' "s|^exec \"\$APPDIR/bin/love\"|$wayland_hook|" "$appdir/AppRun"
+  fi
 
   # Match the upstream image's compression (gzip, 128K blocks) so the
   # bundled runtime can read it.
@@ -427,16 +516,20 @@ exec "$APPDIR/bin/love"|' "$appdir/AppRun"
   mksquashfs "$appdir" "$sfs_out" \
     -comp gzip -b 131072 -noappend -all-root -no-xattrs -quiet >/dev/null
 
-  local out_bin="$WORK/$APP_NAME-x86_64.AppImage"
-  rm -f "$out_bin"
+  mkdir -p "$DIST/linux"
+  local out_bin="$DIST/linux/$APP_NAME-linux-x86_64.AppImage"
+  rm -f "$out_bin" "$out_bin.sha256"
   head -c "$sfs_offset" "$love_appimage" > "$out_bin"
   cat "$sfs_out" >> "$out_bin"
   chmod +x "$out_bin"
-
-  local zip_out="$DIST/linux/$APP_NAME-linux.zip"
-  rm -f "$zip_out"
-  (cd "$WORK" && zip -q -9 -j "$zip_out" "$(basename "$out_bin")")
-  say "Linux build: $zip_out"
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s  %s\n' "$(sha256sum "$out_bin" | awk '{print $1}')" "$(basename "$out_bin")" \
+      > "$out_bin.sha256"
+  else
+    printf '%s  %s\n' "$(shasum -a 256 "$out_bin" | awk '{print $1}')" "$(basename "$out_bin")" \
+      > "$out_bin.sha256"
+  fi
+  say "Linux build: $out_bin"
 }
 
 # --------------------------------------------------------------- Android

@@ -29,18 +29,31 @@ local Chrome = require("src.ui.gen2.Chrome")
 local Font = require("src.render.Font")
 local GbcPalette = require("src.render.GbcPalette")
 local Screens = require("src.ui.Screens")
+local Strings = require("src.core.Strings")
 
 local NamePick = {}
 NamePick.__index = NamePick
 NamePick.isOpaque = true
 
--- data/player_names.asm PlayerNameArray, one half of the IF per edition.
-local PRESETS = { "GOLD", "HIRO", "TAYLOR", "KARL" }
-local PRESETS_SILVER = { "SILVER", "KAMON", "OSCAR", "MAX" }
+-- data/player_names.asm PlayerNameArray, one half of the IF per edition, and
+-- Crystal's two arrays at ../pokecrystal/data/player_names.asm:12-16, :31-35.
+local PRESETS = {
+  gold = { "GOLD", "HIRO", "TAYLOR", "KARL" },
+  silver = { "SILVER", "KAMON", "OSCAR", "MAX" },
+  crystal = { "CHRIS", "MAT", "ALLAN", "JON" },
+}
+local PRESETS_FEMALE = {
+  crystal = { "KRIS", "AMANDA", "JUANA", "JODI" },
+}
 
-local function presetsFor()
-  local silver = require("src.core.GameVersion").get() == "silver"
-  return silver and PRESETS_SILVER or PRESETS
+-- ShowPlayerNamingChoices picks the header off wPlayerGender
+-- (../pokecrystal/engine/gfx/player_gfx.asm:57-62).
+local function presetsFor(gender)
+  local version = require("src.core.GameVersion").get()
+  if gender == "female" and PRESETS_FEMALE[version] then
+    return PRESETS_FEMALE[version]
+  end
+  return PRESETS[version] or PRESETS.gold
 end
 
 -- menu_coords 0, 0, 10, TEXTBOX_Y - 1 (TEXTBOX_Y = 12).
@@ -48,7 +61,8 @@ local BOX_X1, BOX_Y1, BOX_X2, BOX_Y2 = 0, 0, 10, 11
 -- GetMenuTextStartCoord's answer for this header's flags.
 local TEXT_X, TEXT_Y = 2, 2
 local CURSOR_X = TEXT_X - 1
-local TITLE, TITLE_X, TITLE_Y = "NAME", 2, 0
+local TITLE, TITLE_X, TITLE_Y = Strings.source("NAME"), 2, 0
+local NEW_NAME = Strings.source("NEW NAME")
 
 -- Intro_PrepTrainerPic puts the 7x7 pic at hlcoord 6,4; MovePlayerPic walks
 -- it to 13,4 one tile per frame.
@@ -59,14 +73,16 @@ function NamePick:wantsFillScale() return true end
 function NamePick:drawsWidescreen() return true end
 
 -- opts: onDone(name), font, pic (the CAL frontpic already loaded by the Oak
--- speech), picColors, presets
+-- speech), picColors, presets, gender
 function NamePick.new(game, opts)
   opts = opts or {}
   local self = setmetatable({}, NamePick)
   self.game = game
   self.onDone = opts.onDone
-  self.items = { "NEW NAME" }
-  for _, name in ipairs(opts.presets or presetsFor()) do
+  self.gender = opts.gender
+    or (game and game.save and game.save.player and game.save.player.gender)
+  self.items = { NEW_NAME }
+  for _, name in ipairs(opts.presets or presetsFor(self.gender)) do
     self.items[#self.items + 1] = name
   end
   -- `db 1 ; default option`: the cursor starts on NEW NAME, not on a preset.
@@ -96,15 +112,19 @@ end
 function NamePick:openNaming()
   local data = self.game and self.game.data or {}
   local sprites = data.gen2Sprites
-  local chris = sprites and sprites.SPRITE_CHRIS
+  local NamingScreen = require("src.ui.gen2.NamingScreen")
+  local def = sprites and sprites[NamingScreen.playerSprite(self.gender)]
   local Palettes = require("src.world.gen2.Palettes")
   Screens.push(self.game, "Gen2NamingScreen", {
     type = "player",
+    gender = self.gender,
     menuGfx = data.gen2MenuGfx,
-    iconPath = chris and chris.image or nil,
-    -- Chris is PAL_OW_RED; the naming screen is lit like day.
+    iconPath = def and def.image or nil,
+    -- Chris is PAL_OW_RED and Kris PAL_OW_BLUE
+    -- (../pokecrystal/engine/overworld/player_object.asm:32-39); the naming
+    -- screen is lit like day.
     iconColors = data.gen2Palettes
-      and Palettes.spritePalette(data.gen2Palettes, "DAY", chris) or nil,
+      and Palettes.spritePalette(data.gen2Palettes, "DAY", def) or nil,
     onDone = function(name)
       -- An empty name keeps the default, the way ending entry with nothing
       -- typed leaves wPlayerName at its preset.
@@ -112,7 +132,7 @@ function NamePick:openNaming()
       if name and #name > 0 then
         self:choose(name)
       else
-        self:choose(self.items[2] or presetsFor()[1])
+        self:choose(self.items[2] or presetsFor(self.gender)[1])
       end
     end,
   })
@@ -152,7 +172,7 @@ function NamePick:update(_dt)
       if self.fontOk then
         self:openNaming()
       else
-        self:choose(self.items[2] or presetsFor()[1])
+        self:choose(self.items[2] or presetsFor(self.gender)[1])
       end
     else
       -- A preset returns through MovePlayerPicLeft, so the pic walks back
@@ -194,7 +214,8 @@ function NamePick:drawPanel()
     G.setColor(0, 0, 0, 1)
     for index, label in ipairs(self.items) do
       local prefix = (index == self.cursor) and "> " or "  "
-      G.print(prefix .. label, TEXT_X * 8, (TEXT_Y + (index - 1) * 2) * 8)
+      G.print(prefix .. (index == 1 and Strings(label) or label), TEXT_X * 8,
+        (TEXT_Y + (index - 1) * 2) * 8)
     end
     G.setColor(1, 1, 1, 1)
     return
@@ -206,10 +227,12 @@ function NamePick:drawPanel()
   -- on the box's top border -- so the border tiles under it have to go, or
   -- the letters sit on a line the cart does not draw there.
   G.setColor(1, 1, 1, 1)
-  G.rectangle("fill", TITLE_X * 8, TITLE_Y * 8, #TITLE * 8, 8)
-  Chrome.print(TITLE, TITLE_X, TITLE_Y)
+  local title = Strings(TITLE)
+  G.rectangle("fill", TITLE_X * 8, TITLE_Y * 8, #Font.split(title) * 8, 8)
+  Chrome.print(title, TITLE_X, TITLE_Y)
   for index, label in ipairs(self.items) do
-    Chrome.print(label, TEXT_X, TEXT_Y + (index - 1) * 2)
+    Chrome.print(index == 1 and Strings(label) or label,
+      TEXT_X, TEXT_Y + (index - 1) * 2)
   end
   Chrome.cursor(CURSOR_X, TEXT_Y + (self.cursor - 1) * 2)
   G.setColor(1, 1, 1, 1)
@@ -221,19 +244,17 @@ end
 
 function NamePick:drawWidescreen(winW, winH)
   local G = love.graphics
-  G.setColor(1, 1, 1, 1)
-  G.rectangle("fill", 0, 0, winW, winH)
+  Chrome.letterbox(winW, winH, 1, 1, 1)
   local scale = Chrome.fitScale(winW, winH)
   G.push()
-  G.translate(math.floor((winW - 160 * scale) / 2),
-    math.floor((winH - 144 * scale) / 2))
+  G.translate(Chrome.fitOrigin(winW, winH, scale))
   G.scale(scale, scale)
   self:drawPanel()
   G.pop()
 end
 
 NamePick.PRESETS = PRESETS
-NamePick.PRESETS_SILVER = PRESETS_SILVER
+NamePick.PRESETS_FEMALE = PRESETS_FEMALE
 NamePick.presetsFor = presetsFor
 
 return NamePick

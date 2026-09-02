@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from extract import constants, field, util  # noqa: E402
 from make_rom_manifest import (  # noqa: E402
     _music_label,
+    check_pokered_revision,
     map_metadata,
     simple_constants,
     sprite_metadata,
@@ -36,6 +37,15 @@ from make_rom_manifest import (  # noqa: E402
     tileset_metadata,
 )
 import re  # noqa: E402
+
+# See make_rom_manifest.py's POKERED_REVISION comment for why this pin
+# matters -- pokeyellow can drift the same way pokered did for the Silph Co
+# 10F/11F rename. Verified against this commit: symbols/text/trainerHeaders/
+# trainerPartyOverrides all come out byte-for-byte identical to the
+# committed rom_manifest_yellow.json (field.oldManBattle does not -- a
+# separate, pre-existing, undiagnosed discrepancy unrelated to text labels,
+# left alone the same way field.seafoam/tradeArt were for Red/Blue).
+POKEYELLOW_REVISION = "e6ba56989b0f2694f393e6924820be11dcc1fbb8"
 from rom_data import SymbolTable  # noqa: E402
 from yellow_symbol_aliases import (  # noqa: E402
     FAN_CLUB_ID_RENAMES,
@@ -88,6 +98,12 @@ YELLOW_EXTRA_SYMBOLS = (
     "SurfingPikachu1Graphics1",
     "SurfingPikachu1Graphics2",
     "SurfingPikachu1Graphics3",
+    # Surfing Pikachu title screen tilemaps
+    # (engine/minigame/surfing_pikachu.asm DrawSurfingPikachuMinigameIntroBackground)
+    "SurfingMinigame_BeachIntroTilemap",
+    "SurfingMinigame_TitleTilemap",
+    "SurfingMinigame_ToSurfRadTilemap",
+    "SurfingMinigame_UseControlPadTilemap",
     # Oak's own battle back pic.  LoadPlayerBackPic (engine/battle/core.asm)
     # picks OldManPicBack for BATTLE_TYPE_OLD_MAN but ProfOakPicBack for
     # BATTLE_TYPE_PIKACHU, the Pallet Town catch scene (#557).
@@ -437,6 +453,7 @@ def derive(red, pokeyellow, symbols_path):
             print(f"warning: parse_credits failed ({exc}); keeping Red credits")
             # TODO: hand-author a Yellow credits banner if pret layout drifts.
         yellow["field"]["trades"] = field.parse_trades(pokeyellow)
+        yellow["field"]["superRod"] = field.parse_super_rod_yellow(pokeyellow)
     finally:
         util.ASM_DEFINES = saved
 
@@ -495,6 +512,41 @@ def derive(red, pokeyellow, symbols_path):
     if "SUMMER_BEACH_HOUSE" not in locations and "ROUTE_19" in locations:
         locations["SUMMER_BEACH_HOUSE"] = dict(locations["ROUTE_19"])
 
+    # Surfing Pikachu minigame asset index (src/ui/SurfingMinigame.lua).
+    yellow["field"]["surfingPikachu"] = {
+        "music": "Music_SurfingPikachu",
+        "sheets": {
+            "bg": {
+                "path": "assets/generated/minigame/surf_1a.png",
+                "width": 40, "height": 104,
+            },
+            "oam": {
+                "path": "assets/generated/minigame/surf_1b.png",
+                "width": 128, "height": 128,
+            },
+            "intro": {
+                "path": "assets/generated/minigame/surf_1c.png",
+                "width": 96, "height": 96,
+                "introPikaFrames": [
+                    "assets/generated/minigame/intro_pika_0.png",
+                    "assets/generated/minigame/intro_pika_1.png",
+                    "assets/generated/minigame/intro_pika_2.png",
+                    "assets/generated/minigame/intro_pika_3.png",
+                ],
+                "source": "data/sprite_anims/surfing_pikachu_oam.asm .IntroPikachu",
+            },
+            "titleBg": {
+                "path": "assets/generated/minigame/title_bg.png",
+                "width": 160, "height": 144,
+            },
+        },
+        "source": (
+            "engine/minigame/surfing_pikachu.asm "
+            "(DrawSurfingPikachuMinigameIntroBackground), "
+            "gfx/surfing_pikachu.asm"
+        ),
+    }
+
     meta = {
         "aliasCount": alias_hits,
         "omittedIntro": list(OMIT_INTRO_SYMBOLS),
@@ -513,17 +565,24 @@ def main():
     parser.add_argument("--symbols", default=DEFAULT_SYMBOLS,
                         help="pokeyellow.sym symbol file")
     parser.add_argument("--out", default=DEFAULT_OUT)
+    parser.add_argument(
+        "--allow-revision-mismatch", action="store_true",
+        help="generate even if --pokeyellow isn't at POKEYELLOW_REVISION")
     args = parser.parse_args()
 
     pokeyellow = os.path.abspath(args.pokeyellow)
     if not os.path.isfile(os.path.join(pokeyellow, "main.asm")):
         raise SystemExit(f"{pokeyellow} is not a pokeyellow checkout")
+    if POKEYELLOW_REVISION is not None:
+        check_pokered_revision(
+            pokeyellow, POKEYELLOW_REVISION,
+            allow_mismatch=args.allow_revision_mismatch)
     with open(args.red, encoding="utf-8") as f:
         red = json.load(f)
 
     yellow, meta = derive(red, pokeyellow, os.path.abspath(args.symbols))
     with open(args.out, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(yellow, f, ensure_ascii=False, indent=2, sort_keys=True)
+        json.dump(yellow, f, ensure_ascii=True, indent=2, sort_keys=True)
         f.write("\n")
 
     print(f"wrote {args.out}")

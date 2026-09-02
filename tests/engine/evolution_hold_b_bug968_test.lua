@@ -10,6 +10,7 @@ love = love or require("tests.love_stub")
 -- TextBox and EvolutionState both require Sound inside update, so seeding
 package.loaded["src.core.Sound"] = {
   play = function() end,
+  playPress = function() end,
   playCry = function() end,
 }
 
@@ -52,6 +53,14 @@ local function step(game)
   game.stack:update(1 / 60)
 end
 
+local function textOf(box)
+  local out = {}
+  for _, page in ipairs(box.pages) do
+    for _, line in ipairs(page) do out[#out + 1] = line end
+  end
+  return table.concat(out, " ")
+end
+
 -- the post-battle sequence: grew-to-level box, then Evolution.checkParty
 local function levelUpBox(game, mon)
   game.stack:push(TextBox.new(game, "FIXMON A grew\nto level 16!",
@@ -69,19 +78,25 @@ local function dismissWithB(game, mon)
   if not box.done then return nil, "the level-up text never finished typing" end
   Input:keypressed(B_KEY)
   step(game)
-  local top = game.stack:top()
+  -- IsEvolvingText holds its own box for DelayFrames 50 before EvolveMon
+  -- runs (engine/pokemon/evos_moves.asm:120-134)
+  local intro = game.stack:top()
+  if getmetatable(intro) ~= TextBox then
+    return nil, "the \"is evolving!\" box never opened"
+  end
+  if not textOf(intro):find("is evolving") then
+    return nil, "the box before the movie is not _IsEvolvingText"
+  end
+  local top
+  for _ = 1, 900 do
+    top = game.stack:top()
+    if getmetatable(top) == EvolutionState then break end
+    step(game)
+  end
   if getmetatable(top) ~= EvolutionState then
     return nil, "the evolution screen never opened"
   end
   return top
-end
-
-local function textOf(box)
-  local out = {}
-  for _, page in ipairs(box.pages) do
-    for _, line in ipairs(page) do out[#out + 1] = line end
-  end
-  return table.concat(out, " ")
 end
 
 -- B held out of the text box: the movie must run to the end and evolve.
@@ -96,7 +111,7 @@ do
        "and this is a cancelable level-up evolution, so the movie really "
        .. "is reading the button (#290)")
     -- never released: no second edge ever reaches the movie
-    for _ = 1, 400 do
+    for _ = 1, 700 do
       if evo.done then break end
       step(game)
     end
@@ -143,7 +158,7 @@ do
   Input:keyreleased(B_KEY)
   check(evo.t <= 80, "the press landed inside the delay window")
   eq(evo.canceled, false, "a B press during the delay is never polled")
-  for _ = 1, 400 do
+  for _ = 1, 700 do
     if evo.done then break end
     step(game)
   end

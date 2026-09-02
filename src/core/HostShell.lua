@@ -4,16 +4,77 @@ local HostShell = {}
 
 -- Our AppRun exports LD_LIBRARY_PATH="$APPDIR/lib:..." so every subprocess we
 -- spawn tries to link against the libraries we're shipping instead of the
--- system ones. We want to unset the var so that any system tools can find
--- their proper libraries. Only needed when running in an AppImage.
--- LD_PRELOAD is Steam's overlay (#1470): its 32-bit half cannot load into a
--- 64-bit child, so ld.so prints an error into that child's output.
+-- system ones. Host tools (curl, zenity) need that unset. A *bundled* AppDir
+-- curl must keep APPDIR on LD_LIBRARY_PATH so it resolves the bundled
+-- libssl/libcrypto -- scrubbing it forces host OpenSSL and segfaults across
+-- distros. LD_PRELOAD is always scrubbed: Steam's overlay (#1470) cannot load
+-- into a 64-bit child.
 function HostShell.envPrefix()
+  return HostShell.curlEnvPrefix("host")
+end
+
+-- kind "bundled" = AppDir / Flatpak curl (keep LD_LIBRARY_PATH, scrub preload).
+-- kind "host"    = system curl (scrub both).
+function HostShell.curlEnvPrefix(kind)
   local unset = ""
-  if os.getenv("APPIMAGE") then unset = unset .. "-u LD_LIBRARY_PATH " end
+  if kind ~= "bundled" and os.getenv("APPIMAGE") then
+    unset = unset .. "-u LD_LIBRARY_PATH "
+  end
   if os.getenv("LD_PRELOAD") then unset = unset .. "-u LD_PRELOAD " end
   if unset == "" then return "" end
   return "env " .. unset
+end
+
+local curlResolved = nil -- { path=, kind= } once per Lua state
+
+local function pathIsExecutable(path)
+  if type(path) ~= "string" or path == "" then return false end
+  local f = io.open(path, "rb")
+  if not f then return false end
+  f:close()
+  -- Best-effort: existence is enough; exec bit is checked by the spawn.
+  return true
+end
+
+-- Prefer Flatpak /app/bin/curl, then $APPDIR/{usr/,}bin/curl, else host "curl".
+function HostShell.resolveCurl()
+  if curlResolved ~= nil then return curlResolved.path, curlResolved.kind end
+  local candidates = {}
+  if os.getenv("FLATPAK_ID") then
+    candidates[#candidates + 1] = { "/app/bin/curl", "bundled" }
+  end
+  local appdir = os.getenv("APPDIR")
+  if type(appdir) == "string" and appdir ~= "" then
+    candidates[#candidates + 1] = { appdir .. "/usr/bin/curl", "bundled" }
+    candidates[#candidates + 1] = { appdir .. "/bin/curl", "bundled" }
+  end
+  for _, c in ipairs(candidates) do
+    if pathIsExecutable(c[1]) then
+      curlResolved = { path = c[1], kind = c[2] }
+      return curlResolved.path, curlResolved.kind
+    end
+  end
+  curlResolved = { path = "curl", kind = "host" }
+  return curlResolved.path, curlResolved.kind
+end
+
+-- Quoted curl argv0 for a shell command, plus the matching env prefix.
+function HostShell.curlInvocation()
+  local path, kind = HostShell.resolveCurl()
+  return HostShell.curlEnvPrefix(kind) .. HostShell.quote(path), kind
+end
+
+-- Diagnostics for support / About screens.
+function HostShell.curlDiagnostics()
+  local path, kind = HostShell.resolveCurl()
+  return {
+    path = path,
+    kind = kind,
+    appimage = os.getenv("APPIMAGE") ~= nil,
+    appdir = os.getenv("APPDIR"),
+    flatpakId = os.getenv("FLATPAK_ID"),
+    haveCurl = HostShell.haveCurl(),
+  }
 end
 
 -- Windows: every host tool we shell out to (curl for the update and mod-index
@@ -126,12 +187,19 @@ local function withPopenLock(fn)
   if not okAtomic then fn() end
 end
 
--- Wraps io.popen with the AppImage env fix applied and lua errors swallowed
-function HostShell.popen(command, mode)
+-- Wraps io.popen with the AppImage env fix applied and lua errors swallowed.
+-- opts.envPrefix overrides the default HostShell.envPrefix() (pass "" to skip,
+-- or curlEnvPrefix(kind) when spawning a resolved curl binary).
+function HostShell.popen(command, mode, opts)
   HostShell.releasePointerGrab()
+  local prefix = HostShell.envPrefix()
+  if type(opts) == "table" and opts.envPrefix ~= nil then
+    prefix = opts.envPrefix
+  end
   local pipe
+  local line = HostShell.shellCommand(prefix .. command)
   withPopenLock(function()
-    local ok, p = pcall(io.popen, HostShell.envPrefix() .. command, mode or "r")
+    local ok, p = pcall(io.popen, line, mode or "r")
     pipe = (ok and p) or nil
   end)
   return pipe
@@ -143,6 +211,11 @@ end
 function HostShell.pclose(pipe)
   if not pipe then return end
   withPopenLock(function() pcall(function() pipe:close() end) end)
+end
+
+function HostShell.pumpHostEvents()
+  if not (love and love.event and love.event.pump) then return end
+  pcall(love.event.pump)
 end
 
 -- Restart the whole app. The obvious love.event.quit("restart") re-runs LÖVE's
@@ -158,7 +231,15 @@ end
 -- and the app dies. There we relaunch through the GameActivity.restartApp
 -- JNI bridge (love.system.restartApp), which schedules our launch intent
 -- and kills the process so no native state can leak into the fresh run.
--- On every other platform the in-process restart works, so keep it.
+-- iOS is the same class of problem with a sharper edge: love.cpp under
+-- LOVE_IOS forces DONE_RESTART for *every* quit (Apple forbids programmatic
+-- exit) and comments that leftover threads make that restart unreliable --
+-- which our ChipAudio / Fetch / Check workers are.  There is no
+-- restartApp bridge on iOS, so callers that want "back to launcher" must
+-- use main.lua's in-process returnToLauncher (love.quit aborts the quit);
+-- HostShell.restart itself refuses quit("restart") and falls back to a
+-- bare quit() so a mod that still calls restart does not pick the worst
+-- path on purpose.
 function HostShell.restart()
   if not (love and love.event and love.event.quit) then return end
 
@@ -174,9 +255,23 @@ function HostShell.restart()
     love.event.quit()
     return
   end
+  if osName == "iOS" then
+    -- No process-kill bridge.  A bare quit still becomes DONE_RESTART in
+    -- love.cpp, but quit("restart") is the path that also runs our
+    -- endProcess worker joins first and then re-enters runlove -- the
+    -- combination that crashes EXIT GAME.  Prefer the softer quit.
+    love.event.quit()
+    return
+  end
 
   local appimage = os.getenv("APPIMAGE")
   if not appimage then
+    -- Flatpak and plain desktop: love.event.quit("restart") uses
+    -- execv(/proc/self/exe). Inside bwrap that path is valid, but PhysFS
+    -- locks on a mounted .love payload can survive the exec boundary and
+    -- hang the next Boot.mount. Callers that just wrote updates/*.love
+    -- should already have closed archive handles; Boot.run still owns
+    -- crash-guard rollback if a mid-handoff restart dies.
     love.event.quit("restart")
     return
   end
@@ -274,6 +369,18 @@ local function fetchError(url, status, noise)
   return ("fetch failed for %s: %s"):format(url, why)
 end
 
+function HostShell.isWindows()
+  return (love and love.system and love.system.getOS
+    and love.system.getOS() == "Windows") or false
+end
+
+function HostShell.shellCommand(command)
+  command = tostring(command)
+  if not HostShell.isWindows() then return command end
+  if command:sub(1, 1) ~= '"' then return command end
+  return '"' .. command .. '"'
+end
+
 -- Shell quoting for one curl argument; cmd.exe has no single-quote form.
 function HostShell.quote(s)
   s = tostring(s)
@@ -325,12 +432,21 @@ local curlAvailable = nil
 
 function HostShell.haveCurl()
   if curlAvailable ~= nil then return curlAvailable end
-  local pipe = HostShell.popen("curl --version")
+  local path, kind = HostShell.resolveCurl()
+  local pipe = HostShell.popen(
+    HostShell.quote(path) .. " --version", "r",
+    { envPrefix = HostShell.curlEnvPrefix(kind) })
   if not pipe then curlAvailable = false return false end
   local readOk, out = pcall(function() return pipe:read("*a") end)
   HostShell.pclose(pipe)
   curlAvailable = readOk and out ~= nil and out:find("curl", 1, true) ~= nil
   return curlAvailable
+end
+
+local function curlCmd(flags)
+  local path, kind = HostShell.resolveCurl()
+  return HostShell.quote(path) .. " " .. flags,
+    { envPrefix = HostShell.curlEnvPrefix(kind) }
 end
 
 -- An older mobile build reports nil here and falls back to the "no transport"
@@ -376,22 +492,40 @@ end
 -- notice a quit command until curl returns.  With the launcher's default 300s
 -- ceiling, closing the window during a mod download hung the process for
 -- minutes.  Callers on the interactive fetch pool pass something short.
-function HostShell.httpDownload(url, absPath, userAgent, accept, maxTime)
+--
+-- `etagPath` (optional, absolute host path) turns this into a conditional
+-- GET: curl sends `If-None-Match` from whatever ETag is already saved there
+-- (`--etag-compare`) and overwrites it with the response's own ETag on
+-- success (`--etag-save`), same file for both so a first call with no prior
+-- ETag degrades to a plain unconditional download. A server that replies 304
+-- Not Modified is reported as a third return value (`notModified`), and --
+-- confirmed empirically against the real buildbot.libretro.com endpoint
+-- (TrueFX/etag-cache-repro/) before this was wired in here -- curl does NOT
+-- write `absPath` at all in that case (not even an empty file), matching
+-- HTTP: a 304 carries no body. A caller must not treat a missing file as an
+-- error when `notModified` comes back true.
+function HostShell.httpDownload(url, absPath, userAgent, accept, maxTime, etagPath)
   if type(url) ~= "string" or url == "" then return nil, "missing url" end
   if type(absPath) ~= "string" or absPath == "" then return nil, "missing path" end
   userAgent = userAgent or "gen1recomp"
   if HostShell.haveCurl() then
-    local cmd = ("curl -fsSL --proto =http,https --proto-redir =http,https "
-      .. "--connect-timeout 15 --max-time %d ")
-      :format(tonumber(maxTime) or 300)
+    local head, popts = curlCmd(
+      ("-fsSL --proto =http,https --proto-redir =http,https "
+        .. "--connect-timeout 15 --max-time %d ")
+        :format(tonumber(maxTime) or 300))
+    local cmd = head
       .. "-H " .. HostShell.quote("User-Agent: " .. userAgent) .. " "
     if accept then
       cmd = cmd .. "-H " .. HostShell.quote("Accept: " .. accept) .. " "
     end
+    if type(etagPath) == "string" and etagPath ~= "" then
+      cmd = cmd .. "--etag-compare " .. HostShell.quote(etagPath) .. " "
+        .. "--etag-save " .. HostShell.quote(etagPath) .. " "
+    end
     cmd = cmd .. "-o " .. HostShell.quote(absPath) .. " "
       .. "-w " .. HostShell.quote(HTTP_MARK_FMT) .. " "
       .. HostShell.quote(url) .. " 2>&1"
-    local pipe = HostShell.popen(cmd)
+    local pipe = HostShell.popen(cmd, "r", popts)
     if not pipe then return nil, "could not start download" end
     local readOk, out = pcall(function() return pipe:read("*a") end)
     HostShell.pclose(pipe)
@@ -400,6 +534,9 @@ function HostShell.httpDownload(url, absPath, userAgent, accept, maxTime)
     -- status is here purely so the failure can NAME itself: "download failed"
     -- with no URL and no code is the report this whole change exists to fix.
     local body, status, noise = splitCurlOutput(readOk and out or "")
+    if status == 304 then
+      return true, nil, true
+    end
     if status and (status < 200 or status >= 300) then
       return nil, fetchError(url, status, body)
     end
@@ -411,6 +548,10 @@ function HostShell.httpDownload(url, absPath, userAgent, accept, maxTime)
   if not haveBridge() then
     return nil, "no network transport on this platform"
   end
+  -- The Android/iOS bridge has no conditional-GET support -- etagPath is
+  -- silently ignored here, so a downloaded preset re-fetches in full every
+  -- time on those platforms.  No transport-level ETag/If-None-Match hook
+  -- exists on the bridge to hang one off, and it's low-priority for now.
   local ok, done = pcall(love.system.httpDownload, url, absPath, userAgent, accept)
   if ok and done then return true end
   return nil, "download failed for " .. url
@@ -427,16 +568,18 @@ function HostShell.httpGet(url, userAgent, accept, maxTime)
     -- BODY, and on the two services this talks to that body is the whole
     -- diagnosis: GitHub's 403 says "API rate limit exceeded for <ip>", which
     -- tells a user to wait rather than to go hunting for a broken index.
-    local cmd = ("curl -sSL --proto =http,https --proto-redir =http,https "
-      .. "--connect-timeout 10 --max-time %d ")
-      :format(tonumber(maxTime) or 40)
+    local head, popts = curlCmd(
+      ("-sSL --proto =http,https --proto-redir =http,https "
+        .. "--connect-timeout 10 --max-time %d ")
+        :format(tonumber(maxTime) or 40))
+    local cmd = head
       .. "-H " .. HostShell.quote("User-Agent: " .. userAgent) .. " "
     if accept then
       cmd = cmd .. "-H " .. HostShell.quote("Accept: " .. accept) .. " "
     end
     cmd = cmd .. "-w " .. HostShell.quote(HTTP_MARK_FMT) .. " "
       .. HostShell.quote(url) .. " 2>&1"
-    local pipe = HostShell.popen(cmd)
+    local pipe = HostShell.popen(cmd, "r", popts)
     if not pipe then return nil, "could not run curl" end
     local readOk, out = pcall(function() return pipe:read("*a") end)
     HostShell.pclose(pipe)
@@ -523,9 +666,11 @@ function HostShell.httpPost(url, body, contentType, userAgent, maxTime)
     -- newlines.  The body is staged above because io.popen cannot be opened
     -- for both writing and reading.  No -f, matching httpGet: the response
     -- body is discarded anyway, and curl's stderr carries the diagnosis.
-    local cmd = ("curl -sSL --proto =http,https --proto-redir =http,https "
-      .. "--connect-timeout 10 --max-time %d ")
-      :format(tonumber(maxTime) or 40)
+    local head, popts = curlCmd(
+      ("-sSL --proto =http,https --proto-redir =http,https "
+        .. "--connect-timeout 10 --max-time %d ")
+        :format(tonumber(maxTime) or 40))
+    local cmd = head
       .. "-X POST "
       .. "-H " .. HostShell.quote("User-Agent: " .. userAgent) .. " "
     if contentType then
@@ -535,7 +680,7 @@ function HostShell.httpPost(url, body, contentType, userAgent, maxTime)
       .. "--data-binary " .. HostShell.quote("@" .. bodyPath) .. " "
       .. "-w " .. HostShell.quote(HTTP_MARK_FMT) .. " "
       .. HostShell.quote(url) .. " 2>&1"
-    local pipe = HostShell.popen(cmd)
+    local pipe = HostShell.popen(cmd, "r", popts)
     if not pipe then
       pcall(os.remove, bodyPath)
       return nil, "could not run curl"
@@ -712,8 +857,10 @@ function HostShell.httpRequest(url, opts)
     pcall(os.remove, headerPath)
   end
 
-  local cmd = ("curl -sSL --proto =http,https --proto-redir =http,https "
-    .. "--connect-timeout 10 --max-time %d "):format(maxTime)
+  local head, popts = curlCmd(
+    ("-sSL --proto =http,https --proto-redir =http,https "
+      .. "--connect-timeout 10 --max-time %d "):format(maxTime))
+  local cmd = head
     .. "-X " .. HostShell.quote(method) .. " "
     .. "-H " .. HostShell.quote("@" .. headerPath) .. " "
   if body then
@@ -722,7 +869,7 @@ function HostShell.httpRequest(url, opts)
   cmd = cmd .. "-w " .. HostShell.quote(HTTP_MARK_FMT) .. " "
     .. HostShell.quote(url) .. " 2>&1"
 
-  local pipe = HostShell.popen(cmd)
+  local pipe = HostShell.popen(cmd, "r", popts)
   if not pipe then
     cleanup()
     return nil, "could not run curl"

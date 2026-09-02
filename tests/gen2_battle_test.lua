@@ -89,6 +89,15 @@ local MOVES = {
     accuracy = 100, pp = 10, effect = "EFFECT_ENDURE" },
   RAGE = { id = "RAGE", name = "RAGE", power = 20, type = "NORMAL",
     accuracy = 100, pp = 20, effect = "EFFECT_RAGE" },
+  -- data/moves/moves.asm:133, :230, :189 and :92 rows, unedited.
+  BIDE = { id = "BIDE", name = "BIDE", power = 0, type = "NORMAL",
+    accuracy = 100, pp = 10, effect = "EFFECT_BIDE" },
+  SLEEP_TALK = { id = "SLEEP_TALK", name = "SLEEP TALK", power = 0,
+    type = "NORMAL", accuracy = 100, pp = 10, effect = "EFFECT_SLEEP_TALK" },
+  SNORE = { id = "SNORE", name = "SNORE", power = 40, type = "NORMAL",
+    accuracy = 100, pp = 15, effect = "EFFECT_SNORE", effectChance = 30 },
+  SOLARBEAM = { id = "SOLARBEAM", name = "SOLARBEAM", power = 120,
+    type = "GRASS", accuracy = 100, pp = 10, effect = "EFFECT_SOLARBEAM" },
 }
 
 local GROWTH = {
@@ -153,6 +162,16 @@ local POKEMON = {
     types = { "GHOST", "POISON" }, catchRate = 190, baseExp = 62,
     growthRate = "GROWTH_MEDIUM_SLOW", genderRatio = 127,
     levelMoves = { { level = 1, move = "LICK" } },
+    evolutions = {},
+  },
+  -- GENDER_UNKNOWN (data/pokemon/base_stats/magnemite.asm).
+  MAGNEMITE = {
+    id = "MAGNEMITE", index = 81, name = "MAGNEMITE",
+    baseStats = { hp = 25, attack = 35, defense = 70, speed = 45,
+      specialAttack = 95, specialDefense = 55 },
+    types = { "ELECTRIC", "STEEL" }, catchRate = 190, baseExp = 89,
+    growthRate = "GROWTH_MEDIUM_FAST", genderRatio = 0xff,
+    levelMoves = { { level = 1, move = "TACKLE" } },
     evolutions = {},
   },
 }
@@ -261,11 +280,16 @@ do
   check("the slot now holds the newcomer", learner.moves[1].id, "SPORE")
   check("the other three are untouched", learner.moves[2].id, "EMBER")
   local ev = b:takeEvents()
-  check("it queues a forgot line then a learned line", #ev, 2)
+  check("it queues count, forgot, learned lines", #ev, 3)
+  check("the count line leads", ev[1].text, "1, 2 and…")
+  -- ../pokecrystal/home/text.asm:887-896
+  check("and is a text_pause, not a prompt", ev[1].textPause, true)
   check("forgot text names the dropped move",
-    ev[1].text:find("forgot TACKLE") ~= nil, true)
+    ev[2].text:find("forgot TACKLE") ~= nil, true)
+  -- engine/pokemon/learn.asm:225-229
+  check("the poof rides the forgot line", ev[2].sfx, "Sfx_SwitchPokemon")
   check("learned text names the new move",
-    ev[2].text:find("learned SPORE") ~= nil, true)
+    ev[3].text:find("learned SPORE") ~= nil, true)
 
   -- Decline keeps the moveset and says so.
   b:declineForget(1, "SPORE")
@@ -680,15 +704,16 @@ statusBattle.player.moves[1].pp = 20
 statusBattle:takeTurn({ kind = "move", move = "THUNDER_WAVE" })
 check("a second status fails", statusBattle.enemy.status, "paralyze")
 
--- Sleep lands with a turn counter, and canAct spends it.  Asserted on the move
--- rather than a whole turn: with this deterministic random the roll is the
--- minimum 1 turn, and the slower foe's own turn later in the same round then
--- wakes it -- which is what the cart does as well.
+-- Sleep lands with a turn counter, and canAct spends it.  The counter opens at
+-- 2, so the target cannot wake in the round it was slept
+-- (engine/battle/effect_commands.asm:3591-3598, #1707).
 local sleepBattle = newBattle()
 sleepBattle.player.moves = { { id = "SPORE", pp = 15, maxPp = 15 } }
 sleepBattle:useMove(sleepBattle.player, sleepBattle.enemy, "SPORE")
 check("spore slept the target", sleepBattle.enemy.status, "sleep")
-check("sleep has turns", (sleepBattle.enemy.statusTurns or 0) >= 1, true)
+check("sleep never opens shorter than two turns",
+  (sleepBattle.enemy.statusTurns or 0) >= 2, true)
+check("the lowest roll is exactly two", sleepBattle.enemy.statusTurns, 2)
 -- A sleeping mon cannot act, and the counter runs down to a wake-up.
 sleepBattle.enemy.statusTurns = 2
 check("asleep cannot act", sleepBattle:canAct(sleepBattle.enemy), false)
@@ -851,6 +876,83 @@ do
   check("the trainer's PP is untouched", refuseParty[1].moves[1].pp, 35)
 end
 
+-- ResetBattleParticipants falls through into AddBattleParticipant
+-- (engine/battle/core.asm:3033 and :3037), so every ENEMY-initiated mon change
+-- wipes both bitfields and re-credits the mon the player has out.  The player's
+-- own send-outs only ever call AddBattleParticipant (core.asm:2655, :2681,
+-- :3783, :4989, :5014).
+do
+  local function creditBattle()
+    local party = {
+      Mon.new(DATA, "CYNDAQUIL", 20, { dvs = perfect }),
+      Mon.new(DATA, "TOTODILE", 20, { dvs = perfect }),
+    }
+    local foes = {
+      Mon.new(DATA, "GEODUDE", 8, { dvs = perfect }),
+      Mon.new(DATA, "PIDGEY", 8, { dvs = perfect }),
+    }
+    for _, mon in ipairs(party) do
+      mon.moves = { { id = "TACKLE", pp = 35, maxPp = 35 } }
+    end
+    for _, mon in ipairs(foes) do
+      mon.moves = { { id = "TACKLE", pp = 35, maxPp = 35 } }
+    end
+    local battle = Battle.new({
+      data = DATA, party = party,
+      -- attributes[6] is the low byte of the switch flags: OFTEN.
+      trainer = { class = "YOUNGSTER", name = "JOEY", party = foes,
+        attributes = { 0, 0, 0, 0, 0, 0x01, 0 } },
+      random = zeroRandom,
+    })
+    battle:switch(2)
+    return battle, party, foes
+  end
+
+  -- AI_Switch (engine/battle/ai/items.asm:697).
+  local rotate, rotateParty, rotateFoes = creditBattle()
+  check("both mons are credited before the rotation",
+    rotate.participants[1] and rotate.participants[2], true)
+  rotate:volatile(rotate.enemy).perish = 1
+  check("the AI rotated", rotate:enemyTrySwitchOrItem(), true)
+  check("the rotation installed the second foe", rotate.enemy, rotateFoes[2])
+  check("the bench mon lost its credit", rotate.participants[1], nil)
+  check("only the mon on the field keeps it", rotate.participants[2], true)
+  local benchExp = rotateParty[1].experience
+  local activeExp = rotateParty[2].experience
+  rotate:awardExperience(rotate.enemy)
+  check("the bench mon earns nothing from the new foe",
+    rotateParty[1].experience, benchExp)
+  check("and the mon that faced it is still paid",
+    rotateParty[2].experience > activeExp, true)
+
+  -- ForceEnemySwitch (engine/battle/core.asm:2937), reached only from
+  -- BattleCommand_ForceSwitch (effect_commands.asm:4999).
+  local roar, _, roarFoes = creditBattle()
+  roar.firstMover = "enemy"
+  Battle.MOVE_EFFECTS.EFFECT_FORCE_SWITCH(roar, roar.player, roar.enemy,
+    nil, "ROAR", true)
+  check("Roar dragged the second foe out", roar.enemy, roarFoes[2])
+  check("the bench mon lost its credit to Roar", roar.participants[1], nil)
+  check("and the mon on the field keeps it", roar.participants[2], true)
+
+  -- engine/battle/move_effects/baton_pass.asm:59.
+  local baton, _, batonFoes = creditBattle()
+  Battle.MOVE_EFFECTS.EFFECT_BATON_PASS(baton, baton.enemy)
+  check("the baton passed to the second foe", baton.enemy, batonFoes[2])
+  check("the bench mon lost its credit to the baton",
+    baton.participants[1], nil)
+  check("and the mon on the field keeps it", baton.participants[2], true)
+
+  -- PassedBattleMonEntrance only adds (engine/battle/core.asm:5014): the
+  -- player's own baton pass must NOT wipe the set.
+  local playerBaton, playerBatonParty = creditBattle()
+  Battle.MOVE_EFFECTS.EFFECT_BATON_PASS(playerBaton, playerBaton.player)
+  check("the player's baton pass moved the lead back in",
+    playerBaton.player, playerBatonParty[1])
+  check("and credited both mons",
+    playerBaton.participants[1] and playerBaton.participants[2], true)
+end
+
 -- Switching costs the turn and adds the newcomer to the participant set.
 local switchParty = {
   Mon.new(DATA, "CYNDAQUIL", 10, { dvs = perfect }),
@@ -963,6 +1065,12 @@ local EFFECT_MOVES = {
     accuracy = 100, pp = 20, effect = "EFFECT_HEAL" },
   PROTECT = { id = "PROTECT", name = "PROTECT", power = 0, type = "NORMAL",
     accuracy = 100, pp = 10, effect = "EFFECT_PROTECT" },
+  -- data/moves/moves.asm:203 and the ATTRACT row.
+  BELLY_DRUM = { id = "BELLY_DRUM", name = "BELLY DRUM", power = 0,
+    type = "NORMAL", accuracy = 100, pp = 10,
+    effect = "EFFECT_BELLY_DRUM" },
+  ATTRACT = { id = "ATTRACT", name = "ATTRACT", power = 0, type = "NORMAL",
+    accuracy = 100, pp = 15, effect = "EFFECT_ATTRACT" },
 }
 for id, def in pairs(EFFECT_MOVES) do MOVES[id] = def end
 
@@ -1183,17 +1291,77 @@ do
   magWild.hp = 200
   magWild.maxHp = 200
   local magEvents = magBattle:takeTurn({ kind = "move", move = "MAGNITUDE" })
-  local announced
-  for _, ev in ipairs(magEvents) do
+  local announced, announceEvent, usedEvent, animEvent
+  local announceIndex, animIndex
+  for i, ev in ipairs(magEvents) do
+    if ev.kind == "move" and ev.move == "MAGNITUDE" and not usedEvent then
+      usedEvent = ev
+    end
     if ev.kind == "message" and type(ev.text) == "string"
-        and ev.text:match("^Magnitude %d+") then
+        and ev.text:match("^Magnitude %d+") and not announced then
       announced = ev.text
-      break
+      announceEvent = ev
+      announceIndex = i
+    end
+    if ev.kind == "message" and ev.moveAnim == "MAGNITUDE"
+        and not animEvent then
+      animEvent = ev
+      animIndex = i
     end
   end
   check("magnitude announces rolled number", announced, "Magnitude 8!")
+  check("magnitude used-move line defers the animation",
+    usedEvent and usedEvent.deferAnim, true)
+  check("magnitude used-move line burns the move delay",
+    usedEvent and usedEvent.animDelay, true)
+  check("magnitude used-move line owns no animation",
+    usedEvent and usedEvent.moveAnim, nil)
+  -- data/text/battle.asm:1017-1021
+  check("magnitude number line holds without the animation",
+    announceEvent and announceEvent.moveAnim, nil)
+  -- data/moves/effects.asm:1705-1711
+  check("magnitude animation rides its own later event",
+    animIndex ~= nil and announceIndex ~= nil and announceIndex < animIndex,
+    true)
+  check("magnitude anim event carries no text", animEvent and animEvent.text,
+    nil)
+  check("magnitude anim event carries the attacking side",
+    animEvent and animEvent.side, "player")
   check("magnitude deals more than power-1 would",
     magWild.hp < 200, true)
+
+  local missBattle, missPlayer = newBattle({
+    random = function(n)
+      if n == 256 then return 200 end
+      if n == 100 then return 99 end
+      return 0
+    end,
+  })
+  missPlayer.moves = { { id = "MAGNITUDE", pp = 30, maxPp = 30 } }
+  missBattle.stages.enemy.evasion = 6
+  local missEvents = missBattle:takeTurn({ kind = "move", move = "MAGNITUDE" })
+  local missAnnounce, missAnim, missLine
+  for _, ev in ipairs(missEvents) do
+    if ev.kind == "message" and type(ev.text) == "string" then
+      if ev.text:match("^Magnitude %d+") and not missAnnounce then
+        missAnnounce = ev
+      end
+      if ev.text:find("attack missed", 1, true) and not missLine then
+        missLine = ev
+      end
+    end
+    if ev.kind == "message" and ev.moveAnim == "MAGNITUDE"
+        and not missAnim then
+      missAnim = ev
+    end
+  end
+  check("missed magnitude still announces the number",
+    missAnnounce and missAnnounce.text, "Magnitude 8!")
+  check("missed magnitude leaves the number line unmarked",
+    missAnnounce and missAnnounce.missed, nil)
+  check("missed magnitude marks the anim event",
+    missAnim and missAnim.missed, true)
+  check("missed magnitude prints the miss line", missLine ~= nil, true)
 end
 
 -- --------------------------------------------------------------- held items
@@ -1300,12 +1468,25 @@ check("Ground is immune", Effects.sandstormHits({ "NORMAL", "GROUND" }), false)
 check("Steel is immune", Effects.sandstormHits({ "STEEL" }), false)
 check("Flying is not", Effects.sandstormHits({ "NORMAL", "FLYING" }), true)
 
--- BattleCommand_Heal's .Weather ladder: a half normally, two thirds in sun,
--- a quarter in rain or sandstorm.
-check("Morning Sun heals half in clear weather",
-  Effects.weatherHealFraction(nil), 1 / 2)
-checkNear("...two thirds in sun", Effects.weatherHealFraction("sun"), 2 / 3, 0.001)
-check("...a quarter in rain", Effects.weatherHealFraction("rain"), 1 / 4)
+-- BattleCommand_TimeBasedHealContinue's .Multipliers ladder, walked by the
+-- time of day and the weather (engine/battle/effect_commands.asm:6388-6454).
+local DAY_F = Effects.SUN_HEAL.EFFECT_SYNTHESIS
+check("Synthesis heals half in the day in clear weather",
+  Effects.timeBasedHealFraction(nil, DAY_F, 1), 1 / 2)
+check("...the lot in sun", Effects.timeBasedHealFraction("sun", DAY_F, 1), 1)
+check("...a quarter in rain",
+  Effects.timeBasedHealFraction("rain", DAY_F, 1), 1 / 4)
+check("...a quarter at night in clear weather",
+  Effects.timeBasedHealFraction(nil, DAY_F, 2), 1 / 4)
+check("...a half at night in sun",
+  Effects.timeBasedHealFraction("sun", DAY_F, 2), 1 / 2)
+check("...an eighth at night in a sandstorm",
+  Effects.timeBasedHealFraction("sandstorm", DAY_F, 2), 1 / 8)
+check("Moonlight wants NITE instead",
+  Effects.timeBasedHealFraction(nil, Effects.SUN_HEAL.EFFECT_MOONLIGHT, 2),
+  1 / 2)
+check("a battle with no clock still heals half",
+  Effects.timeBasedHealFraction(nil, DAY_F, nil), 1 / 2)
 
 -- ProtectChance halves for every consecutive use and gives up after eight.
 check("first Protect always works", Effects.protectChance(0), 0xff)
@@ -2157,6 +2338,23 @@ check("...but from RIVAL2_2 on it is the Champion's",
   BattleMusic.battleSong({ class = "RIVAL2", member = "RIVAL2_2_CHIKORITA",
     members = RIVAL2_MEMBERS, landmark = 80 }), "Music_ChampionBattle")
 
+-- ../pokecrystal/engine/battle/start_battle.asm:60-66
+check("a Crystal roaming battle plays Suicune's theme",
+  BattleMusic.battleSong({ crystal = true, battleType = 5, landmark = 1,
+    daytime = "NITE" }), "Music_SuicuneBattle")
+check("...and so does the Tin Tower Suicune",
+  BattleMusic.battleSong({ crystal = true, battleType = 12, landmark = 1 }),
+  "Music_SuicuneBattle")
+check("...ahead of even the trainer class",
+  BattleMusic.battleSong({ crystal = true, battleType = 5, class = "FALKNER",
+    landmark = 1 }), "Music_SuicuneBattle")
+check("Gold's roamers keep the ordinary wild theme",
+  BattleMusic.battleSong({ battleType = 5, landmark = 1, daytime = "DAY" }),
+  "Music_JohtoWildBattle")
+check("...as does an ordinary Crystal wild battle",
+  BattleMusic.battleSong({ crystal = true, landmark = 1, daytime = "DAY" }),
+  "Music_JohtoWildBattle")
+
 check("a wild win plays the wild jingle",
   BattleMusic.victorySong({}), "Music_WildPokemonVictory")
 -- PlayVictoryMusic's `.lost` path: no participant left standing means no
@@ -2200,8 +2398,8 @@ checkNear("0,0,0,0 is solid white",
   Transition.flashVeil({ 0, 0, 0, 0 }), -1, 0.001)
 checkNear("3,2,1,0 is the identity",
   Transition.flashVeil({ 3, 2, 1, 0 }), 0, 0.001)
-check("the flash runs 72 frames (12 palettes x 2 x 3 passes)",
-  Transition.FLASH_FRAMES, 72)
+check("the flash runs 75 frames (12 palettes x 2 + the terminator, x 3 slots)",
+  Transition.FLASH_FRAMES, 75)
 
 -- The twenty spin steps must black out the whole 20x18 tilemap between them,
 -- which is the point of the wedge table.
@@ -2711,6 +2909,426 @@ end)()
   b:takeTurn({ kind = "move", move = "TACKLE" })
   check("a disabled charge move fails", b:volatile(player).chargeMove, nil)
   check("and its user reappears", b:volatile(player).vanished, nil)
+end)()
+
+-- ------------------------------------------------------------------- Bide
+--
+-- data/moves/effects.asm:795-800 runs `storeenergy` ahead of `doturn`, and
+-- BattleCommand_DoTurn's mask drops SUBSTATUS_BIDE outright
+-- (engine/battle/effect_commands.asm:977-979), so the whole Bide costs the
+-- one PP its opening turn spent.  The lock is ParsePlayerAction's own arm
+-- (engine/battle/core.asm:569-576) for the player and CheckEnemyLockedIn
+-- (:5650) for the foe.
+;(function()
+  local function said(events, text)
+    for _, e in ipairs(events) do
+      if e.kind == "message" and e.text == text then return true end
+    end
+    return false
+  end
+  local player = Mon.new(DATA, "CYNDAQUIL", 20, { dvs = perfect })
+  player.moves = { { id = "BIDE", pp = 10, maxPp = 10 },
+    { id = "TACKLE", pp = 35, maxPp = 35 } }
+  player.hp, player.maxHp = 999, 999
+  local wild = Mon.new(DATA, "PIDGEY", 20, { dvs = perfect })
+  wild.moves = { { id = "TACKLE", pp = 35, maxPp = 35 } }
+  wild.hp, wild.maxHp = 9999, 9999
+  local b = Battle.new({ data = DATA, party = { player }, wild = wild,
+    random = zeroRandom })
+  b:takeEvents()
+
+  check("nothing forces the first BIDE", b:forcedMove(player), nil)
+  b:useMove(player, wild, "BIDE")
+  b:takeEvents()
+  check("the opening turn spends one PP", player.moves[1].pp, 9)
+  check("and the FIGHT menu is locked into it", b:forcedMove(player), "BIDE")
+  check("with the move list narrowed to the one",
+    #b:usableMoves(player), 1)
+
+  -- BattleCommand_StoreEnergy banks wPlayerDamageTaken while the bit is up.
+  b:dealDamage(wild, player, 5, {})
+  b:takeEvents()
+  b:useMove(player, wild, "BIDE")
+  check("a storing turn spends no PP", player.moves[1].pp, 9)
+  check("and stays locked", b:forcedMove(player), "BIDE")
+  check("`.still_storing` prints rather than attacking",
+    said(b:takeEvents(), "CYNDAQUIL is storing energy!"), true)
+
+  -- A dry BIDE keeps running: the bide arm jumps past MoveSelectionScreen,
+  -- where .CheckPlayerHasUsableMoves lives (engine/battle/core.asm:5058).
+  player.moves[1].pp = 0
+  check("a spent BIDE is still offered", #b:usableMoves(player), 1)
+  check("...and it is the BIDE", b:usableMoves(player)[1].id, "BIDE")
+  player.moves[1].pp = 9
+
+  local hpBefore = wild.hp
+  b:useMove(player, wild, "BIDE")
+  b:takeEvents()
+  check("the release spends no PP either", player.moves[1].pp, 9)
+  check("UnleashEnergy pays back double", wild.hp, hpBefore - 10)
+  check("and the lock is gone", b:forcedMove(player), nil)
+
+  -- CheckEnemyLockedIn holds SUBSTATUS_BIDE, so the AI is never asked.
+  local es = b:volatile(b.enemy)
+  es.bideTurns, es.bideMove, es.bideStored = 2, "BIDE", 0
+  check("a biding foe re-uses its Bide", b:enemyMove(), "BIDE")
+  es.bideTurns, es.bideMove, es.bideStored = nil, nil, nil
+
+  -- .reset_bide (engine/battle/core.asm:572-573, :627-629): the PACK cancels
+  -- a Bide, a switch does not.
+  b:useMove(player, wild, "BIDE")
+  b:takeEvents()
+  check("locked again", b:forcedMove(player), "BIDE")
+  b:takeTurn({ kind = "item", item = "POTION" })
+  b:takeEvents()
+  check("using an item cancels the Bide", b:forcedMove(player), nil)
+  check("and drops the bank", b:volatile(player).bideStored, nil)
+
+  -- CantMove (engine/battle/effect_commands.asm:344-353) clears SUBSTATUS_BIDE
+  -- on every arm that spends the turn, so a flinch ends the Bide.
+  b:useMove(player, wild, "BIDE")
+  b:takeEvents()
+  check("locked once more", b:forcedMove(player), "BIDE")
+  b:volatile(player).flinched = true
+  check("a flinch spends the turn", b:canAct(player, "BIDE"), false)
+  b:takeEvents()
+  check("and CantMove ends the Bide", b:forcedMove(player), nil)
+  check("bank dropped with it", b:volatile(player).bideStored, nil)
+
+  -- .not_linked reads SUBSTATUS_ENCORED before CheckEnemyLockedIn
+  -- (engine/battle/core.asm:5524-5533), so an encored foe obeys the Encore.
+  es.bideTurns, es.bideMove, es.bideStored = 2, "BIDE", 0
+  es.encore, es.encoreTurns = "TACKLE", 3
+  check("Encore outranks the foe's Bide lock", b:enemyMove(), "TACKLE")
+  es.encore, es.encoreTurns = nil, nil
+  check("without it the Bide lock holds", b:enemyMove(), "BIDE")
+  es.bideTurns, es.bideMove, es.bideStored = nil, nil, nil
+end)()
+
+-- --------------------------------------------------- Snore and Sleep Talk
+--
+-- `.fast_asleep` prints FastAsleepText and then falls into `.not_asleep` for
+-- those two moves instead of `call CantMove / jp EndTurn`
+-- (engine/battle/effect_commands.asm:188-200).  BattleCommand_SleepTalk opens
+-- on ClearLastMove and ends in ResetTurn (move_effects/sleep_talk.asm:2, :61).
+;(function()
+  local function said(events, text)
+    for _, e in ipairs(events) do
+      if e.kind == "message" and e.text == text then return true end
+    end
+    return false
+  end
+  local function sleeper(moves)
+    local player = Mon.new(DATA, "CYNDAQUIL", 20, { dvs = perfect })
+    player.moves = moves
+    player.hp, player.maxHp = 999, 999
+    local wild = Mon.new(DATA, "PIDGEY", 20, { dvs = perfect })
+    wild.moves = { { id = "TACKLE", pp = 35, maxPp = 35 } }
+    wild.hp, wild.maxHp = 9999, 9999
+    local b = Battle.new({ data = DATA, party = { player }, wild = wild,
+      random = zeroRandom })
+    b:takeEvents()
+    return b, player, wild
+  end
+
+  local b, player, wild = sleeper({
+    { id = "SLEEP_TALK", pp = 10, maxPp = 10 },
+    { id = "TACKLE", pp = 35, maxPp = 35 } })
+
+  player.status, player.statusTurns = "sleep", 3
+  check("an ordinary move still loses the turn to sleep",
+    b:canAct(player, "TACKLE"), false)
+  check("and the counter was spent", player.statusTurns, 2)
+  check("FastAsleepText still goes up",
+    said(b:takeEvents(), "CYNDAQUIL is fast asleep!"), true)
+
+  player.statusTurns = 3
+  check("SLEEP TALK is let through", b:canAct(player, "SLEEP_TALK"), true)
+  check("...and still spends its sleep turn", player.statusTurns, 2)
+  check("...and still prints the line",
+    said(b:takeEvents(), "CYNDAQUIL is fast asleep!"), true)
+  player.statusTurns = 3
+  check("SNORE is let through too", b:canAct(player, "SNORE"), true)
+  b:takeEvents()
+
+  -- The wake-up arm is not a bypass: it answers for the whole turn.
+  player.statusTurns = 1
+  check("the last sleep turn wakes up", b:canAct(player, "SLEEP_TALK"), true)
+  check("and clears the status", player.status, nil)
+
+  player.status, player.statusTurns = "sleep", 5
+  local hpBefore = wild.hp
+  b:useMove(player, wild, "SLEEP_TALK")
+  b:takeEvents()
+  check("SLEEP TALK pays its own PP through doturn", player.moves[1].pp, 9)
+  check("but the move it calls pays none (ResetTurn)", player.moves[2].pp, 35)
+  check("and that move really landed", wild.hp < hpBefore, true)
+  check("ClearLastMove leaves no last move (used_move_text.asm:30-36)",
+    b:volatile(player).lastMove, nil)
+
+  -- .check_two_turn_move (sleep_talk.asm:117-141) drops the five charge
+  -- effects and EFFECT_BIDE, so a mon with nothing else fails.
+  local b2, player2, wild2 = sleeper({
+    { id = "SLEEP_TALK", pp = 10, maxPp = 10 },
+    { id = "SOLARBEAM", pp = 10, maxPp = 10 } })
+  player2.status, player2.statusTurns = "sleep", 5
+  b2:useMove(player2, wild2, "SLEEP_TALK")
+  check("a two-turn move is never sampled",
+    said(b2:takeEvents(), "But it failed!"), true)
+  check("and nothing was called", b2:volatile(player2).chargeMove, nil)
+
+  -- BattleCommand_SleepTalk's own `and SLP_MASK / jr z, .fail` (:16-19).
+  local b3, player3, wild3 = sleeper({
+    { id = "SLEEP_TALK", pp = 10, maxPp = 10 },
+    { id = "TACKLE", pp = 35, maxPp = 35 } })
+  b3:useMove(player3, wild3, "SLEEP_TALK")
+  check("an awake SLEEP TALK fails",
+    said(b3:takeEvents(), "But it failed!"), true)
+
+  -- BattleCommand_Snore (move_effects/snore.asm:1-9) is the same refusal.
+  local b4, player4, wild4 = sleeper({ { id = "SNORE", pp = 15, maxPp = 15 } })
+  local snoreBefore = wild4.hp
+  b4:useMove(player4, wild4, "SNORE")
+  check("an awake SNORE fails", said(b4:takeEvents(), "But it failed!"), true)
+  check("and deals nothing", wild4.hp, snoreBefore)
+  player4.status, player4.statusTurns = "sleep", 5
+  b4:useMove(player4, wild4, "SNORE")
+  b4:takeEvents()
+  check("a sleeping SNORE hits", wild4.hp < snoreBefore, true)
+end)()
+
+-- ------------------------------------------- fainted mons stop participating
+--
+-- UpdateFaintedPlayerMon RESET_FLAGs wBattleParticipantsNotFainted
+-- (engine/battle/core.asm:2551-2556) and .EvenlyDivideExpAmongParticipants
+-- divides by the count of set bits (:7118-7130), so the survivor of a lost
+-- lead collects a whole share, not half of one.
+;(function()
+  local function twoMonBattle()
+    local one = Mon.new(DATA, "CYNDAQUIL", 20, { dvs = perfect })
+    one.moves = { { id = "TACKLE", pp = 35, maxPp = 35 } }
+    local two = Mon.new(DATA, "CYNDAQUIL", 20, { dvs = perfect })
+    two.moves = { { id = "TACKLE", pp = 35, maxPp = 35 } }
+    local wild = Mon.new(DATA, "PIDGEY", 20, { dvs = perfect })
+    wild.moves = { { id = "TACKLE", pp = 35, maxPp = 35 } }
+    local b = Battle.new({ data = DATA, party = { one, two }, wild = wild,
+      random = zeroRandom })
+    b:takeEvents()
+    return b, one, two, wild
+  end
+
+  local b, one, two, wild = twoMonBattle()
+  check("the lead starts as a participant", b.participants[1], true)
+  one.hp = 0
+  b:resolveFaints()
+  b:takeEvents()
+  check("a fainted participant drops out", b.participants[1], nil)
+
+  -- The clear is one-shot: GiveExperiencePoints' `.done` falls through
+  -- ResetBattleParticipants into AddBattleParticipant (:7116, :3033-3037) and
+  -- puts the dead slot's bit back, and nothing takes it off again.
+  local oneShot = twoMonBattle()
+  oneShot.player.hp = 0
+  oneShot:resolveFaints()
+  oneShot:takeEvents()
+  oneShot:resetParticipants()
+  oneShot:resolveFaints()
+  oneShot:takeEvents()
+  check("and the cart's own re-add survives a second pass",
+    oneShot.participants[1], true)
+
+  b:switch(2)
+  b:takeEvents()
+  check("the replacement is a participant", b.participants[2], true)
+  check("...and the fainted lead is not", b.participants[1], nil)
+  local before = two.experience
+  wild.hp = 0
+  b:resolveFaints()
+  b:takeEvents()
+  local shared = two.experience - before
+
+  -- The control: the same KO with the same mon as the only party member.
+  local solo = Mon.new(DATA, "CYNDAQUIL", 20, { dvs = perfect })
+  solo.moves = { { id = "TACKLE", pp = 35, maxPp = 35 } }
+  local soloWild = Mon.new(DATA, "PIDGEY", 20, { dvs = perfect })
+  soloWild.moves = { { id = "TACKLE", pp = 35, maxPp = 35 } }
+  local soloBattle = Battle.new({ data = DATA, party = { solo },
+    wild = soloWild, random = zeroRandom })
+  soloBattle:takeEvents()
+  local soloBefore = solo.experience
+  soloWild.hp = 0
+  soloBattle:resolveFaints()
+  soloBattle:takeEvents()
+  check("the survivor gets a whole share, not half",
+    shared, solo.experience - soloBefore)
+  check("and the share is a real number", shared > 0, true)
+end)()
+
+-- BattleCommand_BellyDrum (engine/battle/move_effects/belly_drum.asm): the
+;(function()
+  local function said(events, text)
+    for _, e in ipairs(events) do
+      if e.kind == "message" and e.text == text then return true end
+    end
+    return false
+  end
+  local function drumBattle()
+    local player = Mon.new(DATA, "CYNDAQUIL", 20, { dvs = perfect })
+    player.moves = { { id = "BELLY_DRUM", pp = 10, maxPp = 10 } }
+    local wild = Mon.new(DATA, "PIDGEY", 20, { dvs = perfect })
+    wild.moves = { { id = "TACKLE", pp = 35, maxPp = 35 } }
+    local b = Battle.new({ data = DATA, party = { player }, wild = wild,
+      random = zeroRandom })
+    b:takeEvents()
+    return b, player, wild
+  end
+
+  local b, player, wild = drumBattle()
+  player.maxHp, player.hp = 40, 40
+  b:useMove(player, wild, "BELLY_DRUM")
+  local events = b:takeEvents()
+  check("Belly Drum pays half the max HP", player.hp, 20)
+  check("and maximizes ATTACK", b.stages.player.attack, 6)
+  check("with BellyDrumText's second box",
+    said(events, "maximized ATTACK!"), true)
+
+  -- CheckUserHasEnoughHP (engine/battle/core.asm:1930) returns the borrow, so
+  local half, halfPlayer, halfWild = drumBattle()
+  halfPlayer.maxHp, halfPlayer.hp = 40, 20
+  half:useMove(halfPlayer, halfWild, "BELLY_DRUM")
+  check("exactly half HP refuses the move", halfPlayer.hp, 20)
+  check("...and says so", said(half:takeEvents(), "But it failed!"), true)
+  check("but the opening attackup2 is kept", half.stages.player.attack, 2)
+
+  local low, lowPlayer, lowWild = drumBattle()
+  lowPlayer.maxHp, lowPlayer.hp = 40, 19
+  low:useMove(lowPlayer, lowWild, "BELLY_DRUM")
+  check("below half refuses it too", lowPlayer.hp, 19)
+
+  local capped, cappedPlayer, cappedWild = drumBattle()
+  cappedPlayer.maxHp, cappedPlayer.hp = 40, 40
+  capped.stages.player.attack = 6
+  capped:useMove(cappedPlayer, cappedWild, "BELLY_DRUM")
+  check("a maxed ATTACK costs no HP", cappedPlayer.hp, 40)
+  check("and leaves the stage where it was", capped.stages.player.attack, 6)
+  check("with the failure line",
+    said(capped:takeEvents(), "But it failed!"), true)
+
+  -- GetHalfMaxHP floors (engine/battle/core.asm:1821).
+  local odd, oddPlayer, oddWild = drumBattle()
+  oddPlayer.maxHp, oddPlayer.hp = 21, 21
+  odd:useMove(oddPlayer, oddWild, "BELLY_DRUM")
+  check("an odd max HP floors the cost", oddPlayer.hp, 11)
+end)()
+
+-- BattleCommand_Attract (engine/battle/move_effects/attract.asm), the
+-- SUBSTATUS_IN_LOVE arm of CheckPlayerTurn (effect_commands.asm:291-310) and
+-- BreakAttraction (engine/battle/core.asm:3871).
+;(function()
+  local function said(events, text)
+    for _, e in ipairs(events) do
+      if e.kind == "message" and e.text == text then return true end
+    end
+    return false
+  end
+  local femaleDvs = { attack = 0, defense = 15, speed = 15, special = 15 }
+  femaleDvs.hp = Mon.hpDV(femaleDvs)
+  check("a 0 Attack DV PIDGEY is female",
+    Mon.new(DATA, "PIDGEY", 20, { dvs = femaleDvs }).gender, "female")
+  check("and the perfect one is male",
+    Mon.new(DATA, "PIDGEY", 20, { dvs = perfect }).gender, "male")
+  check("MAGNEMITE has no gender at all",
+    Mon.new(DATA, "MAGNEMITE", 20, { dvs = perfect }).gender, "unknown")
+
+  local function attractBattle(species, dvs, userSpecies)
+    local player = Mon.new(DATA, userSpecies or "CYNDAQUIL", 20,
+      { dvs = perfect })
+    player.moves = { { id = "ATTRACT", pp = 15, maxPp = 15 },
+      { id = "TACKLE", pp = 35, maxPp = 35 } }
+    local bench = Mon.new(DATA, "TOTODILE", 20, { dvs = perfect })
+    bench.moves = { { id = "TACKLE", pp = 35, maxPp = 35 } }
+    local wild = Mon.new(DATA, species, 20, { dvs = dvs })
+    wild.moves = { { id = "TACKLE", pp = 35, maxPp = 35 } }
+    local b = Battle.new({ data = DATA, party = { player, bench },
+      wild = wild, random = zeroRandom })
+    b:takeEvents()
+    return b, player, wild
+  end
+
+  local b, player, wild = attractBattle("PIDGEY", femaleDvs)
+  b:useMove(player, wild, "ATTRACT")
+  check("ATTRACT infatuates the opposite sex", b:volatile(wild).attract, true)
+  check("with FellInLoveText",
+    said(b:takeEvents(), b:monName(wild) .. "\nfell in love!"), true)
+  b:useMove(player, wild, "ATTRACT")
+  check("a second ATTRACT on the same target fails",
+    said(b:takeEvents(), "But it failed!"), true)
+
+  local same, samePlayer, sameWild = attractBattle("PIDGEY", perfect)
+  same:useMove(samePlayer, sameWild, "ATTRACT")
+  check("same sex sets nothing", same:volatile(sameWild).attract, nil)
+  check("and fails outright",
+    said(same:takeEvents(), "But it failed!"), true)
+
+  local none, nonePlayer, noneWild = attractBattle("MAGNEMITE", perfect)
+  none:useMove(nonePlayer, noneWild, "ATTRACT")
+  check("a genderless target sets nothing",
+    none:volatile(noneWild).attract, nil)
+
+  local selfless, selflessPlayer, selflessWild =
+    attractBattle("PIDGEY", femaleDvs, "MAGNEMITE")
+  selfless:useMove(selflessPlayer, selflessWild, "ATTRACT")
+  check("a genderless user sets nothing",
+    selfless:volatile(selflessWild).attract, nil)
+
+  local turn, turnPlayer, turnWild = attractBattle("PIDGEY", femaleDvs)
+  turn:volatile(turnPlayer).attract = true
+  turn.random = maxRandom
+  check("a high byte keeps the mon from attacking",
+    turn:canAct(turnPlayer, "TACKLE"), false)
+  local lostEvents = turn:takeEvents()
+  check("the in-love line opens on the user", said(lostEvents,
+    turn:monName(turnPlayer) .. "\nis in love with"), true)
+  check("and scrolls onto the target", said(lostEvents,
+    "is in love with\n" .. turn:monName(turnWild) .. "!"), true)
+  check("InfatuationText opens on the user", said(lostEvents,
+    turn:monName(turnPlayer) .. "'s\ninfatuation kept"), true)
+  check("and scrolls onto the refusal", said(lostEvents,
+    "infatuation kept\nit from attacking!"), true)
+  -- constants/text_constants.asm:32
+  local widest = 0
+  for _, e in ipairs(lostEvents) do
+    if e.kind == "message" then
+      local rows = 0
+      for row in (e.text .. "\n"):gmatch("([^\n]*)\n") do
+        rows = rows + 1
+        widest = math.max(widest, #row)
+      end
+      check("every infatuated box is at most two rows", rows <= 2, true)
+    end
+  end
+  check("and no row overflows the message box", widest <= 18, true)
+  turn.random = zeroRandom
+  check("a low byte lets the move go",
+    turn:canAct(turnPlayer, "TACKLE"), true)
+  local keptEvents = turn:takeEvents()
+  check("but the in-love pair still prints", said(keptEvents,
+    turn:monName(turnPlayer) .. "\nis in love with"), true)
+  check("both halves of it", said(keptEvents,
+    "is in love with\n" .. turn:monName(turnWild) .. "!"), true)
+  check("and nothing was kept from attacking", said(keptEvents,
+    "infatuation kept\nit from attacking!"), false)
+
+  local sw, swPlayer, swWild = attractBattle("PIDGEY", femaleDvs)
+  sw:useMove(swPlayer, swWild, "ATTRACT")
+  sw:volatile(swPlayer).attract = true
+  sw:volatile(swWild).attract = true
+  sw:takeEvents()
+  sw:switch(2)
+  check("the mon that left drops its own", (swPlayer.volatile or {}).attract,
+    nil)
+  check("and the one that stayed loses it too",
+    sw:volatile(swWild).attract, nil)
 end)()
 
 print(("gen2 battle: %d checks, %d failures"):format(checks, failures))

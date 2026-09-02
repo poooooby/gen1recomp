@@ -62,10 +62,19 @@ function love.conf(t)
     t.window.minheight = 360
   end
   t.version = love._os == "iOS" and "12.0" or "11.5"
+  -- Driver vsync stays on everywhere (including KMSDRM handhelds) so
+  -- PresentSync can probe cadence and pace via the panel.  Turning it off
+  -- here bypassed that stack and forced the FrameCap 1 ms polling loop.
   t.window.vsync = 1
   t.modules.audio = not companion
   t.modules.joystick = not companion
   t.modules.physics = false
+  -- love.sensor exposes raw accelerometer/gyroscope data (love.sensor.getData),
+  -- independent of t.accelerometerjoystick below (which instead maps the
+  -- accelerometer onto joystick axes and stays off -- see that flag's
+  -- comment for why). Explicit here so a future effect (e.g. a tilt-driven
+  -- reflective-screen look) has sensor data available without reviving #468.
+  t.modules.sensor = true
 
   -- love.system is not loaded during love.conf; love._os is set by the
   -- engine before conf runs (LÖVE 11.x / 11.5).

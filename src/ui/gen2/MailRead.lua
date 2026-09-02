@@ -90,12 +90,10 @@ end
 
 function MailRead:drawWidescreen(winW, winH)
   local G = love.graphics
-  G.setColor(1, 1, 1, 1)
-  G.rectangle("fill", 0, 0, winW, winH)
+  Chrome.letterbox(winW, winH, 1, 1, 1)
   local scale = Chrome.fitScale(winW, winH)
   G.push()
-  G.translate(math.floor((winW - 160 * scale) / 2),
-    math.floor((winH - 144 * scale) / 2))
+  G.translate(Chrome.fitOrigin(winW, winH, scale))
   G.scale(scale, scale)
   self:drawPanel()
   G.pop()

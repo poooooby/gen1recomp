@@ -1,6 +1,7 @@
 -- The evolution movie (engine/movie/evolution.asm): the mon's pic
 -- flashes back and forth with the evolved form, speeding up, then the
--- new form appears with its cry and the congratulations text.
+-- new form appears with its cry and the "evolved into" text
+-- (engine/pokemon/evos_moves.asm:120-128).
 -- pokered engine/movie/evolution.asm (Evolution_CheckForCancel) polls the
 -- joypad during the flash: a fresh B press aborts the evolution -- the mon
 -- keeps its species and _StoppedEvolvingText ("Huh? MON stopped evolving!")
@@ -9,14 +10,19 @@
 -- and stone evolutions, where the B press is read but thrown away because
 -- ItemUseEvoStone left wForceEvolution set (#290).
 
-local Font = require("src.render.Font")
 local Music = require("src.core.Music")
-local Strings = require("src.core.Strings")
 local romText = require("src.core.RomText")
 
+-- Not opaque: ClearScreenArea wipes rows 0-11 only (evos_moves.asm:126-128),
+-- so the "is evolving!" box beneath stays visible through the flash (#1596).
 local EvolutionState = {}
 EvolutionState.__index = EvolutionState
-EvolutionState.isOpaque = true
+
+local PIC_LOAD_FRAMES = 84
+-- evolution.asm EvolveMon delays 80 frames before .animLoop, polling nothing (#968, #1031)
+local CANCEL_GRACE_FRAMES = 80
+local ANIM_LOOP_FRAMES = 288
+local FLASH_FRAMES = CANCEL_GRACE_FRAMES + ANIM_LOOP_FRAMES
 
 -- SGB: SetPal_PokemonWholeScreen for the mon on display
 function EvolutionState:sgbPalettes(game)
@@ -33,7 +39,8 @@ function EvolutionState:sgbPalettes(game)
   -- every COLORS mode honest for free: OG RED short-circuits every name to the
   -- one global boot-ROM palette (a Game Boy Color ignores the SGB packets, so
   -- it never blacks out) and the mono modes replace it in effectiveColors.
-  if not self.done then
+  -- ../pokered/engine/movie/evolution.asm:23-26, :49-50
+  if not self.done and self.t >= CANCEL_GRACE_FRAMES then
     local black = P.pal(game.data, "BLACK")
     if black then return { P.whole(black) } end
   end
@@ -45,15 +52,6 @@ function EvolutionState:sgbPalettes(game)
   if c then return { P.whole(c) } end
   return P.wholeNamed(game.data, "MEWMON")
 end
-
--- evolution.asm EvolveMon delays 80 frames before .animLoop, polling nothing (#968, #1031)
-local CANCEL_GRACE_FRAMES = 80
--- .animLoop starts at `lb bc, $1, $10` and runs 8 iterations: iteration k holds
--- the old pic for c = 18-2k frames inside Evolution_CheckForCancel (72 in all),
--- then Evolution_BackAndForthAnim swaps b = k times, each swap a pair of
--- Evolution_ChangeMonPic that end in Delay3 (6 frames a swap, 216 in all).
-local ANIM_LOOP_FRAMES = 288
-local FLASH_FRAMES = CANCEL_GRACE_FRAMES + ANIM_LOOP_FRAMES
 
 -- which pic is on screen t frames into .animLoop
 local function evoShowsNew(t)
@@ -95,11 +93,95 @@ function EvolutionState.new(game, mon, newSpecies, onDone, via)
   self.t = 0
   self.done = false
   self.canceled = false
-  Music.play(game.data, Music.special(game.data, "evolution"))
+  -- engine/movie/evolution.asm:12-19
+  Music.stop()
+  require("src.core.Sound").play(game.data, "Tink")
+  self.loading = PIC_LOAD_FRAMES
+  self.crySrc = nil
+  self.cryT = 0
+  self.cryWait = false
   return self
 end
 
+-- engine/movie/evolution.asm:39-46
+function EvolutionState:beginCry()
+  self.crySrc = require("src.core.Sound").playCry(self.game.data, self.mon.species)
+  self.cryT = 0
+  self.cryWait = self.crySrc ~= nil
+  if not self.cryWait then
+    Music.play(self.game.data, Music.special(self.game.data, "evolution"))
+  end
+end
+
+-- engine/movie/evolution.asm:68-74
+function EvolutionState:beginDoneCry(species)
+  Music.stop()
+  self.endCrySrc = require("src.core.Sound").playCry(self.game.data, species)
+  self.endCryT = 0
+  self.endCryWait = self.endCrySrc ~= nil
+  if not self.endCryWait then self:pushDoneText() end
+end
+
+-- engine/pokemon/evos_moves.asm:136-153, :293
+function EvolutionState:pushDoneText()
+  local game = self.game
+  local TextBox = require("src.render.TextBox")
+  if self.canceled then
+    game.stack:push(TextBox.new(game,
+      romText(game.data, "_StoppedEvolvingText",
+        "Huh? %s\nstopped evolving!", self.oldName),
+      function()
+        Music.restoreMap(game.data)
+        game.stack:pop()
+        if self.onDone then self.onDone() end
+      end))
+    return
+  end
+  local Evolution = require("src.pokemon.Evolution")
+  local newName = game.data.pokemon[self.newSpecies].name
+  -- engine/pokemon/evos_moves.asm:136-153
+  local msg = romText(game.data, "_EvolvedText", "%s evolved", self.oldName)
+    .. romText(game.data, "_IntoText", "\ninto %s!", newName)
+  game.stack:push(TextBox.new(game, msg,
+    function()
+      Music.restoreMap(game.data)
+      game.stack:pop()
+      -- engine/pokemon/evos_moves.asm:212 (#12)
+      Evolution.learnEvolutionMoves(game, self.mon, self.onDone)
+    end,
+    TextBox.soundOpts(game, "Get_Item2")))
+end
+
 function EvolutionState:update(dt)
+  -- engine/movie/evolution.asm:20-40
+  if self.loading then
+    self.loading = self.loading - 1
+    if self.loading > 0 then return end
+    self.loading = nil
+    self:beginCry()
+    return
+  end
+  if self.cryWait then
+    self.cryT = self.cryT + 1
+    local src = self.crySrc
+    local playing = src and src.isPlaying and src:isPlaying()
+    if self.cryT >= 3 and (not playing or self.cryT > 180) then
+      self.cryWait, self.crySrc = false, nil
+      Music.play(self.game.data, Music.special(self.game.data, "evolution"))
+    end
+    return
+  end
+  -- home/pokemon.asm:145-149
+  if self.endCryWait then
+    self.endCryT = self.endCryT + 1
+    local src = self.endCrySrc
+    local playing = src and src.isPlaying and src:isPlaying()
+    if self.endCryT >= 3 and (not playing or self.endCryT > 180) then
+      self.endCryWait, self.endCrySrc = false, nil
+      self:pushDoneText()
+    end
+    return
+  end
   self.t = self.t + 1
   if self.done then return end
   local game = self.game
@@ -109,45 +191,24 @@ function EvolutionState:update(dt)
      and game.input:wasPressed("b") then
     self.done = true
     self.canceled = true
-    local TextBox = require("src.render.TextBox")
-    game.stack:push(TextBox.new(game,
-      romText(game.data, "_StoppedEvolvingText",
-        "Huh? %s\nstopped evolving!", self.oldName),
-      function()
-        Music.restoreMap(game.data)
-        game.stack:pop() -- the evolution screen itself
-        if self.onDone then self.onDone() end
-      end))
+    -- evolution.asm:89-94
+    self:beginDoneCry(self.mon.species)
     return
   end
   if self.t >= FLASH_FRAMES then
     self.done = true
     local Evolution = require("src.pokemon.Evolution")
     Evolution.apply(game, self.mon, self.newSpecies, self.via)
-    require("src.core.Sound").playCry(game.data, self.newSpecies)
-    local TextBox = require("src.render.TextBox")
-    local newName = game.data.pokemon[self.newSpecies].name
-    -- _EvolvedText extracts truncated (it stops at a dynamic marker the
-    -- decoder does not follow), so the engine's wording stands here
-    game.stack:push(TextBox.new(game,
-      Strings("Congratulations!\nYour %s\nevolved into\n%s!",
-              self.oldName, newName),
-      function()
-        Music.restoreMap(game.data)
-        game.stack:pop() -- the evolution screen itself
-        -- Gen1 re-runs the level-up learn check on the evolved species
-        -- after the "evolved into" text (evos_moves.asm EvolveMon ->
-        -- learn_move.asm LearnMoveFromLevelUp, #12).  Pop the evo screen
-        -- first so the "learned MOVE!" text / forget prompt push onto the
-        -- overworld / battle-return, not this state.
-        Evolution.learnEvolutionMoves(game, self.mon, self.onDone)
-      end))
+    self:beginDoneCry(self.newSpecies)
   end
 end
 
 function EvolutionState:draw()
   love.graphics.setColor(1, 1, 1, 1)
-  love.graphics.rectangle("fill", 0, 0, 160, 144)
+  -- rows 0-11 only (hlcoord 0,0 / lb bc, 12, 20, evos_moves.asm:126-128)
+  love.graphics.rectangle("fill", 0, 0, 160, 96)
+  -- engine/movie/evolution.asm:20-40
+  if self.loading then return end
 
   -- accelerating flash between the two forms
   local sprite, spriteTrueColor
@@ -172,14 +233,6 @@ function EvolutionState:draw()
       require("src.render.PaletteFX").markTrueColor(x, y, sprite:getDimensions())
     end
   end
-
-  love.graphics.setColor(0, 0, 0, 1)
-  if not self.done then
-    Font.draw(Strings("What?"), 8, 104)
-    Font.draw(self.oldName .. " is", 8, 114)
-    Font.draw(Strings("evolving!"), 8, 124)
-  end
-  love.graphics.setColor(1, 1, 1, 1)
 end
 
 return EvolutionState

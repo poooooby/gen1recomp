@@ -79,7 +79,11 @@ local Save = {}
 --           that already has savings banked therefore starts buying from the
 --           bottom of the list, which is what a cartridge whose owner had
 --           saved that much would also do.
-Save.FORMAT = 7
+--   7 -> 8  Crystal caught data: a mon carrying a caught level but no landmark
+--           is zeroed, so the Seer takes ReadCaughtData's `.error` arm
+--           (../pokecrystal/engine/events/poke_seer.asm:103-104) instead of
+--           GetCaughtLocation's "Unknown".  #1929
+Save.FORMAT = 8
 
 Save.MAX_MONEY = 999999
 Save.MAX_COINS = 9999
@@ -133,10 +137,33 @@ local function fs()
   return love.filesystem
 end
 
--- The blank-name fallback is the first PlayerNameArray row, which differs
--- per edition -- data/player_names.asm:12-23.
-function Save.defaultPlayerName(version)
-  return (version or GameVersion.get()) == "silver" and "SILVER" or "GOLD"
+-- The first PlayerNameArray row -- pokegold data/player_names.asm:12-22, and
+-- Crystal's gender-split arrays at data/player_names.asm:12-16, :31-35.
+Save.DEFAULT_PLAYER_NAMES = {
+  gold = "GOLD",
+  silver = "SILVER",
+  crystal = "CHRIS",
+}
+
+-- FemalePlayerNameArray's first row, the `.Kris` dname NamePlayer falls back to
+-- (data/player_names.asm:31-32, engine/menus/intro_menu.asm:768-781).
+Save.DEFAULT_PLAYER_NAMES_FEMALE = {
+  crystal = "KRIS",
+}
+
+-- wPlayerGender as this save spells it (constants/ram_constants.asm:176-177).
+function Save.isFemale(save)
+  local player = type(save) == "table" and save.player
+  return (player and player.gender) == "female"
+end
+
+function Save.defaultPlayerName(version, gender)
+  version = version or GameVersion.get()
+  if gender == "female" then
+    local female = Save.DEFAULT_PLAYER_NAMES_FEMALE[version]
+    if female then return female end
+  end
+  return Save.DEFAULT_PLAYER_NAMES[version] or "GOLD"
 end
 
 -- A fresh Gen 2 save.  `opts` carries what the intro collected: player name,
@@ -148,10 +175,13 @@ function Save.newGame(opts)
     version = GameVersion.get(),
     generation = 2,
     player = {
-      name = opts.playerName or Save.defaultPlayerName(),
+      name = opts.playerName
+        or Save.defaultPlayerName(nil, opts.gender or "male"),
       -- _ResetWRAM rolls wPlayerID out of hRandomSub/hRandomAdd
       -- (engine/menus/intro_menu.asm:41-49).
       id = opts.trainerId or rand(0, 65535),
+      -- InitCrystalData zeroes wPlayerGender before InitGender is even offered
+      -- (engine/menus/init_gender.asm:1-6).
       gender = opts.gender or "male",
       money = 3000,
       coins = 0,
@@ -220,6 +250,9 @@ function Save.newGame(opts)
     phoneContacts = {},
     tradeFlags = {},
     pokedex = { seen = {}, caught = {} },
+    -- wLastDexMode (engine/pokedex/pokedex.asm:59-61): the sort mode the
+    -- #DEX reopens in.  NEW_MODE is the cart's zero byte.
+    lastDexMode = "NEW",
     -- wUnownDex: the distinct Unown FORMS caught, in catching order.  A second
     -- record beside the #DEX because the #DEX knows only the species
     -- (src/core/gen2/Unown.lua).
@@ -269,25 +302,33 @@ Save.DEFAULT_OPTIONS = {
   -- uses (src/core/SaveData.lua) and they drive the same shared modules, so
   -- a player's display and speed choices mean the same thing in both games.
   speed = 1,                -- GameSpeed.LEVELS multiplier, logic only
+  -- graphics performance tier: auto | high | balanced | low.  "auto" is the
+  -- Gen 1 save's own default (src/core/SaveData.lua); same key, same module.
+  performance = "auto",
   zoom = 0,                 -- Zoom offset from the window's fit scale
   tilt = 0,                 -- Tilt.LEVELS degrees, 0 = off
-  gbcfx = 0,                -- GBCFX ladder, 0 = off
   -- COLOR: GbcPalette.MODES.  "gbc" is the cart's own palettes and the
   -- default -- this is a Game Boy Color game, so colour is ON out of the box
   -- and the other two rungs are the deliberate step DOWN to a grey or green
   -- Game Boy.  The Gen 1 save's equivalent key is `colors` (SGB packs), which
   -- means something different, hence the different name.
   color = "gbc",
+  palette = "",
   videoMode = "windowed",
   fpsCap = 60,
+  -- BATTLE SIZE (#1709): fixed | fill
+  battleFit = "fixed",
+  battleBg = "white",
   -- VOID FILL: fade | water | trees | black.  fade is each map header's own
   -- border block with the dissolve across a boundary (#1418).
   voidFill = "fade",
+  uiLetterbox = "auto",
   musicVol = 7,             -- 0-7, like the GB's NR50 master volume
   sfxVol = 7,               -- 0-7
   musicFilter = 0,          -- low-pass steps, 0 = off
   haptics = "light",
   touchControls = { enabled = true },
+  screenPos = "center",
 }
 
 function Save.defaultOptions()
@@ -308,7 +349,8 @@ end
 Save.OPTIONS_KEY = "gold"
 
 local SHARED_KEYS = {
-  touchControls = true, haptics = true,
+  touchControls = true, haptics = true, screenPos = true,
+  videoMode = true,
   mods = true, modsByVersion = true, modsGen2 = true,
   modOptions = true, modProfiles = true, modProfilesSeeded = true,
   activeProfile = true,
@@ -327,12 +369,9 @@ function Save.loadOptions(fs)
   end
   if type(loaded) == "table" then
     for key in pairs(SHARED_KEYS) do
-      if loaded[key] ~= nil then options[key] = loaded[key] end
-    end
-  end
-  if type(stored) == "table" then
-    for key in pairs(SHARED_KEYS) do
-      if options[key] == nil and stored[key] ~= nil then
+      if loaded[key] ~= nil then
+        options[key] = loaded[key]
+      elseif type(stored) == "table" and stored[key] ~= nil then
         options[key] = stored[key]
       end
     end
@@ -375,6 +414,67 @@ local function normalizePokerus(mons)
   end
 end
 
+-- constants/pokemon_data_constants.asm:79, :90
+local function normalizeMoves(mons)
+  for _, mon in ipairs(mons or {}) do
+    if type(mon) == "table" and type(mon.moves) == "table" then
+      local rebuilt = false
+      for i, entry in ipairs(mon.moves) do
+        if type(entry) ~= "table" then
+          mon.moves[i] = { id = entry, pp = (mon.pp or {})[i] }
+          rebuilt = true
+        end
+      end
+      if rebuilt then mon.pp = nil end
+    end
+  end
+end
+
+-- ../pokecrystal/ram/sram.asm:140 sGSBallFlag.  nil is the cleared byte.
+Save.GS_BALL_STATES = { have = true, given = true, used = true }
+
+local function counter(value)
+  return math.max(0, math.floor(tonumber(value) or 0))
+end
+
+-- ../pokecrystal/ram/sram.asm:138 "SRAM Crystal Data", created on demand the
+-- way Mail.state creates sPartyMail, so a Crystal handler can index freely.
+function Save.crystalState(save)
+  local crystal = save.crystal or {}
+  save.crystal = crystal
+  if crystal.celebiCaught == nil then crystal.celebiCaught = false end
+  crystal.beasts = crystal.beasts or {}
+  -- ../pokecrystal/ram/wram.asm:3342 wBuenasPassword, :3343 wBlueCardBalance.
+  local buena = crystal.buenaPassword or {}
+  crystal.buenaPassword = buena
+  buena.prizesToday = counter(buena.prizesToday)
+  buena.streak = counter(buena.streak)
+  -- ../pokecrystal/engine/events/move_tutor.asm:1 MoveTutor.
+  crystal.moveTutor = crystal.moveTutor or {}
+  if crystal.moveTutor.used == nil then crystal.moveTutor.used = false end
+  -- ../pokecrystal/ram/wram.asm:3445 wUnlockedUnowns.
+  crystal.unownWords = crystal.unownWords or {}
+  -- ../pokecrystal/engine/menus/intro_menu.asm:69-70
+  crystal.mapSign = crystal.mapSign or { prev = "LANDMARK_NEW_BARK_TOWN" }
+  return crystal
+end
+
+-- ../pokecrystal/ram/sram.asm:147 "SRAM Battle Tower".  `reward` stays nil
+-- until one is won, which is sBattleTowerReward's zero byte (:160).
+function Save.battleTowerState(save)
+  local tower = save.battleTower or {}
+  save.battleTower = tower
+  -- ../pokecrystal/ram/sram.asm:155 sNrOfBeatenBattleTowerTrainers.
+  tower.streak = counter(tower.streak)
+  tower.best = counter(tower.best)
+  -- ../pokecrystal/ram/sram.asm:150 sBattleTowerChallengeState: 0 normal, 2 tower.
+  tower.challenge = counter(tower.challenge)
+  -- ../pokecrystal/ram/sram.asm:162 sBTMonOfTrainers.
+  tower.prevTeams = tower.prevTeams or {}
+  if tower.inChallenge == nil then tower.inChallenge = false end
+  return tower
+end
+
 -- Fill in anything a save (or an older save) is missing, so callers can index
 -- freely.  Runs on both newGame and load.
 function Save.normalize(save)
@@ -386,7 +486,11 @@ function Save.normalize(save)
   end
   save.generation = 2
   save.player = save.player or {}
-  save.player.name = save.player.name or Save.defaultPlayerName(save.version)
+  -- _ResetWRAM leaves wPlayerGender at 0, PLAYERGENDER_MALE, and Gold never
+  -- writes it -- constants/ram_constants.asm:177.
+  save.player.gender = save.player.gender or "male"
+  save.player.name = save.player.name
+    or Save.defaultPlayerName(save.version, save.player.gender)
   save.player.id = save.player.id or rand(0, 65535)
   save.player.money = math.max(0, math.min(save.player.money or 0, Save.MAX_MONEY))
   save.player.coins = math.max(0, math.min(save.player.coins or 0, Save.MAX_COINS))
@@ -458,6 +562,12 @@ function Save.normalize(save)
   save.playTime = save.playTime
     or { hours = 0, minutes = 0, seconds = 0, frames = 0 }
   save.rtc = save.rtc or {}
+  -- ../pokecrystal/ram/sram.asm:138,147: both regions are Crystal's own, so a
+  -- Gold or Silver file never grows either key.
+  if GameVersion.engine(save.version) == "crystal" then
+    Save.crystalState(save)
+    Save.battleTowerState(save)
+  end
   -- HallOfFame.record fills in the count and the roster list, and trims a
   -- roster that a corrupt file grew past NUM_HOF_TEAMS -- the same guard the
   -- party gets below, for the same reason.
@@ -471,8 +581,12 @@ function Save.normalize(save)
     table.remove(save.party)
   end
   normalizePokerus(save.party)
+  normalizeMoves(save.party)
   for _, box in pairs(save.boxes) do
-    if type(box) == "table" then normalizePokerus(box) end
+    if type(box) == "table" then
+      normalizePokerus(box)
+      normalizeMoves(box)
+    end
   end
   -- move_mon.asm:143-149: a mon the player owns carries wPlayerID; saves
   -- written before the stamp existed get it here.
@@ -539,6 +653,30 @@ Save.MIGRATIONS = {
     if save.mom.whichItem == nil then save.mom.whichItem = 0 end
     if save.mom.triggerBalance == nil then
       save.mom.triggerBalance = MomShopping.MOM_MONEY
+    end
+  end,
+  -- ../pokecrystal/engine/events/poke_seer.asm:103-104
+  [7] = function(save)
+    local Mon = require("src.battle.gen2.Mon")
+    if not Mon.hasCaughtData(save.version) then return end
+    local function clear(mon)
+      if type(mon) ~= "table" or mon.isEgg then return end
+      if (tonumber(mon.caughtLocation) or 0) ~= 0 then return end
+      mon.caughtTime, mon.caughtLevel = 0, 0
+      mon.caughtLocation, mon.caughtByGender = 0, "boy"
+    end
+    for _, mon in ipairs(save.party or {}) do clear(mon) end
+    for _, box in pairs(save.boxes or {}) do
+      if type(box) == "table" then
+        for _, mon in ipairs(box) do clear(mon) end
+      end
+    end
+    local dc = save.dayCare
+    if type(dc) == "table" then
+      for _, which in ipairs({ "man", "lady" }) do
+        local side = dc[which]
+        if type(side) == "table" then clear(side.mon) end
+      end
     end
   end,
 }
@@ -684,6 +822,12 @@ function Save.validate(save)
   scrubEvents(save, report)
   scrubMapScenes(save, report)
   scrubPlayerState(save, report)
+  -- wLastDexMode: only the three modes the #DEX has (PokedexMenu MODES);
+  -- a hand-edited value falls back to NEW_MODE, the cart's zero byte
+  if save.lastDexMode ~= "NEW" and save.lastDexMode ~= "OLD"
+     and save.lastDexMode ~= "A-Z" then
+    save.lastDexMode = "NEW"
+  end
   -- The `mailmsg` structs get the same treatment for the same reason: their
   -- `type` byte is an item id nothing else in the save vouches for, and a
   -- party key outside 1..6 or a MAILBOX past MAILBOX_CAPACITY is a region the

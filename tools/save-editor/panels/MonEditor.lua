@@ -147,13 +147,73 @@ local function drawDvRows(S, Kit, mon, cx, rowY, colW, rowH, rowGap)
   end
 end
 
+-- engine/pokemon/caught_data.asm:168-199
+local CAUGHT_BY = { { "-", "none" }, { "BOY", "boy" }, { "GIRL", "girl" } }
+
+local function drawCaughtRows(S, Kit, mon, cx, y, inner, row)
+  local s = Kit.scale
+  local chipH = 22 * s
+  local gap = 6 * s
+  local tinyH = Kit.textHeight("tiny")
+
+  Kit.text("tiny", "CAUGHT", cx, y + (row - tinyH) / 2, PAL.caption)
+  local timeX = cx + 62 * s
+  local timeW = math.max(34 * s, (cx + inner - timeX - 3 * gap) / 4)
+  for i, label in ipairs(Ops.CAUGHT_TIMES) do
+    if Kit.chip(timeX + (i - 1) * (timeW + gap), y + (row - chipH) / 2,
+        timeW, chipH, label, (mon.caughtTime or 0) == i - 1, PAL.blue, PAL.steel) then
+      Ops.setCaughtTime(S, mon, i - 1)
+    end
+  end
+  y = y + row + gap
+
+  local btn = 24 * s
+  local lvX = cx + inner - 2 * btn - gap
+  if Kit.stepper(lvX, y + (row - btn) / 2, btn, btn, "-", { font = "small" }) then
+    Ops.setCaughtLevel(S, mon, (mon.caughtLevel or 0) - 1)
+  end
+  if Kit.stepper(lvX + btn + gap, y + (row - btn) / 2, btn, btn, "+",
+      { font = "small" }) then
+    Ops.setCaughtLevel(S, mon, (mon.caughtLevel or 0) + 1)
+  end
+  Kit.textRight("tiny", ("MET LV %d"):format(mon.caughtLevel or 0), lvX - 10 * s,
+    y + (row - tinyH) / 2, PAL.text)
+  Kit.text("tiny", "OT", cx, y + (row - tinyH) / 2, PAL.caption)
+  local otX = cx + 26 * s
+  local otW = math.max(30 * s, (inner * 0.42 - 26 * s - 2 * gap) / 3)
+  for i, pair in ipairs(CAUGHT_BY) do
+    if Kit.chip(otX + (i - 1) * (otW + gap), y + (row - chipH) / 2, otW, chipH,
+        pair[1], (mon.caughtByGender or "none") == pair[2], PAL.blue, PAL.steel) then
+      Ops.setCaughtByGender(S, mon, pair[2])
+    end
+  end
+  y = y + row + gap
+
+  local whereX = cx + inner - 3 * btn - 2 * gap
+  if Kit.stepper(whereX, y + (row - btn) / 2, btn, btn, "-", { font = "small" }) then
+    Ops.setCaughtLocation(S, mon, (mon.caughtLocation or 0) - 1)
+  end
+  if Kit.stepper(whereX + btn + gap, y + (row - btn) / 2, btn, btn, "+",
+      { font = "small" }) then
+    Ops.setCaughtLocation(S, mon, (mon.caughtLocation or 0) + 1)
+  end
+  if Kit.button(whereX + 2 * (btn + gap), y + (row - btn) / 2, btn, btn, "0",
+      { kind = "danger", font = "micro", radius = 6 * s }) then
+    Ops.setCaughtLocation(S, mon, 0)
+  end
+  local where = ("WHERE %s"):format(Gen.landmarkName(S.data, mon.caughtLocation or 0))
+  Kit.text("tiny", Kit.ellipsize("tiny", where, whereX - 10 * s - cx), cx,
+    y + (row - tinyH) / 2, PAL.text)
+  return y + row + gap
+end
+
 local function drawMoveRows(S, Kit, mon, rightX, rowY, colW, rowH, rowGap)
   local s = Kit.scale
   for slot = 1, 4 do
     local ry = rowY + (slot - 1) * (rowH + rowGap)
     Theme.row(rightX, ry, colW, rowH, 10 * s, 0.6)
     local mv = mon.moves and mon.moves[slot]
-    local clear = 24 * s
+    local clear = Kit.tapMin()
     local clearX = rightX + colW - 10 * s - clear
     local ppText = mv and ("PP %d"):format(mv.pp or 0) or ""
     local ppW = Kit.textWidth("tiny", ppText)
@@ -166,9 +226,9 @@ local function drawMoveRows(S, Kit, mon, rightX, rowY, colW, rowH, rowGap)
       mv and PAL.text or PAL.faint)
     Kit.textRight("tiny", ppText, clearX - 10 * s,
       ry + (rowH - Kit.textHeight("tiny")) / 2, PAL.caption)
-    -- the row body cycles, the x empties: two targets, no modal picker
+    -- the row body opens the searchable picker; the x empties the slot
     if Kit.press(rightX, ry, clearX - rightX - 4 * s, rowH) then
-      Ops.cycleMove(S, mon, slot)
+      Ops.openMovePicker(S, Kit, slot)
     end
     if Kit.button(clearX, ry + (rowH - clear) / 2, clear, clear, "x",
         { kind = "danger", font = "tiny", radius = 6 * s }) then
@@ -204,10 +264,10 @@ function MonEditor.draw(S, Kit, x, y, w, h)
   -- text keeps room.
   local narrow = inner < 470 * s
   local sprite = (narrow and 64 or 96) * s
-  local rowH = 30 * s
+  local rowH = math.max(Kit.tapMin(), 30 * s)
   local rowGap = 8 * s
   local cellH = 52 * s
-  local actH = 34 * s
+  local actH = math.max(Kit.tapMin(), 34 * s)
 
   local hw = inner - sprite - 18 * s
   local levelInHeader = hw >= levelRowWidth(Kit, mon)
@@ -231,6 +291,7 @@ function MonEditor.draw(S, Kit, x, y, w, h)
   -- the field + Set row
   local extraH = 0
   if Gen.ofState(S) == 2 then extraH = 88 * s end
+  if Gen.hasCaughtData(S.save, S.version) then extraH = extraH + 102 * s end
   local nickFieldH = 30 * s
   local contentH = pad + headerH + 18 * s
     + capH + 10 * s + nickFieldH + 18 * s
@@ -341,7 +402,7 @@ function MonEditor.draw(S, Kit, x, y, w, h)
   local colY = statsY + cellH + 18 * s
   if Gen.ofState(S) == 2 then
     local extraY = colY
-    Kit.caption(cx, extraY, "GOLD")
+    Kit.caption(cx, extraY, Gen.editionLabel(S.save, S.version))
     extraY = extraY + capH + 8 * s
     local row = 28 * s
     Kit.text("tiny", "HELD " .. tostring(mon.item or "none"), cx, extraY, PAL.text)
@@ -371,7 +432,11 @@ function MonEditor.draw(S, Kit, x, y, w, h)
     if mon.unownLetter then bits[#bits + 1] = "Unown " .. tostring(mon.unownLetter) end
     Kit.text("tiny", table.concat(bits, "  ") ~= "" and table.concat(bits, "  ")
       or "gender/shiny follow DVs", cx, extraY, PAL.caption)
-    colY = extraY + 22 * s
+    extraY = extraY + 22 * s
+    if Gen.hasCaughtData(S.save, S.version) then
+      extraY = drawCaughtRows(S, Kit, mon, cx, extraY, inner, row)
+    end
+    colY = extraY
   end
   if narrow then
     -- stacked: DVs first, then moves, then the two actions side by side at
@@ -384,7 +449,7 @@ function MonEditor.draw(S, Kit, x, y, w, h)
 
     local movesY = rowY + colRowsH + 14 * s
     Kit.caption(cx, movesY, "MOVES")
-    Kit.textRight("tiny", "click a slot to cycle", cx + inner, movesY, PAL.caption)
+    Kit.textRight("tiny", "click a slot to search", cx + inner, movesY, PAL.caption)
     local mRowY = movesY + capH + 10 * s
     drawMoveRows(S, Kit, mon, cx, mRowY, inner, rowH, rowGap)
 
@@ -407,7 +472,7 @@ function MonEditor.draw(S, Kit, x, y, w, h)
     Kit.textRight("tiny", ("HP DV auto-derived . %d"):format(mon.dvs.hp or 0),
       cx + colW, colY, PAL.caption)
     Kit.caption(rightX, colY, "MOVES")
-    Kit.textRight("tiny", "click a slot to cycle", rightX + colW, colY, PAL.caption)
+    Kit.textRight("tiny", "click a slot to search", rightX + colW, colY, PAL.caption)
 
     local rowY = colY + capH + 10 * s
     drawDvRows(S, Kit, mon, cx, rowY, colW, rowH, rowGap)

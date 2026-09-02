@@ -32,11 +32,40 @@
 local Assets = require("src.render.Assets")
 local Chrome = require("src.ui.gen2.Chrome")
 local GbcPalette = require("src.render.GbcPalette")
+local HallOfFame = require("src.core.gen2.HallOfFame")
 local Palettes = require("src.world.gen2.Palettes")
 local TileSheet = require("src.ui.gen2.TileSheet")
 local Nests = require("src.core.gen2.Nests")
 local Sound = require("src.core.Sound")
 local Unown = require("src.core.gen2.Unown")
+local Strings = require("src.core.Strings")
+local MenuRepeat = require("src.ui.MenuRepeat")
+local TypeChart = require("src.battle.TypeChart")
+
+-- `db $3b, " OPTION ", $3c` / `db $3b, " SEARCH ", $3c"`: the panel titles
+-- drawn by drawOption/drawSearch below, declared here (rather than inline)
+-- so Strings.source puts them in the catalog harvest.
+local OPTION_LABEL = Strings.source(" OPTION ")
+local SEARCH_LABEL = Strings.source(" SEARCH ")
+local MODE_LABELS = {
+  NEW = Strings.source("NEW"),
+  OLD = Strings.source("OLD"),
+  ["A-Z"] = Strings.source("A-Z"),
+}
+local SEEN_LABEL = Strings.source("SEEN")
+local OWN_LABEL = Strings.source("OWN")
+local HEIGHT_LABEL = Strings.source("HT")
+local WEIGHT_LABEL = Strings.source("WT")
+local SEARCH_TYPE1_LABEL = Strings.source("TYPE1")
+local SEARCH_TYPE2_LABEL = Strings.source("TYPE2")
+local BEGIN_SEARCH_LABEL = Strings.source("BEGIN SEARCH!!")
+local CANCEL_LABEL = Strings.source("CANCEL")
+local NO_SEARCH_RESULTS = Strings.source("No <PK><MN> found!")
+local ENTRY_ACTION_LABEL = Strings.source(" PAGE AREA CRY PRNT")
+local POUND_LABEL = Strings.source("lb")
+local NEST_TITLE = Strings.source("%s'S NEST")
+
+local LIST_DIRS = { "up", "down" }
 
 local PokedexMenu = {}
 PokedexMenu.__index = PokedexMenu
@@ -150,9 +179,15 @@ function PokedexMenu.new(game, opts)
   self.pokemon = opts.pokemon or data.pokemon
   self.palettes = opts.palettes or data.gen2Palettes
   self.onClose = opts.onClose
+  -- InitPokedex: wLastDexMode -> wCurDexMode (engine/pokedex/pokedex.asm:97).
   self.modeIndex = 1
+  for i, name in ipairs(MODES) do
+    if self.save and name == self.save.lastDexMode then self.modeIndex = i end
+  end
   self.index = 1
   self.scroll = 0
+  -- engine/pokedex/pokedex.asm:36-39
+  self.hold = MenuRepeat.new(MenuRepeat.GEN2_DELAY, MenuRepeat.GEN2_RATE)
   self.view = "list" -- list | entry | area | option | search | results | unown
   self.page = 1
   self.entryAction = 1
@@ -317,6 +352,13 @@ function PokedexMenu:cursorVisible()
   return ((self.entryBlink or 0) % 32) < 20
 end
 
+-- Pokedex: wCurDexMode -> wLastDexMode on the way out
+-- (engine/pokedex/pokedex.asm:60), which lives in the saved game data.
+function PokedexMenu:close()
+  if self.save then self.save.lastDexMode = MODES[self.modeIndex] end
+  if self.onClose then self.onClose() end
+end
+
 function PokedexMenu:update(_dt)
   self.entryBlink = (self.entryBlink or 0) + 1
   local input = self.game and self.game.input
@@ -328,8 +370,8 @@ function PokedexMenu:update(_dt)
       if input:wasPressed("a") or input:wasPressed("b") then
         if self.page == 1 then
           self.page = 2
-        elseif self.onClose then
-          self.onClose()
+        else
+          self:close()
         end
       end
       return
@@ -366,8 +408,9 @@ function PokedexMenu:update(_dt)
   if self.view == "option" then return self:updateOption(input) end
   if self.view == "search" then return self:updateSearch(input) end
   if self.view == "unown" then return self:updateUnown(input) end
+  local dir, edge = MenuRepeat.direction(self.hold, input, LIST_DIRS)
   if input:wasPressed("b") then
-    if self.onClose then self.onClose() end
+    self:close()
     return
   elseif input:wasPressed("select") then
     -- Pokedex_UpdateMainScreen: SELECT opens the OPTION screen and START the
@@ -381,12 +424,21 @@ function PokedexMenu:update(_dt)
     self.searchType = self.searchType or { 1, 0 }
     self.searchResults = nil
     return
-  elseif input:wasPressed("up") then
-    self.index = self.index > 1 and self.index - 1 or #self.rows
+  elseif dir == "up" then
+    -- pokedex.asm:982-1011
+    if self.index > 1 then
+      self.index = self.index - 1
+    elseif edge then
+      self.index = #self.rows
+    end
     self:ensureVisible()
     return
-  elseif input:wasPressed("down") then
-    self.index = self.index < #self.rows and self.index + 1 or 1
+  elseif dir == "down" then
+    if self.index < #self.rows then
+      self.index = self.index + 1
+    elseif edge then
+      self.index = 1
+    end
     self:ensureVisible()
     return
   elseif input:wasPressed("a") then
@@ -621,9 +673,9 @@ function PokedexMenu:drawMainBackground()
   self:border(0, 9, 6, 7)
 
   local seen, caught = self:totals()
-  self:text("SEEN", 1, 11)
+  self:text(Strings(SEEN_LABEL), 1, 11)
   self:text(printNumString(seen, 3), 5, 12)
-  self:text("OWN", 1, 14)
+  self:text(Strings(OWN_LABEL), 1, 14)
   self:text(printNumString(caught, 3), 5, 15)
 
   for i, id in ipairs(BOTTOM_CAPTION) do self:tile(id, i, 17) end
@@ -765,7 +817,6 @@ function PokedexMenu:printEntry()
   local row = self:current()
   if not row then return end
   local Printer = require("src.core.Printer")
-  local Strings = require("src.core.Strings")
   local TextBox = require("src.render.TextBox")
   local name = (self.pokemon and self.pokemon[row.species]
     and self.pokemon[row.species].name) or tostring(row.species)
@@ -790,22 +841,9 @@ end
 
 -- ------------------------------------------------------------------- AREA
 --
--- Pokedex_GetArea (engine/pokegear/pokegear.asm) borrows the Pokegear's town
--- map and overlays FindNest's landmarks. The region shown starts as the one the
--- player is standing in; LEFT/RIGHT swap it, which is how you see a Kanto mon's
--- nests from Johto. B goes back to the entry.
+-- engine/pokegear/pokegear.asm:2285, :2322
 function PokedexMenu:areaRegionName()
-  if self.areaRegion then return self.areaRegion end
-  local landmark = self:playerLandmark()
-  return Nests.regionOf(landmark) or "johto"
-end
-
--- The player's landmark index, which is what decides the starting region.
-function PokedexMenu:playerLandmark()
-  local save = self.game and self.game.save
-  local mapId = save and save.position and save.position.map
-  local def = mapId and self.data and self.data.gen2Maps and self.data.gen2Maps[mapId]
-  return def and def.landmark
+  return self.areaRegion or "johto"
 end
 
 -- The Pokegear's own tilemap blit: a flat list of tile ids, row-major over the
@@ -832,9 +870,69 @@ function PokedexMenu:updateArea(input)
     self.view = "entry"
     return
   end
-  if input:wasPressed("left") or input:wasPressed("right") then
-    self.areaRegion = (self:areaRegionName() == "johto") and "kanto" or "johto"
+  if input:wasPressed("left") then
+    self.areaRegion = "johto"
+  elseif input:wasPressed("right") then
+    -- pokegear.asm:2373
+    if HallOfFame.hasEntered(self.game and self.game.save) then
+      self.areaRegion = "kanto"
+    end
   end
+end
+
+-- engine/pokegear/pokegear.asm:2451
+function PokedexMenu:nestIconColors()
+  local set = self.palettes and Palettes.objectSet(self.palettes, "DAY")
+  return (set and set[1])
+    or (self.mapGfx and self.mapGfx.palettes and self.mapGfx.palettes[1])
+end
+
+-- engine/pokegear/pokegear.asm:2298
+function PokedexMenu:drawNestIcon(x, y)
+  if self.nestIcon == nil then
+    self.nestIcon = false
+    local path = self.mapGfx and self.mapGfx.nestIcon
+    if path then
+      local ok, image = pcall(Assets.image, path)
+      if ok and image then self.nestIcon = image end
+    end
+  end
+  local G = love.graphics
+  G.setColor(1, 1, 1, 1)
+  if not self.nestIcon then
+    local ink = self:nestIconColors()
+    local dark = ink and GbcPalette.color(ink, 4) or { 0, 0, 0 }
+    G.setColor(dark[1] / 255, dark[2] / 255, dark[3] / 255, 1)
+    G.rectangle("fill", x + 1, y + 1, 6, 6)
+    G.setColor(1, 1, 1, 1)
+    return
+  end
+  local function body() G.draw(self.nestIcon, x, y) end
+  local colors = self:nestIconColors()
+  if colors and GbcPalette.available() then
+    GbcPalette.withRaw(colors, body)
+  else
+    body()
+  end
+end
+
+-- engine/pokegear/pokegear.asm:2403
+function PokedexMenu:drawAreaHeader(title)
+  local pals = self.mapGfx and self.mapGfx.palettes
+  local pal = pals and pals[1]
+  -- engine/pokedex/pokedex.asm:2459
+  local paper = pal and GbcPalette.color(pal, 4) or { 0, 0, 0 }
+  local G = love.graphics
+  G.setColor(paper[1] / 255, paper[2] / 255, paper[3] / 255, 1)
+  G.rectangle("fill", 0, 0, Chrome.SCREEN_W * 8, 8)
+  G.setColor(1, 1, 1, 1)
+  local sheet = self.mapSheet
+  if sheet then
+    sheet:draw(0x06, 0, 1)
+    for x = 1, Chrome.SCREEN_W - 2 do sheet:draw(0x07, x, 1) end
+    sheet:draw(0x17, Chrome.SCREEN_W - 1, 1)
+  end
+  Chrome.printThrough(title, 2, 0, pal, true, true)
 end
 
 function PokedexMenu:drawArea()
@@ -844,54 +942,22 @@ function PokedexMenu:drawArea()
   local save = self.game and self.game.save
   local nests = Nests.find(self.data, row.species, region, save)
 
-  self:fill(TILE_BG, 0, 0, Chrome.SCREEN_W + 1, Chrome.SCREEN_H)
-
-  -- The map itself is the Pokegear's, drawn through the same gfx the MAP card
-  -- uses. Without it (a cache imported before the town map was extracted) the
-  -- page still lists the landmark NAMES, which is the information the screen
-  -- exists to convey.
   local maps = self.mapGfx and self.mapGfx.maps
   local cells = maps and maps[region]
   if cells then
     self:drawTilemap(cells)
   end
 
-  self:blank(0, 0, Chrome.SCREEN_W, 2)
-  self:text(self:monName(row.species) .. "'S NEST", 1, 0)
-  self:text(region == "kanto" and "KANTO" or "JOHTO", 1, 1)
+  self:drawAreaHeader(Strings(NEST_TITLE, self:monName(row.species)))
 
-  local G = love.graphics
-
-  if #nests == 0 then
-    -- A species with no grass, water or roamer entry in this region. The cart
-    -- simply shows the map with nothing blinking on it.
-    self:text("AREA UNKNOWN", 4, 16)
-    return
-  end
-
-  -- engine/pokegear/pokegear.asm:2427
-  local on = ((self.areaBlink or 0) % 32) < 20
-  if cells and on then
-    for _, index in ipairs(nests) do
-      local mark = Nests.landmark(self.data, index)
-      if mark and mark.x and mark.y then
-        G.setColor(0, 0, 0, 1)
-        G.rectangle("fill", mark.x - 2, mark.y - 2, 5, 5)
-        G.setColor(1, 1, 1, 1)
-        G.rectangle("fill", mark.x - 1, mark.y - 1, 3, 3)
-      end
-    end
-  end
-
-  -- Name the first one in words as well as on the map: the flashing dot is
-  -- unreadable at this size on a modern display, and the landmark name is what
-  -- a player actually wants off this screen.
-  local first = Nests.landmark(self.data, nests[1])
-  if first and first.name then
-    local name = tostring(first.name):gsub("\n", " ")
-    self:text(name, 1, 16)
-    if #nests > 1 then
-      self:text(("+%d"):format(#nests - 1), 17, 16)
+  -- engine/pokegear/pokegear.asm:2385
+  local on = ((self.areaBlink or 0) % 32) < 16
+  if not on then return end
+  for _, index in ipairs(nests) do
+    local mark = Nests.landmark(self.data, index)
+    if mark and mark.x and mark.y then
+      -- engine/pokegear/pokegear.asm:2444
+      self:drawNestIcon(mark.x - 4, mark.y - 4)
     end
   end
 end
@@ -929,7 +995,7 @@ function PokedexMenu:drawEntryBody(row, entry)
   self:tile(0x3b, 0, 17)
   -- _NewPokedexEntry ByteFills the action row away (pokedex.asm:2540-2545).
   if not self.newEntry then
-    self:text(" PAGE AREA CRY PRNT", 1, 17)
+    self:text(Strings(ENTRY_ACTION_LABEL), 1, 17)
     -- Pokedex_InitArrowCursor parks an arrow on the selected action; without it
     -- the four words are decoration and there is no way to tell what A will do.
     --
@@ -962,10 +1028,10 @@ function PokedexMenu:drawEntryBody(row, entry)
 
   -- .Height / .Weight are placeholder strings until the mon is caught:
   -- "HT  ?'??"" at (9,7) and "WT   ???lb" at (9,9).
-  self:text("HT", 9, 7)
-  self:text("WT", 9, 9)
+  self:text(Strings(HEIGHT_LABEL), 9, 7)
+  self:text(Strings(WEIGHT_LABEL), 9, 9)
   self:tile(TILE_FOOT, 14, 7)
-  self:text("lb", 17, 9)
+  self:text(Strings(POUND_LABEL), 17, 9)
 
   if not row.caught then
     self:text("  ?", 11, 7)
@@ -1037,8 +1103,10 @@ function PokedexMenu:drawPlain()
       Chrome.print(("%s  %s"):format(
         Chrome.number(entry.dex or 0, 3, true), self:monName(row.species)), 1, 1)
       Chrome.print(entry.kind or "", 1, 3)
-      Chrome.print("HT " .. printNumString(entry.height or 0, 4, false, 2), 1, 5)
-      Chrome.print("WT " .. printNumString(entry.weight or 0, 5, false, 4), 1, 7)
+      Chrome.print(Strings(HEIGHT_LABEL) .. " "
+        .. printNumString(entry.height or 0, 4, false, 2), 1, 5)
+      Chrome.print(Strings(WEIGHT_LABEL) .. " "
+        .. printNumString(entry.weight or 0, 5, false, 4), 1, 7)
       self:drawPic(row, 12, 1, true)
       Chrome.box(0, 10, 20, 8)
       local ty = 11
@@ -1065,10 +1133,10 @@ function PokedexMenu:drawPlain()
   self:drawPic(self:current(), 13, 1)
   Chrome.box(13, 11, 7, 7)
   local seen, caught = self:totals()
-  Chrome.print(self:mode(), 14, 12)
-  Chrome.print("SEEN", 14, 14)
+  Chrome.print(Strings(MODE_LABELS[self:mode()] or self:mode()), 14, 12)
+  Chrome.print(Strings(SEEN_LABEL), 14, 14)
   Chrome.printRight(tostring(seen), 19, 15)
-  Chrome.print("OWN", 14, 16)
+  Chrome.print(Strings(OWN_LABEL), 14, 16)
   Chrome.printRight(tostring(caught), 19, 17)
 end
 
@@ -1091,14 +1159,18 @@ PokedexMenu.SEARCH_TYPES = {
 -- `#` is the compression byte for POKé, four tiles either way, so the label
 -- is spelled out here the way every other Gen 2 screen in the port spells it.
 PokedexMenu.OPTION_MODES = {
-  { label = "NEW POKéDEX MODE", mode = "NEW",
-    lines = { "<PK><MN> are listed by", "evolution type." } },
-  { label = "OLD POKéDEX MODE", mode = "OLD",
-    lines = { "<PK><MN> are listed by", "official type." } },
-  { label = "A to Z MODE", mode = "A-Z",
-    lines = { "<PK><MN> are listed", "alphabetically." } },
-  { label = "UNOWN MODE", mode = "UNOWN", unown = true,
-    lines = { "UNOWN are listed", "in catching order." } },
+  { label = Strings.source("NEW POKéDEX MODE"), mode = "NEW",
+    lines = { Strings.source("<PK><MN> are listed by"),
+      Strings.source("evolution type.") } },
+  { label = Strings.source("OLD POKéDEX MODE"), mode = "OLD",
+    lines = { Strings.source("<PK><MN> are listed by"),
+      Strings.source("official type.") } },
+  { label = Strings.source("A to Z MODE"), mode = "A-Z",
+    lines = { Strings.source("<PK><MN> are listed"),
+      Strings.source("alphabetically.") } },
+  { label = Strings.source("UNOWN MODE"), mode = "UNOWN", unown = true,
+    lines = { Strings.source("UNOWN are listed"),
+      Strings.source("in catching order.") } },
 }
 
 -- Pokedex_CheckUnlockedUnownMode: `ld a, [wStatusFlags] / bit
@@ -1330,15 +1402,24 @@ end
 function PokedexMenu:searchTypeName(slot)
   local index = self.searchType[slot] or 0
   if index == 0 then return "-----" end
-  return PokedexMenu.SEARCH_TYPES[index] or "-----"
+  local id = PokedexMenu.SEARCH_TYPES[index]
+  return id and TypeChart.displayName(id, self.data) or "-----"
+end
+
+-- Search compares internal type ids, never their translated display names.
+-- Keeping this separate from searchTypeName lets a registry rename and even
+-- reorder the visible label without changing which species the wheel finds.
+function PokedexMenu:searchTypeId(slot)
+  local index = self.searchType[slot] or 0
+  return index ~= 0 and PokedexMenu.SEARCH_TYPES[index] or nil
 end
 
 -- Pokedex_SearchForMons: a mon matches when its two types cover both of the
 -- wanted ones, in either order; "-----" matches anything.  Only SEEN mon are
 -- searched, which is what makes the count meaningful.
 function PokedexMenu:beginSearch()
-  local want1 = self.searchType[1] ~= 0 and self:searchTypeName(1) or nil
-  local want2 = self.searchType[2] ~= 0 and self:searchTypeName(2) or nil
+  local want1 = self:searchTypeId(1)
+  local want2 = self:searchTypeId(2)
   local results = {}
   for _, entry in ipairs(self.rows) do
     if entry.seen then
@@ -1355,7 +1436,7 @@ function PokedexMenu:beginSearch()
   if #results == 0 then
     -- .MenuAction_BeginSearch redraws the search screen and stays put when
     -- nothing matched.
-    self.searchMessage = "No <PK><MN> found!"
+    self.searchMessage = NO_SEARCH_RESULTS
     return
   end
   self.searchMessage = nil
@@ -1374,17 +1455,17 @@ function PokedexMenu:drawOption()
   -- `db $3b, " OPTION ", $3c`: the two end-cap tiles are the dex sheet's, not
   -- font glyphs.
   self:tile(0x3b, 0, 1)
-  self:text(" OPTION ", 1, 1)
+  self:text(Strings(OPTION_LABEL), 1, 1)
   self:tile(0x3c, 9, 1)
   local rows = self:optionRows()
   for i, row in ipairs(rows) do
-    self:text(row.label, 3, 2 + i * 2)
+    self:text(Strings(row.label), 3, 2 + i * 2)
     if i == self.optionIndex then self:text("\xe2\x96\xb6", 2, 2 + i * 2) end
   end
   local current = rows[self.optionIndex]
   if current then
-    self:text(current.lines[1], 1, 14)
-    self:text(current.lines[2], 1, 15)
+    self:text(Strings(current.lines[1]), 1, 14)
+    self:text(Strings(current.lines[2]), 1, 15)
   end
 end
 
@@ -1394,10 +1475,10 @@ function PokedexMenu:drawSearch()
   self:fill(TILE_BG, 0, 0, Chrome.SCREEN_W, Chrome.SCREEN_H)
   self:border(0, 2, 14, 18)
   self:tile(0x3b, 0, 1)
-  self:text(" SEARCH ", 1, 1)
+  self:text(Strings(SEARCH_LABEL), 1, 1)
   self:tile(0x3c, 9, 1)
-  self:text("TYPE1", 3, 4)
-  self:text("TYPE2", 3, 6)
+  self:text(Strings(SEARCH_TYPE1_LABEL), 3, 4)
+  self:text(Strings(SEARCH_TYPE2_LABEL), 3, 6)
   self:text(self:searchTypeName(1), 10, 4)
   self:text(self:searchTypeName(2), 10, 6)
   -- `.TypeLeftRightArrows: db $3d, "        ", $3e` -- two of the dex sheet's
@@ -1406,9 +1487,9 @@ function PokedexMenu:drawSearch()
     self:tile(0x3d, 8, y)
     self:tile(0x3e, 17, y)
   end
-  self:text("BEGIN SEARCH!!", 3, 13)
-  self:text("CANCEL", 3, 15)
-  if self.searchMessage then self:text(self.searchMessage, 3, 10) end
+  self:text(Strings(BEGIN_SEARCH_LABEL), 3, 13)
+  self:text(Strings(CANCEL_LABEL), 3, 15)
+  if self.searchMessage then self:text(Strings(self.searchMessage), 3, 10) end
   local rows = { 4, 6, 13, 15 }
   local y = rows[self.searchIndex] or 4
   self:text("\xe2\x96\xb6", 2, y)
@@ -1447,12 +1528,10 @@ end
 
 function PokedexMenu:drawWidescreen(winW, winH)
   local G = love.graphics
-  G.setColor(0, 0, 0, 1)
-  G.rectangle("fill", 0, 0, winW, winH)
+  Chrome.letterbox(winW, winH, 0, 0, 0)
   local scale = Chrome.fitScale(winW, winH)
   G.push()
-  G.translate(math.floor((winW - 160 * scale) / 2),
-    math.floor((winH - 144 * scale) / 2))
+  G.translate(Chrome.fitOrigin(winW, winH, scale))
   G.scale(scale, scale)
   self:drawPanel()
   G.pop()

@@ -24,6 +24,7 @@ T.eq(GameVersion.generation("blue"), 1, "Blue is Gen 1")
 T.eq(GameVersion.generation("yellow"), 1, "Yellow is Gen 1")
 T.eq(GameVersion.generation("gold"), 2, "Gold is Gen 2")
 T.eq(GameVersion.generation("silver"), 2, "Silver is Gen 2")
+T.eq(GameVersion.generation("crystal"), 2, "Crystal is Gen 2")
 
 -- ------- 2. manifest: gen2compat is opt-in and defaults off
 
@@ -156,7 +157,7 @@ for name, path in pairs({ maps = "gen2Maps", tilesets = "gen2Tilesets",
     "and Gen 1 is untouched by the routing: " .. name)
 end
 
--- The mirror set: six registries that exist because GOLD does.  They carry no
+-- The mirror set: registries that exist because GOLD does.  They carry no
 -- Gen 1 target at all, so the routed path is the only path they ever have, and
 -- Schemas.GEN1 gates them on Red the way Schemas.GEN2 gates `map_scripts` on Gold.
 -- Each is held to a live consumer, which is the claim that matters: a routed
@@ -170,12 +171,14 @@ end
 --   apricorns       src/core/gen2/Apricorns.lua:useRegistry
 --   landmarks       src/core/gen2/Nests.lua:landmarkId / landmark
 --   radio_channels  src/ui/gen2/MapRadio.lua:channelRecord
+--   rom_text        src/core/RomText.lua's label-keyed data.text lookup
 for name, path in pairs({ held_items = "gen2HeldItems",
                           phone_contacts = "gen2PhoneContacts",
                           decorations = "gen2Decorations",
                           apricorns = "gen2Apricorns",
                           landmarks = "gen2Landmarks.landmarks",
-                          radio_channels = "gen2RadioChannels" }) do
+                          radio_channels = "gen2RadioChannels",
+                          rom_text = "text" }) do
   local spec = Schemas.REGISTRIES[name]
   T.check(spec ~= nil, "catalog still has registry: " .. name)
   T.eq(Schemas.targetFor(name, spec, 2), path,
@@ -380,6 +383,9 @@ local GEN2_EVENTS = {
   -- in the party or the box, Evolution.apply after the species swap, both
   -- matching the Gen 1 payload keys
   "pokemon.caught", "pokemon.evolved",
+  -- the arena battle's own result, from src/ui/ArenaState.lua and
+  -- src/ui/gen2/ArenaState.lua with the same five keys
+  "link.battle_ended",
   -- boot, save and the script VM
   "game.ready", "save.created", "save.loaded", "save.loading", "save.writing",
   "script.started", "script.ended",
@@ -395,14 +401,15 @@ local GEN2_HOOKS = {
   -- overworld
   "warp.destination", "movement.collision", "movement.speed",
   "encounter.roll", "encounter.species", "encounter.fishing",
-  "world.tod", "map.palette", "fieldmove.eligibility",
+  "encounter.table", "world.tod", "map.palette", "fieldmove.eligibility",
   -- menus and the battle intro
   "ui.start_menu.items", "ui.title_menu.items", "ui.options.rows",
   "ui.party.submenu", "ui.party.grid_navigation", "ui.naming.grid",
   "ui.pc.items", "ui.list_menu",
   "transition.style",
   -- battle
-  "battle.damage", "battle.crit", "battle.accuracy", "battle.turn_order",
+  "battle.damage", "battle.crit", "battle.accuracy",
+  "battle.charge_required", "battle.turn_order",
   "battle.enemy_action", "battle.run", "battle.exp_award", "exp.gain",
   "catch.rate", "trainer.party",
   -- one wrap cancels or forces an evolution in either game: Gold passes `data`
@@ -423,6 +430,7 @@ local GEN2_HOOKS = {
   -- nextFn gets nil there).
   "battle.catch_exp", "battle.low_health_alarm", "battle.overlay",
   "battle.bottom_ui_visible", "battle.status_hud_visible",
+  "battle.move_grid_navigation",
   -- One pic path resolver for both games: the Gen 1 site is the SHARED
   -- src/pokemon/Sprites.lua and Gold's own battle screen calls the same hook
   -- with the Gen 1 ctx keys plus `letter` and `shiny`, which Red has no
@@ -543,6 +551,10 @@ local GEN2_ONLY_EVENTS = {
 local GEN2_ONLY_HOOKS = {
   "held_item.trigger", "breeding.compatibility", "phone.contact_list",
   "shiny.roll", "gender.roll",
+  -- AI_SwitchOrTryItem's choke point.  Red's AI has no switch or item branch
+  -- at all (src/battle/TrainerAI.lua picks a move and nothing else), so there
+  -- is no Gen 1 site to share the name with.
+  "battle.enemy_switch_or_item",
 }
 
 local sourceCache = {}
@@ -989,6 +1001,87 @@ do
   stack:clear()
   T.eq(stack:top(), nil, "clear empties the stack")
   T.eq(table.concat(order, ","), "c,b,a", "clear unwinds top-first")
+end
+
+-- ------- 7. move_effects: a "full" effect (no standalone handler) is a
+-- valid id, not a dangling reference
+--
+-- src/battle/gen2/Battle.lua's MOVE_EFFECT_RECORDS only carries the effects
+-- that have a standalone handler, by design -- a move whose effect is just
+-- "deal damage" (EFFECT_NORMAL_HIT and friends) falls through to the generic
+-- damage path and has no entry there.  registerMoveEffectsInto has to widen
+-- the id space it registers to match, or every "full" effect the real
+-- movedex uses reads as unresolved the moment any mod's `moves` patch (even
+-- one that only touches `name`) triggers the cross-reference scan.
+do
+  local data = gen2Fixtures()
+  data.moves.FIX_TACKLE.effect = "EFFECT_NORMAL_HIT"
+  -- RomExtractorGen2:extractMoves seeds `data.moves` with `generation`/
+  -- `source` alongside the move records (src/import/RomExtractorGen2.lua),
+  -- so `generation` is the NUMBER 2, not a move -- a real fixture for this
+  -- scan, or it never catches a bare pairs(moves) indexing it as one.
+  data.moves.generation = 2
+  data.moves.source = "ROM:Moves + MoveNames"
+  local run = T.sdk.loadMods({ "mods/fix_refs" }, {
+    fs = T.sdk.memfs(refsFixture([[
+      local mod = ...
+      mod.content.moves:patch("FIX_TACKLE", { name = "SLAP" })
+    ]])),
+    data = data,
+    generation = 2,
+  })
+  local dangling = danglingRefs(run)
+  T.eq(#dangling, 0,
+    "Gen 2: a handler-less effect id (EFFECT_NORMAL_HIT) resolves ("
+      .. table.concat(dangling, "; ") .. ")")
+  T.eq(run.data.moves.FIX_TACKLE.name, "SLAP", "Gen 2: the patch still landed")
+  run.release()
+end
+
+do
+  -- the base ROM data is never wrong here, so the realistic typo is a MOD's
+  -- own patch introducing an effect id nothing seeded -- registerMoveEffectsInto
+  -- only widens the space from data.moves as it stood before the merge, so
+  -- this still has to miss.
+  local data = gen2Fixtures()
+  data.moves.FIX_TACKLE.effect = "EFFECT_NORMAL_HIT"
+  local run = T.sdk.loadMods({ "mods/fix_refs" }, {
+    fs = T.sdk.memfs(refsFixture([[
+      local mod = ...
+      mod.content.moves:patch("FIX_TACKLE", { effect = "EFFECT_NOT_A_REAL_ID" })
+    ]])),
+    data = data,
+    generation = 2,
+  })
+  local dangling = danglingRefs(run)
+  T.eq(#dangling, 1,
+    "Gen 2: widening the id space does not stop catching a mod's real typo")
+  T.check(dangling[1] and dangling[1]:match("move_effects"),
+    "Gen 2: and the report still names move_effects")
+  run.release()
+end
+
+do
+  -- RomExtractorGen2:extractMoves' `effect = effects[row[2] + 1] or row[2]`
+  -- falls back to the raw effect BYTE (a number) when the ROM's value has no
+  -- name in the manifest's moveEffectOrder -- so `move` being a real record
+  -- table does not guarantee `move.effect` is a string. registry:register
+  -- asserts its id is a non-empty string; passing it a number would take the
+  -- whole boot down the same way the `generation`/`source` case above did.
+  local data = gen2Fixtures()
+  data.moves.FIX_TACKLE.effect = 27
+  local ok = pcall(function()
+    local run = T.sdk.loadMods({ "mods/fix_refs" }, {
+      fs = T.sdk.memfs(refsFixture([[
+        local mod = ...
+        mod.content.moves:patch("FIX_TACKLE", { name = "SLAP" })
+      ]])),
+      data = data,
+      generation = 2,
+    })
+    run.release()
+  end)
+  T.check(ok, "Gen 2: a numeric effect byte with no manifest name does not crash the boot")
 end
 
 -- Without this the file printed its FAILs and exited 0, so the runner marked

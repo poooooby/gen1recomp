@@ -28,31 +28,78 @@
 local Bag = require("src.inventory.Bag")
 local Chrome = require("src.ui.gen2.Chrome")
 local Logger = require("src.core.Logger")
+local PcItems = require("src.core.gen2.PcItems")
 local Runtime = require("src.mods.Runtime")
 local Screens = require("src.ui.Screens")
 local Sound = require("src.core.Sound")
+local Strings = require("src.core.Strings")
+local Typer = require("src.ui.gen2.Typer")
+local WaitPlaySFX = require("src.ui.gen2.WaitPlaySFX")
 
 local ItemPcMenu = {}
 ItemPcMenu.__index = ItemPcMenu
-ItemPcMenu.isOpaque = true
+-- ../pokecrystal/engine/events/pokecenter_pc.asm:231
+ItemPcMenu.isOpaque = false
+
+-- ../pokecrystal/engine/events/pokecenter_pc.asm:330
+local CLEARS_SCREEN = { withdraw = true, deposit = true, toss = true }
 
 -- MAX_PC_ITEMS stacks of at most MAX_ITEM_STACK (constants/item_constants.asm),
 -- the same pair src/core/gen2/MomShopping.lua enforces for Mom's deliveries.
 local PC_ITEM_CAPACITY = 50
 local MAX_STACK = 99
 
+local function stacksFor(n) return math.ceil((n or 0) / MAX_STACK) end
+
 -- PlayersPCMenuData .PlayersPCMenuPointers strings, verbatim.  .WhichPC picks
 -- which rows a caller sees: PLAYERSPC_NORMAL ends on LOG OFF, PLAYERSPC_HOUSE
 -- carries DECORATION and ends on TURN OFF.
 local ENTRIES = {
-  { id = "withdraw", label = "WITHDRAW ITEM" },
-  { id = "deposit", label = "DEPOSIT ITEM" },
-  { id = "toss", label = "TOSS ITEM" },
-  { id = "mailbox", label = "MAIL BOX" },
+  { id = "withdraw", label = Strings.source("WITHDRAW ITEM"), builtin = true },
+  { id = "deposit", label = Strings.source("DEPOSIT ITEM"), builtin = true },
+  { id = "toss", label = Strings.source("TOSS ITEM"), builtin = true },
+  { id = "mailbox", label = Strings.source("MAIL BOX"), builtin = true },
 }
-local LOG_OFF = { id = "logoff", label = "LOG OFF" }
-local DECORATION = { id = "decoration", label = "DECORATION" }
-local TURN_OFF = { id = "turnoff", label = "TURN OFF" }
+local LOG_OFF = {
+  id = "logoff", label = Strings.source("LOG OFF"), builtin = true,
+}
+local DECORATION = {
+  id = "decoration", label = Strings.source("DECORATION"), builtin = true,
+}
+local TURN_OFF = {
+  id = "turnoff", label = Strings.source("TURN OFF"), builtin = true,
+}
+
+-- _PlayersPC's player-facing text. Dynamic item names are format arguments,
+-- not catalog keys, so registry-provided names remain untouched while a
+-- language may reorder the quantity/name around them.
+local TEXT = {
+  turnedOn = Strings.source("{PLAYER} turned on\nthe PC."),
+  noBagRoom = Strings.source("There's no room\nfor more items."),
+  withdrew = Strings.source("Withdrew %d\n%s(S)."),
+  withdrawHowMany = Strings.source("How many do you\nwant to withdraw?"),
+  noPcRoom = Strings.source("There's no room to\nstore items."),
+  deposited = Strings.source("Deposited %d\n%s(S)."),
+  noItems = Strings.source("No items here!"),
+  depositHowMany = Strings.source("How many do you\nwant to deposit?"),
+  tooImportant = Strings.source("That's too impor-\ntant to toss out!"),
+  tossHowMany = Strings.source("Toss out how many\n%s(S)?"),
+  throwAway = Strings.source("Throw away %d\n%s(S)?"),
+  discarded = Strings.source("Discarded\n%s(S)."),
+  whatDo = Strings.source("What do you want\nto do?"),
+}
+
+local function translatedLines(source, ...)
+  local lines = {}
+  for line in (Strings(source, ...) .. "\n"):gmatch("(.-)\n") do
+    lines[#lines + 1] = line
+  end
+  return lines
+end
+
+local function translatedPages(source, ...)
+  return { translatedLines(source, ...) }
+end
 
 -- ui.pc.items identity: an unhooked build hands its own list back.
 local function sameItems(_, items) return items end
@@ -60,11 +107,19 @@ local function sameItems(_, items) return items end
 -- PCItemsJoypad's ScrollingMenu is `db 4, 8 ; rows, columns`.
 local VISIBLE_ROWS = 4
 
+-- .PCItemsMenuData is menu_coords 4, 1 (engine/events/pokecenter_pc.asm:641),
+-- and ScrollingMenu_UpdateDisplay (engine/menus/scrolling_menu.asm:359) adds
+local LIST_X = 5
+
 -- charmap.asm: the quantity glyph.
 local TIMES = "\xc3\x97"
 
 function ItemPcMenu:wantsFillScale() return true end
-function ItemPcMenu:drawsWidescreen() return true end
+
+function ItemPcMenu:setPhase(phase)
+  self.phase = phase
+  self.isOpaque = CLEARS_SCREEN[phase] or false
+end
 
 -- opts: save, items (items.lua), house (PLAYERSPC_HOUSE: boot text,
 --       DECORATION row, TURN OFF), events (wEventFlags, for the decoration
@@ -103,7 +158,7 @@ function ItemPcMenu.new(game, opts)
   entries[#entries + 1] = self.house and TURN_OFF or LOG_OFF
   self.entries = entries
   self.index = 1
-  self.phase = "menu"
+  self:setPhase("menu")
   self.rows = {}
   self.listIndex = 1
   self.scroll = 0
@@ -112,8 +167,8 @@ function ItemPcMenu.new(game, opts)
   self.confirm = nil
   if self.house then
     -- _PlayersHousePC: PC_PlayBootSound, then PlayersPCTurnOnText.
-    self:playSfx("Sfx_BootPc")
-    self:say({ { "{PLAYER} turned on", "the PC." } })
+    self:playPcSfx("Sfx_BootPc")
+    self:say(translatedPages(TEXT.turnedOn))
   end
   return self
 end
@@ -126,6 +181,27 @@ function ItemPcMenu:playSfx(name)
   end
 end
 
+-- engine/events/pokecenter_pc.asm:200
+function ItemPcMenu:playPcSfx(name)
+  Sound.waitSfxDone()
+  self:playSfx(name)
+end
+
+-- engine/events/pokecenter_pc.asm:195
+function ItemPcMenu:playPcSfxTwice(name)
+  self:playPcSfx(name)
+  self.repeatSfx = WaitPlaySFX.arm(name)
+end
+
+function ItemPcMenu:tickRepeatSfx()
+  local pending = self.repeatSfx
+  if not pending then return false end
+  if WaitPlaySFX.waiting(pending) then return true end
+  self.repeatSfx = nil
+  self:playPcSfx(pending.name)
+  return false
+end
+
 function ItemPcMenu:playerName()
   local player = self.save and self.save.player
   return (player and player.name) or "GOLD"
@@ -135,14 +211,16 @@ end
 -- one runs onDone.  The item PC's messages never log off by themselves, which
 -- is _PlayersPC's `.loop`: a refusal drops back into the same menu.
 function ItemPcMenu:say(pages, onDone)
-  self.message = { pages = pages, page = 1, onDone = onDone }
+  Typer.say(self, pages, onDone, { expand = function(line)
+    return (line:gsub("{PLAYER}", self:playerName()))
+  end })
 end
 
 function ItemPcMenu:close()
   -- _PlayersHousePC plays PC_PlayShutdownSound only on the unchanged arm;
   -- `.changed_deco_tiles` leaves for the map reload without it.
   if self.house and not self.changedDecorations then
-    self:playSfx("Sfx_ShutDownPc")
+    self:playPcSfx("Sfx_ShutDownPc")
   end
   if self.onClose then self.onClose(self.changedDecorations) end
 end
@@ -161,25 +239,28 @@ function ItemPcMenu:cantToss(id)
   return def ~= nil and def.canToss == false
 end
 
+-- engine/events/pokecenter_pc.asm:647
 function ItemPcMenu:rebuild()
   local pc = (self.save and self.save.pcItems) or {}
+  local order = self.save and PcItems.order(self.save, self.items) or {}
   local rows = {}
-  for id, count in pairs(pc) do
-    if (count or 0) > 0 then
+  for slot = 1, #order do
+    local id = order[slot]
+    local count = pc[id] or 0
+    if count > 0 then
       local def = self:def(id)
-      rows[#rows + 1] = {
-        id = id, count = count,
-        name = (def and def.name) or id,
-        index = def and def.index or math.huge,
-      }
+      local remaining = count
+      while remaining > 0 do
+        local n = math.min(remaining, MAX_STACK)
+        rows[#rows + 1] = {
+          id = id, count = n,
+          name = (def and def.name) or id,
+          slot = slot,
+        }
+        remaining = remaining - n
+      end
     end
   end
-  -- wPCItems keeps acquisition order; without that recorded, item id order is
-  -- the stable choice, the same sort the PACK uses.
-  table.sort(rows, function(a, b)
-    if a.index ~= b.index then return a.index < b.index end
-    return a.id < b.id
-  end)
   self.rows = rows
   if self.listIndex > #rows + 1 then self.listIndex = #rows + 1 end
   if self.listIndex < 1 then self.listIndex = 1 end
@@ -200,20 +281,18 @@ function ItemPcMenu:ensureVisible()
     math.max(0, self:listTotal() - VISIBLE_ROWS)))
 end
 
--- ReceiveItem over wPCItems: a new id needs one of the fifty stacks, a grown
--- one may not pass 99.  False is the no-carry the deposit turns into
+-- ReceiveItem over wPCItems: the add tops up every existing stack of that id
+-- and spills the rest into a new one, so it only needs a free stack when the
+-- room in place is short.  False is the no-carry the deposit turns into
 -- _PlayersPCNoRoomDepositText.
+-- engine/items/items.asm:156 PutItemInPocket
 function ItemPcMenu:pcAdd(id, qty)
   local pc = self.save.pcItems
   local held = pc[id] or 0
-  if held == 0 then
-    local stacks = 0
-    for _, count in pairs(pc) do
-      if (count or 0) > 0 then stacks = stacks + 1 end
-    end
-    if stacks >= PC_ITEM_CAPACITY then return false end
-  end
-  if held + qty > MAX_STACK then return false end
+  local used = 0
+  for _, count in pairs(pc) do used = used + stacksFor(count) end
+  local need = stacksFor(held + qty) - stacksFor(held)
+  if used + need > PC_ITEM_CAPACITY then return false end
   pc[id] = held + qty
   return true
 end
@@ -261,18 +340,18 @@ function ItemPcMenu:withdraw(row, qty)
   -- PlayerWithdrawItemMenu .withdraw: ReceiveItem into the bag first; only a
   -- carry tosses the stack out of the PC.
   if not Bag.add(self.save, row.id, qty, self.data) then
-    self:say({ { "There's no room", "for more items." } })
+    self:say(translatedPages(TEXT.noBagRoom))
     return
   end
   self:pcRemove(row.id, qty)
   self:rebuild()
-  self:say({ { ("Withdrew %d"):format(qty), row.name .. "(S)." } })
+  self:say(translatedPages(TEXT.withdrew, qty, row.name))
 end
 
 function ItemPcMenu:chooseWithdraw()
   local row = self.rows[self.listIndex]
   if not row then
-    self.phase = "menu"
+    self:setPhase("menu")
     return
   end
   -- .Submenu: an item without a quantity attribute (a KEY ITEM in the PC) is
@@ -282,27 +361,27 @@ function ItemPcMenu:chooseWithdraw()
     return
   end
   self:askQuantity(row.count,
-    { "How many do you", "want to withdraw?" },
+    translatedLines(TEXT.withdrawHowMany),
     function(qty) self:withdraw(row, qty) end)
 end
 
 function ItemPcMenu:deposit(id, name, qty)
   if not self:pcAdd(id, qty) then
-    self:say({ { "There's no room to", "store items." } })
+    self:say(translatedPages(TEXT.noPcRoom))
     return
   end
   Bag.remove(self.save, id, qty)
   if self.pack then self.pack:rebuild() end
-  self:say({ { ("Deposited %d"):format(qty), name .. "(S)." } })
+  self:say(translatedPages(TEXT.deposited, qty, name))
 end
 
 function ItemPcMenu:enterDeposit()
   -- .CheckItemsInBag: an empty bag never opens the PACK.
   if bagIsEmpty(self.save) then
-    self:say({ { "No items here!" } })
+    self:say(translatedPages(TEXT.noItems))
     return
   end
-  self.phase = "deposit"
+  self:setPhase("deposit")
   -- DepositSellPack: the PACK as a chooser, held and drawn by this screen the
   -- way the mart holds its sell PACK.  `world = {}` keeps field items inert.
   self.pack = Screens.build(self.game, "Gen2PackMenu", {
@@ -316,43 +395,46 @@ end
 
 function ItemPcMenu:leaveDeposit()
   self.pack = nil
-  self.phase = "menu"
+  self:setPhase("menu")
 end
 
 function ItemPcMenu:offerToDeposit(id, count)
-  -- .TryDepositItem's `.no_toss` arm is a bare ret: a KEY ITEM or HM stays in
-  -- the bag with no message at all.
-  if self:cantToss(id) then return end
   if (count or 0) < 1 then return end
   local def = self:def(id)
   local name = (def and def.name) or id
+  -- .DepositItem (engine/events/pokecenter_pc.asm:504): an item with no
+  -- quantity is always x1 and never reaches .AskQuantity.
+  if self:cantToss(id) then
+    self:deposit(id, name, 1)
+    return
+  end
   self:askQuantity(count,
-    { "How many do you", "want to deposit?" },
+    translatedLines(TEXT.depositHowMany),
     function(qty) self:deposit(id, name, qty) end)
 end
 
 function ItemPcMenu:chooseToss()
   local row = self.rows[self.listIndex]
   if not row then
-    self.phase = "menu"
+    self:setPhase("menu")
     return
   end
   -- TossItemFromPC .key_item -> .CantToss.
   if self:cantToss(row.id) then
-    self:say({ { "That's too impor-", "tant to toss out!" } })
+    self:say(translatedPages(TEXT.tooImportant))
     return
   end
   self:askQuantity(row.count,
-    { "Toss out how many", row.name .. "(S)?" },
+    translatedLines(TEXT.tossHowMany, row.name),
     function(qty)
       -- .ItemsThrowAwayText's yes/no sits between the count and the toss.
       self.confirm = {
-        prompt = { ("Throw away %d"):format(qty), row.name .. "(S)?" },
+        prompt = translatedLines(TEXT.throwAway, qty, row.name),
         choice = 1,
         onYes = function()
           self:pcRemove(row.id, qty)
           self:rebuild()
-          self:say({ { "Discarded", row.name .. "(S)." } })
+          self:say(translatedPages(TEXT.discarded, row.name))
         end,
       }
     end)
@@ -365,9 +447,11 @@ function ItemPcMenu:choose()
   if not entry then return end
   local game = self.game
   if entry.id == "withdraw" or entry.id == "toss" then
-    self.phase = entry.id
+    self:setPhase(entry.id)
     self.listIndex = 1
     self.scroll = 0
+    -- engine/events/pokecenter_pc.asm:569
+    self.switching = nil
     self:rebuild()
     return
   end
@@ -399,17 +483,62 @@ function ItemPcMenu:choose()
   self:close()
 end
 
+
+-- engine/events/pokecenter_pc.asm:622
+-- engine/items/switch_items.asm:27
+function ItemPcMenu:armSwitch()
+  if not self.rows[self.listIndex] then return end
+  self.switching = self.listIndex
+end
+
+-- engine/events/pokecenter_pc.asm:604
+function ItemPcMenu:updateSwitch(input)
+  if input:wasPressed("up") then
+    self.listIndex = self.listIndex > 1 and self.listIndex - 1
+      or self:listTotal()
+    self:ensureVisible()
+  elseif input:wasPressed("down") then
+    self.listIndex = self.listIndex < self:listTotal() and self.listIndex + 1
+      or 1
+    self:ensureVisible()
+  elseif input:wasPressed("a") or input:wasPressed("select") then
+    self:placeSwitch()
+  elseif input:wasPressed("b") then
+    -- engine/events/pokecenter_pc.asm:615
+    self.switching = nil
+  end
+end
+
+-- engine/events/pokecenter_pc.asm:620
+-- engine/items/switch_items.asm:12
+function ItemPcMenu:placeSwitch()
+  local held = self.rows[self.switching]
+  local target = self.rows[self.listIndex]
+  self:playPcSfxTwice("Sfx_SwitchPokemon")
+  if not target then return end
+  if held and self.save and target.slot ~= held.slot then
+    PcItems.move(self.save, held.id, target.slot, self.items)
+    self:rebuild()
+  end
+  self.switching = nil
+end
+
 -- ------------------------------------------------------------------- update
 
 function ItemPcMenu:update(_dt)
   local input = self.game and self.game.input
   if not input then return end
 
+  -- engine/events/pokecenter_pc.asm:195
+  if self:tickRepeatSfx() then return end
+
   if self.message then
+    Typer.step(self)
+    if Typer.typing(self) then return end
     if input:wasPressed("a") or input:wasPressed("b") then
       local m = self.message
       if m.page < #m.pages then
-        m.page = m.page + 1
+        Typer.turn(self, m)
         return
       end
       self.message = nil
@@ -442,9 +571,12 @@ function ItemPcMenu:update(_dt)
     if input:wasPressed("up") or input:wasPressed("down") then
       c.choice = c.choice == 1 and 2 or 1
     elseif input:wasPressed("b") then
+      -- home/menu.asm:345
+      self:playSfx("Sfx_ReadText2")
       self.confirm = nil
       if c.onNo then c.onNo() end
     elseif input:wasPressed("a") then
+      self:playSfx("Sfx_ReadText2")
       self.confirm = nil
       if c.choice == 1 then
         if c.onYes then c.onYes() end
@@ -459,12 +591,16 @@ function ItemPcMenu:update(_dt)
     if self.pack then
       self.pack:update(_dt)
     else
-      self.phase = "menu"
+      self:setPhase("menu")
     end
     return
   end
 
   if self.phase == "withdraw" or self.phase == "toss" then
+    if self.switching then
+      self:updateSwitch(input)
+      return
+    end
     if input:wasPressed("up") then
       self.listIndex = self.listIndex > 1 and self.listIndex - 1
         or self:listTotal()
@@ -474,13 +610,19 @@ function ItemPcMenu:update(_dt)
         or 1
       self:ensureVisible()
     elseif input:wasPressed("b") then
-      self.phase = "menu"
+      -- engine/menus/scrolling_menu.asm:24
+      self:playSfx("Sfx_ReadText2")
+      self:setPhase("menu")
+      self.switching = nil
     elseif input:wasPressed("a") then
+      self:playSfx("Sfx_ReadText2")
       if self.phase == "withdraw" then
         self:chooseWithdraw()
       else
         self:chooseToss()
       end
+    elseif input:wasPressed("select") then
+      self:armSwitch()
     end
     return
   end
@@ -490,9 +632,12 @@ function ItemPcMenu:update(_dt)
   elseif input:wasPressed("down") then
     self.index = self.index < #self.entries and self.index + 1 or 1
   elseif input:wasPressed("a") then
+    -- home/menu.asm:476
+    self:playSfx("Sfx_ReadText2")
     self:choose()
   elseif input:wasPressed("b") then
     -- DoNthMenu's carry is `.turn_off`.
+    self:playSfx("Sfx_ReadText2")
     self:close()
   end
 end
@@ -511,19 +656,29 @@ end
 
 function ItemPcMenu:drawList()
   Chrome.box(0, 0, 20, 12)
+  -- engine/events/pokecenter_pc.asm:628 .a_1 -> home/menu.asm:50
+  -- engine/events/pokecenter_pc.asm:605 .moving_stuff_around
+  local picked = not self.switching
+    and (self.message or self.qtyState or self.confirm) and true or false
   for row = 1, VISIBLE_ROWS do
     local i = row + self.scroll
     local ty = row * 2
     if i <= #self.rows then
       local entry = self.rows[i]
-      if i == self.listIndex then Chrome.cursor(5, ty) end
-      Chrome.print(entry.name, 6, ty)
-      -- PlaceMenuItemQuantity (engine/menus/menu_2.asm:24): the xNN is the
-      -- entry's second line, right-aligned in a blank-padded 2-digit field.
-      Chrome.print(TIMES .. Chrome.number(entry.count, 2), 7, ty + 1)
+      -- home/menu.asm:50
+      if i == self.listIndex then
+        Chrome.cursor(LIST_X - 1, ty, picked)
+      elseif i == self.switching then
+        Chrome.cursor(LIST_X - 1, ty, true)
+      end
+      Chrome.print(entry.name, LIST_X, ty)
+      -- PlaceMenuItemQuantity (engine/menus/menu_2.asm:18, :24)
+      if not self:cantToss(entry.id) then
+        Chrome.print(TIMES .. Chrome.number(entry.count, 2), LIST_X + 9, ty + 1)
+      end
     elseif i == self:listTotal() then
-      if i == self.listIndex then Chrome.cursor(5, ty) end
-      Chrome.print("CANCEL", 6, ty)
+      if i == self.listIndex then Chrome.cursor(LIST_X - 1, ty, picked) end
+      Chrome.print(Strings("CANCEL"), LIST_X, ty)
     end
   end
   -- UpdateItemDescription under the list.
@@ -542,7 +697,8 @@ function ItemPcMenu:drawList()
 end
 
 function ItemPcMenu:drawPanel()
-  Chrome.clear()
+  -- ../pokecrystal/engine/pokemon/bills_pc_top.asm:231
+  if self.isOpaque then Chrome.clear() end
 
   if self.phase == "deposit" and self.pack then
     self.pack:drawPanel()
@@ -552,31 +708,33 @@ function ItemPcMenu:drawPanel()
     -- _PlayersPCAskWhatDoText, printed under the list the whole time.  The
     -- box goes down first: the menu window overlays it where the house's
     -- six-row list runs past row 12, the way the cart's windows stack.
-    self:drawBottomLines({ "What do you want", "to do?" })
+    self:drawBottomLines(translatedLines(TEXT.whatDo))
     -- PlayersPCMenuData is menu_coords 0, 0, 15, 12; the house list is one
     -- row taller than that box, so size it to the entries.
     Chrome.box(0, 0, 16, math.max(12, #self.entries * 2 + 2))
     for i, entry in ipairs(self.entries) do
       local ty = i * 2
       if i == self.index then Chrome.cursor(1, ty) end
-      Chrome.print(entry.label, 2, ty)
+      Chrome.print(entry.builtin and Strings(entry.label) or entry.label, 2, ty)
     end
   end
 
   if self.qtyState then
     local q = self.qtyState
     self:drawBottomLines(q.prompt)
-    Chrome.box(7, 15, 13, 3)
-    Chrome.print(TIMES, 8, 16)
-    Chrome.print(Chrome.number(q.qty, 2, true), 9, 16)
+    -- engine/items/buy_sell_toss.asm:205 TossItem_MenuHeader, :133
+    Chrome.box(15, 9, 5, 3)
+    Chrome.print(TIMES, 16, 10)
+    Chrome.print(Chrome.number(q.qty, 2, true), 17, 10)
   elseif self.confirm then
     self:drawBottomLines(self.confirm.prompt)
     Chrome.box(14, 7, 6, 5)
-    Chrome.print("YES", 16, 8)
-    Chrome.print("NO", 16, 10)
+    Chrome.print(Strings("YES"), 16, 8)
+    Chrome.print(Strings("NO"), 16, 10)
     Chrome.cursor(15, self.confirm.choice == 1 and 8 or 10)
   elseif self.message then
-    self:drawBottomLines(self.message.pages[self.message.page])
+    self:drawBottomLines(
+      Typer.text(self, self.message.pages[self.message.page]))
   end
 
   love.graphics.setColor(1, 1, 1, 1)
@@ -584,19 +742,6 @@ end
 
 function ItemPcMenu:draw()
   self:drawPanel()
-end
-
-function ItemPcMenu:drawWidescreen(winW, winH)
-  local G = love.graphics
-  G.setColor(1, 1, 1, 1)
-  G.rectangle("fill", 0, 0, winW, winH)
-  local scale = Chrome.fitScale(winW, winH)
-  G.push()
-  G.translate(math.floor((winW - 160 * scale) / 2),
-    math.floor((winH - 144 * scale) / 2))
-  G.scale(scale, scale)
-  self:drawPanel()
-  G.pop()
 end
 
 ItemPcMenu.ENTRIES = ENTRIES

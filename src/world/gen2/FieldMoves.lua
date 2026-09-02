@@ -36,6 +36,7 @@
 -- `action` names the World method that carries it out; everything else in the
 -- table is that action's argument.
 
+local GameVersion = require("src.core.GameVersion")
 local Permissions = require("src.world.gen2.Permissions")
 local Runtime = require("src.mods.Runtime")
 local Strings = require("src.core.Strings")
@@ -61,6 +62,8 @@ local FieldMoves = {}
 FieldMoves.TEXT = {
   BADGE_REQUIRED   = Strings.source("Sorry! A new BADGE\nis required."),
   CANT_USE_HERE    = Strings.source("Can't use that\nhere."),
+  -- ../pokecrystal/data/text/common_2.asm:1516 _PokemonNotEnoughHPText
+  NOT_ENOUGH_HP    = Strings.source("Not enough HP!"),
 
   USE_CUT          = Strings.source("{STRBUF} used\nCUT!"),
   CUT_NOTHING      = Strings.source("There's nothing to\nCUT here."),
@@ -101,8 +104,8 @@ FieldMoves.TEXT = {
                      .. "\fA #MON may be\nable to pass it."),
   ASK_WHIRLPOOL    = Strings.source("A whirlpool is in\nthe way."
                      .. "\fWant to use\nWHIRLPOOL?"),
-  -- Not a cart line: the stand-in destination prompt World:askFlyPoint uses
-  -- until the POKeGEAR's MAP card grows _FlyMap's cursor mode.
+  -- Not a cart line: the prompt World:askFlyPoint falls back to when there is
+  -- no screen at all to push -- a headless probe, never a real run.
   ASK_FLY_TO       = Strings.source("Fly to %s?"),
 }
 
@@ -152,13 +155,49 @@ FieldMoves.KANTO_BADGES = {
 -- World:setEngineFlag / World:engineFlag route badge ids here so there is one
 -- store again, the same way ENGINE_BUG_CONTEST_TIMER is routed to
 -- save.bugContest rather than kept as a second copy.
-FieldMoves.BADGE_FLAG = {}
-for index, name in ipairs(FieldMoves.JOHTO_BADGES) do
-  FieldMoves.BADGE_FLAG[25 + index] = { store = "badges", name = name }
+-- Crystal declares 162 engine flags to Gold's 93 and the badge block sits one
+-- higher (constants/engine_flags.asm:39 vs pokegold's :38), so the ids come
+-- from the cache's engineFlagOrder when it has one.
+-- Crystal only; pokegold constants/engine_flags.asm:4-111 has no such row.
+FieldMoves.FEMALE_FLAG_NAME = "ENGINE_PLAYER_IS_FEMALE"
+
+function FieldMoves.bindEngineFlags(order)
+  local byName = {}
+  if type(order) == "table" then
+    -- pairs, not ipairs: a const_skip leaves a hole and ipairs would stop
+    -- there, silently dropping every badge past it.
+    for index, name in pairs(order) do
+      if type(index) == "number" and type(name) == "string" then
+        byName[name] = index - 1
+      end
+    end
+  end
+  local flags = {}
+  local function place(names, store, goldBase)
+    for index, name in ipairs(names) do
+      local id = byName["ENGINE_" .. name .. "BADGE"] or (goldBase + index)
+      flags[id] = { store = store, name = name }
+    end
+  end
+  place(FieldMoves.JOHTO_BADGES, "badges", 25)
+  place(FieldMoves.KANTO_BADGES, "kantoBadges", 33)
+  FieldMoves.BADGE_FLAG = flags
+  -- The flag IS wPlayerGender's bit 0, so World routes it to the gender byte
+  -- (data/events/engine_flags.asm:131, constants/engine_flags.asm:121).
+  FieldMoves.FEMALE_FLAG = byName[FieldMoves.FEMALE_FLAG_NAME]
+  -- Crystal's ENGINE_MOBILE_SYSTEM (constants/engine_flags.asm:25) has no Gold
+  -- row, so every id from BUG_CONTEST_TIMER up shifts one.
+  FieldMoves.BUG_CONTEST_FLAG = byName["ENGINE_BUG_CONTEST_TIMER"] or 16
+  FieldMoves.BIKE_SHOP_CALL_FLAG = byName["ENGINE_BIKE_SHOP_CALL_ENABLED"] or 19
+  -- pokecrystal constants/engine_flags.asm:66-92 vs pokegold :65-91
+  for _, row in ipairs(FieldMoves.FLYPOINTS or {}) do
+    row.goldFlag = row.goldFlag or row.flag
+    row.flag = byName[row.name] or row.goldFlag
+  end
+  return flags
 end
-for index, name in ipairs(FieldMoves.KANTO_BADGES) do
-  FieldMoves.BADGE_FLAG[33 + index] = { store = "kantoBadges", name = name }
-end
+
+FieldMoves.bindEngineFlags(nil)
 
 function FieldMoves.hasBadge(save, badge)
   if not badge then return true end
@@ -357,6 +396,39 @@ FieldMoves.STATE_SPRITE = {
   surf_pika = "SPRITE_SURFING_PIKACHU",
 }
 
+-- data/sprites/player_sprites.asm:8-13 KrisStateSprites, the other half of the
+-- table GetPlayerSprite picks between (engine/overworld/overworld.asm:55-64).
+FieldMoves.STATE_SPRITE_FEMALE = {
+  normal = "SPRITE_KRIS",
+  bike = "SPRITE_KRIS_BIKE",
+  surf = "SPRITE_SURF",
+  surf_pika = "SPRITE_SURFING_PIKACHU",
+}
+
+-- wPlayerGender's PLAYERGENDER_FEMALE_F, as the save spells it
+-- (constants/ram_constants.asm:176-177).
+function FieldMoves.isFemale(gender)
+  return gender == "female"
+end
+
+-- GetPlayerSprite's table pick and row walk
+-- (engine/overworld/overworld.asm:57-64, :67-75).
+function FieldMoves.stateSprite(state, gender)
+  local table_ = FieldMoves.isFemale(gender)
+    and FieldMoves.STATE_SPRITE_FEMALE or FieldMoves.STATE_SPRITE
+  return table_[state] or table_[FieldMoves.PLAYER_NORMAL]
+end
+
+function FieldMoves.playerSprite(gender)
+  return FieldMoves.stateSprite(FieldMoves.PLAYER_NORMAL, gender)
+end
+
+-- Whether the cache carries Kris at all; Gold and Silver have no
+-- KrisStateSprites to extract (pokegold data/sprites/player_sprites.asm:1-6).
+function FieldMoves.hasGenderChoice(sprites)
+  return (sprites and sprites[FieldMoves.STATE_SPRITE_FEMALE.normal]) ~= nil
+end
+
 function FieldMoves.isBiking(state)
   return state == FieldMoves.PLAYER_BIKE
 end
@@ -410,33 +482,35 @@ end
 -- const_def count (0-based, ENGINE_RADIO_CARD is 0): the byte a town's own
 -- MAPCALLBACK_NEWMAP callback sets with `setflag` the first time you walk in,
 -- and what FieldMoves.hasVisitedSpawn below actually reads.
+-- Ids are pokegold's; bindEngineFlags rebinds by name (pokecrystal
+-- constants/engine_flags.asm:25 ENGINE_MOBILE_SYSTEM shifts them +1).
 FieldMoves.FLYPOINTS = {
   -- Johto
-  { landmark = "LANDMARK_NEW_BARK_TOWN",    spawn = "SPAWN_NEW_BARK",      flag = 64 },
-  { landmark = "LANDMARK_CHERRYGROVE_CITY", spawn = "SPAWN_CHERRYGROVE",   flag = 65 },
-  { landmark = "LANDMARK_VIOLET_CITY",      spawn = "SPAWN_VIOLET",        flag = 66 },
-  { landmark = "LANDMARK_AZALEA_TOWN",      spawn = "SPAWN_AZALEA",        flag = 67 },
-  { landmark = "LANDMARK_GOLDENROD_CITY",   spawn = "SPAWN_GOLDENROD",     flag = 69 },
-  { landmark = "LANDMARK_ECRUTEAK_CITY",    spawn = "SPAWN_ECRUTEAK",      flag = 71 },
-  { landmark = "LANDMARK_OLIVINE_CITY",     spawn = "SPAWN_OLIVINE",       flag = 70 },
-  { landmark = "LANDMARK_CIANWOOD_CITY",    spawn = "SPAWN_CIANWOOD",      flag = 68 },
-  { landmark = "LANDMARK_MAHOGANY_TOWN",    spawn = "SPAWN_MAHOGANY",      flag = 72 },
-  { landmark = "LANDMARK_LAKE_OF_RAGE",     spawn = "SPAWN_LAKE_OF_RAGE",  flag = 73 },
-  { landmark = "LANDMARK_BLACKTHORN_CITY",  spawn = "SPAWN_BLACKTHORN",    flag = 74 },
-  { landmark = "LANDMARK_SILVER_CAVE",      spawn = "SPAWN_MT_SILVER",     flag = 75 },
+  { landmark = "LANDMARK_NEW_BARK_TOWN",    spawn = "SPAWN_NEW_BARK",      flag = 64, name = "ENGINE_FLYPOINT_NEW_BARK" },
+  { landmark = "LANDMARK_CHERRYGROVE_CITY", spawn = "SPAWN_CHERRYGROVE",   flag = 65, name = "ENGINE_FLYPOINT_CHERRYGROVE" },
+  { landmark = "LANDMARK_VIOLET_CITY",      spawn = "SPAWN_VIOLET",        flag = 66, name = "ENGINE_FLYPOINT_VIOLET" },
+  { landmark = "LANDMARK_AZALEA_TOWN",      spawn = "SPAWN_AZALEA",        flag = 67, name = "ENGINE_FLYPOINT_AZALEA" },
+  { landmark = "LANDMARK_GOLDENROD_CITY",   spawn = "SPAWN_GOLDENROD",     flag = 69, name = "ENGINE_FLYPOINT_GOLDENROD" },
+  { landmark = "LANDMARK_ECRUTEAK_CITY",    spawn = "SPAWN_ECRUTEAK",      flag = 71, name = "ENGINE_FLYPOINT_ECRUTEAK" },
+  { landmark = "LANDMARK_OLIVINE_CITY",     spawn = "SPAWN_OLIVINE",       flag = 70, name = "ENGINE_FLYPOINT_OLIVINE" },
+  { landmark = "LANDMARK_CIANWOOD_CITY",    spawn = "SPAWN_CIANWOOD",      flag = 68, name = "ENGINE_FLYPOINT_CIANWOOD" },
+  { landmark = "LANDMARK_MAHOGANY_TOWN",    spawn = "SPAWN_MAHOGANY",      flag = 72, name = "ENGINE_FLYPOINT_MAHOGANY" },
+  { landmark = "LANDMARK_LAKE_OF_RAGE",     spawn = "SPAWN_LAKE_OF_RAGE",  flag = 73, name = "ENGINE_FLYPOINT_LAKE_OF_RAGE" },
+  { landmark = "LANDMARK_BLACKTHORN_CITY",  spawn = "SPAWN_BLACKTHORN",    flag = 74, name = "ENGINE_FLYPOINT_BLACKTHORN" },
+  { landmark = "LANDMARK_SILVER_CAVE",      spawn = "SPAWN_MT_SILVER",     flag = 75, name = "ENGINE_FLYPOINT_SILVER_CAVE" },
   -- Kanto
-  { landmark = "LANDMARK_PALLET_TOWN",      spawn = "SPAWN_PALLET",        flag = 52 },
-  { landmark = "LANDMARK_VIRIDIAN_CITY",    spawn = "SPAWN_VIRIDIAN",      flag = 53 },
-  { landmark = "LANDMARK_PEWTER_CITY",      spawn = "SPAWN_PEWTER",        flag = 54 },
-  { landmark = "LANDMARK_CERULEAN_CITY",    spawn = "SPAWN_CERULEAN",      flag = 55 },
-  { landmark = "LANDMARK_VERMILION_CITY",   spawn = "SPAWN_VERMILION",     flag = 57 },
-  { landmark = "LANDMARK_ROCK_TUNNEL",      spawn = "SPAWN_ROCK_TUNNEL",   flag = 56 },
-  { landmark = "LANDMARK_LAVENDER_TOWN",    spawn = "SPAWN_LAVENDER",      flag = 58 },
-  { landmark = "LANDMARK_CELADON_CITY",     spawn = "SPAWN_CELADON",       flag = 60 },
-  { landmark = "LANDMARK_SAFFRON_CITY",     spawn = "SPAWN_SAFFRON",       flag = 59 },
-  { landmark = "LANDMARK_FUCHSIA_CITY",     spawn = "SPAWN_FUCHSIA",       flag = 61 },
-  { landmark = "LANDMARK_CINNABAR_ISLAND",  spawn = "SPAWN_CINNABAR",      flag = 62 },
-  { landmark = "LANDMARK_INDIGO_PLATEAU",   spawn = "SPAWN_INDIGO",        flag = 63 },
+  { landmark = "LANDMARK_PALLET_TOWN",      spawn = "SPAWN_PALLET",        flag = 52, name = "ENGINE_FLYPOINT_PALLET" },
+  { landmark = "LANDMARK_VIRIDIAN_CITY",    spawn = "SPAWN_VIRIDIAN",      flag = 53, name = "ENGINE_FLYPOINT_VIRIDIAN" },
+  { landmark = "LANDMARK_PEWTER_CITY",      spawn = "SPAWN_PEWTER",        flag = 54, name = "ENGINE_FLYPOINT_PEWTER" },
+  { landmark = "LANDMARK_CERULEAN_CITY",    spawn = "SPAWN_CERULEAN",      flag = 55, name = "ENGINE_FLYPOINT_CERULEAN" },
+  { landmark = "LANDMARK_VERMILION_CITY",   spawn = "SPAWN_VERMILION",     flag = 57, name = "ENGINE_FLYPOINT_VERMILION" },
+  { landmark = "LANDMARK_ROCK_TUNNEL",      spawn = "SPAWN_ROCK_TUNNEL",   flag = 56, name = "ENGINE_FLYPOINT_ROCK_TUNNEL" },
+  { landmark = "LANDMARK_LAVENDER_TOWN",    spawn = "SPAWN_LAVENDER",      flag = 58, name = "ENGINE_FLYPOINT_LAVENDER" },
+  { landmark = "LANDMARK_CELADON_CITY",     spawn = "SPAWN_CELADON",       flag = 60, name = "ENGINE_FLYPOINT_CELADON" },
+  { landmark = "LANDMARK_SAFFRON_CITY",     spawn = "SPAWN_SAFFRON",       flag = 59, name = "ENGINE_FLYPOINT_SAFFRON" },
+  { landmark = "LANDMARK_FUCHSIA_CITY",     spawn = "SPAWN_FUCHSIA",       flag = 61, name = "ENGINE_FLYPOINT_FUCHSIA" },
+  { landmark = "LANDMARK_CINNABAR_ISLAND",  spawn = "SPAWN_CINNABAR",      flag = 62, name = "ENGINE_FLYPOINT_CINNABAR" },
+  { landmark = "LANDMARK_INDIGO_PLATEAU",   spawn = "SPAWN_INDIGO",        flag = 63, name = "ENGINE_FLYPOINT_INDIGO_PLATEAU" },
 }
 
 -- spawn -> row, built once, so hasVisitedSpawn below does not walk the whole
@@ -536,10 +610,14 @@ end
 -- FlashFunction.CheckUseFlash: badge, then wTimeOfDayPalset == DARKNESS_PALSET
 -- -- so FLASH is refused in a lit cave and on a route alike, and the refusal
 -- is FieldMoveFailed's generic "Can't use that here."
+--
+-- ../pokecrystal/engine/events/overworld.asm:284-287 puts SpecialAerodactylChamber
+-- between the two, and its carry is a second way into `.useflash`.
 function FieldMoves.flashFromMenu(ctx)
   local refused = badgeGate(ctx, "FLASH")
   if refused then return refused end
-  if not ctx.dark then
+  local chamber = ctx.openAerodactylWall and ctx.openAerodactylWall()
+  if not ctx.dark and not chamber then
     return { ok = false, text = FieldMoves.TEXT.CANT_USE_HERE }
   end
   return { ok = true, action = "flash", text = FieldMoves.TEXT.BLINDING_FLASH }
@@ -560,6 +638,11 @@ function FieldMoves.surfFromMenu(ctx)
   end
   if not Permissions.isWater(ctx.facingColl)
       or FieldMoves.directionBlocked(ctx.playerColl, ctx.facing) then
+    return { ok = false, text = FieldMoves.TEXT.CANT_SURF }
+  end
+  -- Crystal's added `farcall CheckFacingObject`, which pokegold's :339 tags
+  -- BUG (../pokecrystal/engine/events/overworld.asm:364-365).
+  if ctx.facingObject and GameVersion.fixes().surfOntoNpc then
     return { ok = false, text = FieldMoves.TEXT.CANT_SURF }
   end
   return {
@@ -633,6 +716,47 @@ function FieldMoves.headbuttFromMenu(ctx)
   return { ok = true, action = "headbutt" }
 end
 
+-- ../pokecrystal/constants/map_object_constants.asm:145
+local SPRITEMOVEDATA_SMASHABLE_ROCK = 0x18
+
+-- ../pokecrystal/engine/events/overworld.asm:1317 TryRockSmashFromMenu
+function FieldMoves.rockSmashFromMenu(ctx)
+  local object = ctx.facingObject
+  local def = object and object.def
+  if not def or def.movement ~= SPRITEMOVEDATA_SMASHABLE_ROCK then
+    return { ok = false, text = FieldMoves.TEXT.CANT_USE_HERE }
+  end
+  return {
+    ok = true, action = "rocksmash", object = object,
+    lastTalked = (def.index or 0) + 1,
+  }
+end
+
+-- ../pokecrystal/engine/events/std_scripts.asm:241 SmashRockScript
+function FieldMoves.rockSmashScriptKey(stdScripts, scripts)
+  local entry = stdScripts and stdScripts.scripts
+    and stdScripts.scripts.SmashRockScript
+  local smash = entry and entry.key and scripts and scripts[entry.key]
+  local jump = smash and smash[1]
+  local ask = jump and jump.op == "farsjump" and jump.script
+    and scripts[jump.script]
+  for _, cmd in ipairs(ask or {}) do
+    if cmd.op == "iftrue" and cmd.script then return cmd.script end
+  end
+  return nil
+end
+
+-- ../pokecrystal/engine/events/overworld.asm:1357 RockSmashFromMenuScript
+function FieldMoves.rockSmashFromMenuScript(stdScripts, scripts, specialId)
+  local key = FieldMoves.rockSmashScriptKey(stdScripts, scripts)
+  if not key then return nil end
+  local script = { { op = "refreshmap" } }
+  local id = specialId and specialId("UpdateTimePals")
+  if id then script[#script + 1] = { op = "special", id = id } end
+  script[#script + 1] = { op = "sjump", script = key }
+  return script
+end
+
 -- SweetScentFromMenu (engine/events/sweet_scent.asm): QueueScript then an
 -- unconditional `ld a, $1 / ld [wFieldMoveSucceeded], a` -- no badge, no
 -- tile test, nothing that can refuse the press.  Whether anything actually
@@ -669,6 +793,36 @@ function FieldMoves.teleportFromMenu(ctx)
   }
 end
 
+-- ../pokecrystal/engine/pokemon/mon_menu.asm:744 .CheckMonHasEnoughHP
+function FieldMoves.softboiledFromMenu(ctx)
+  local mon = ctx.mon
+  local maxHp = mon and (mon.maxHp or (mon.stats and mon.stats.hp)) or 0
+  local cost = math.floor(maxHp / 5)
+  if not mon or (mon.hp or 0) <= cost then
+    return { ok = false, text = FieldMoves.TEXT.NOT_ENOUGH_HP }
+  end
+  return { ok = true, action = "softboiled", cost = cost, inMenu = true }
+end
+
+local function softboiledMaxHp(mon)
+  return mon and (mon.maxHp or (mon.stats and mon.stats.hp)) or 0
+end
+
+-- ../pokecrystal/engine/items/item_effects.asm:2043 .cant_use
+function FieldMoves.softboiledTargetOk(user, target)
+  if not (user and target) or target == user or target.isEgg then return false end
+  return (target.hp or 0) > 0 and (target.hp or 0) < softboiledMaxHp(target)
+end
+
+-- ../pokecrystal/engine/items/item_effects.asm:1997 RemoveHP / :2005 RestoreHealth
+function FieldMoves.softboiledTransfer(user, target, cost)
+  if not FieldMoves.softboiledTargetOk(user, target) then return nil end
+  local before = target.hp or 0
+  user.hp = math.max(0, (user.hp or 0) - (cost or 0))
+  target.hp = math.min(softboiledMaxHp(target), before + (cost or 0))
+  return before, target.hp
+end
+
 FieldMoves.FROM_MENU = {
   CUT = FieldMoves.cutFromMenu,
   FLASH = FieldMoves.flashFromMenu,
@@ -678,14 +832,16 @@ FieldMoves.FROM_MENU = {
   WATERFALL = FieldMoves.waterfallFromMenu,
   WHIRLPOOL = FieldMoves.whirlpoolFromMenu,
   HEADBUTT = FieldMoves.headbuttFromMenu,
+  ROCK_SMASH = FieldMoves.rockSmashFromMenu,
   SWEET_SCENT = FieldMoves.sweetScentFromMenu,
   DIG = FieldMoves.digFromMenu,
   TELEPORT = FieldMoves.teleportFromMenu,
+  -- ../pokecrystal/engine/pokemon/mon_menu.asm:138 MonMenu_Softboiled_MilkDrink
+  SOFTBOILED = FieldMoves.softboiledFromMenu,
+  MILK_DRINK = FieldMoves.softboiledFromMenu,
 }
 
--- The party submenu's field-move row.  Anything the port has no routine for
--- (SOFTBOILED, ROCK_SMASH, MILK_DRINK) lands on FieldMoveFailed's line, which
--- is what the cart's own unimplemented-here branches print.
+-- ../pokecrystal/engine/events/overworld.asm:1330 TryRockSmashFromMenu .no_rock
 function FieldMoves.fromMenu(moveId, ctx)
   local fn = FieldMoves.FROM_MENU[moveId]
   if not fn then

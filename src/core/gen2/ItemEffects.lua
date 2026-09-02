@@ -74,6 +74,8 @@ local BITTER = {
 -- _ItemWontHaveEffectText / _ItemCantUseOnEggText (data/text/common_3.asm).
 ItemEffects.TEXT_NO_EFFECT = "It won't have any\neffect."
 ItemEffects.TEXT_CANT_USE_ON_EGG = "That can't be used\non an EGG."
+-- _ItemCantUseOnMonText (data/text/common_3.asm:1265).
+ItemEffects.TEXT_CANT_USE_ON_MON = "That can't be used\non this #MON."
 -- _PPRestoredText (data/text/common_3.asm).
 ItemEffects.TEXT_PP_RESTORED = "PP was restored."
 -- _PPIsMaxedOutText / _PPsIncreasedText (data/text/common_3.asm).
@@ -138,8 +140,7 @@ local function bitterHappiness(itemId, mon)
 end
 
 -- ItemRestoreHP: fainted and full-HP targets refuse before anything is spent,
--- then RestoreHealth adds the HealingHPAmounts row capped at max HP and
--- PARTYMENUTEXT_HEAL_HP prints the delta ("<name>\nrecovered NN HP!").
+-- then RestoreHealth adds the HealingHPAmounts row capped at max HP.
 local function restoreHp(itemId, mon)
   local amount = ItemEffects.HEAL_HP[itemId]
   local maxHp = maxHpOf(mon)
@@ -154,7 +155,9 @@ local function restoreHp(itemId, mon)
   bitterHappiness(itemId, mon)
   return {
     used = true,
-    text = ("%s\nrecovered %d HP!"):format(monName(mon), gained),
+    -- data/text/common_1.asm:30
+    -- home/text.asm:772
+    text = ("%s\nrecovered %dHP!"):format(monName(mon), gained),
   }
 end
 
@@ -240,6 +243,8 @@ local function rareCandy(mon, data)
     used = true,
     level = newLevel,
     learned = learned,
+    -- data/text/common_1.asm:86
+    sfx = "Sfx_DexFanfare5079",
     text = ("%s grew to\nlevel %d!"):format(monName(mon), newLevel),
   }
 end

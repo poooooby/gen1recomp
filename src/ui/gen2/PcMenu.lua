@@ -27,6 +27,7 @@ local Runtime = require("src.mods.Runtime")
 local Save = require("src.core.gen2.Save")
 local SaveMenu = require("src.ui.gen2.SaveMenu")
 local Screens = require("src.ui.Screens")
+local Sound = require("src.core.Sound")
 local Strings = require("src.core.Strings")
 
 -- _PCMonHoldingMailText (data/text/common_2.asm), the refusal
@@ -38,9 +39,12 @@ local MON_HOLDING_MAIL = {
   Strings.source("Please remove the\nMAIL."),
 }
 
--- _ChangeBoxSaveText (data/text/common_2.asm:1306) is three lines whose `cont`
--- has already scrolled by the time YesNoBox goes up over its last two.
-local CHANGE_BOX_SAVE = { "#MON BOX, data", "will be saved. OK?" }
+-- _ChangeBoxSaveText (data/text/common_2.asm:1306) is three lines whose first
+-- `cont` ("When you change a") has already scrolled by the time YesNoBox goes
+-- up over its last two -- confirmed against poke-corpus GoldSilver
+-- en_msg.txt:4897. One \n-joined translatable key, same pattern as
+-- SaveMenu.lua's OVERWRITE_PROMPT_SOURCE/SAVING_PROMPT_SOURCE.
+local CHANGE_BOX_SAVE_SOURCE = Strings.source("#MON BOX, data\nwill be saved. OK?")
 
 -- YesNoBox's own `lb bc, SCREEN_WIDTH - 6, 7` (home/menu.asm:382-383).
 local YESNO_X, YESNO_Y, YESNO_W, YESNO_H = 14, 7, 6, 5
@@ -54,16 +58,16 @@ PcMenu.isOpaque = true
 -- draws two tiles rather than seven -- which is the only reason "MOVE <PK><MN>
 -- W/O MAIL" fits inside a 20-tile screen.
 local ENTRIES = {
-  { id = "withdraw", label = "WITHDRAW <PK><MN>" },
-  { id = "deposit", label = "DEPOSIT <PK><MN>" },
-  { id = "changebox", label = "CHANGE BOX" },
-  { id = "move", label = "MOVE <PK><MN> W/O MAIL" },
+  { id = "withdraw", label = Strings.source("WITHDRAW <PK><MN>"), builtin = true },
+  { id = "deposit", label = Strings.source("DEPOSIT <PK><MN>"), builtin = true },
+  { id = "changebox", label = Strings.source("CHANGE BOX"), builtin = true },
+  { id = "move", label = Strings.source("MOVE <PK><MN> W/O MAIL"), builtin = true },
   -- PLAYERSPCITEM_MAIL_BOX (engine/events/pokecenter_pc.asm), which BOTH
   -- .WhichPC lists carry: the MAILBOX is on the item PC in a Pokecenter and in
   -- the bedroom alike, unlike DECORATION below.  It sits here because this
   -- port folds the item PC's menu into the storage one.
-  { id = "mailbox", label = "MAIL BOX" },
-  { id = "seeya", label = "SEE YA!" },
+  { id = "mailbox", label = Strings.source("MAIL BOX"), builtin = true },
+  { id = "seeya", label = Strings.source("SEE YA!"), builtin = true },
 }
 
 -- PLAYERSPCITEM_DECORATION, the one row the bedroom's PC has that a
@@ -71,7 +75,9 @@ local ENTRIES = {
 -- carries it, PLAYERSPC_NORMAL does not).  It belongs to the item PC's menu on
 -- the cart, which this port folds into the storage menu the same way both PCs
 -- are folded -- so it hangs off the same list, gated on `house`.
-local DECORATION = { id = "decoration", label = "DECORATION" }
+local DECORATION = {
+  id = "decoration", label = Strings.source("DECORATION"), builtin = true,
+}
 
 -- The exit row.  It is a member of ENTRIES (it is one of _BillsPC's five), but
 -- the list is assembled without it and it is put back on the end AFTER the
@@ -151,8 +157,21 @@ function PcMenu.new(game, opts)
   -- .CheckCanUsePC: an empty party gets the "You'll need a POKéMON" line and
   -- the PC never opens.  Kept here rather than at the call site so every route
   -- into the PC (the overworld script, a driver, a mod) gets the same gate.
+  -- Boxes.lua's own \f is the same catalog key BoxMenu.lua's
+  -- BOX_FAILURE_SOURCES already declares for this string; split the
+  -- translated result on it into notice()'s page-per-string shape rather
+  -- than calling notice() itself, which would also reset messageCloses to
+  -- false -- this refusal closes the PC, the mail-holding one does not.
   local ok, reason = Boxes.canUsePc(self.save)
-  if not ok then self.message = reason end
+  if not ok then
+    local pages = {}
+    for page in (Strings(reason) .. "\f"):gmatch("(.-)\f") do
+      pages[#pages + 1] = page
+    end
+    self.message = pages[1]
+    self.messagePages = pages
+    self.messagePage = 1
+  end
   return self
 end
 
@@ -166,6 +185,13 @@ function PcMenu:notice(pages)
   self.messagePages = pages
   self.messagePage = 1
   self.messageCloses = false
+end
+
+-- home/menu.asm:746
+function PcMenu:playSfx(name)
+  local data = self.game and self.game.data
+  local sfx = data and data.audio and data.audio.sfx
+  if sfx and sfx[Sound.resolve(data, name)] then Sound.play(data, name) end
 end
 
 function PcMenu:close()
@@ -208,20 +234,28 @@ function PcMenu:writeChangeBox()
   Boxes.setCurrent(self.save, self.changeBox)
   local ok = self.writer(self.save)
   self.saved = ok and true or false
-  if ok then SaveMenu.playSaveSfx(self.game, SaveMenu.SFX_SAVE) end
+  -- engine/menus/save.asm:266
+  if ok then
+    Sound.waitSfxDone()
+    SaveMenu.playSaveSfx(self.game, SaveMenu.SFX_SAVE)
+  end
 end
 
 function PcMenu:savePrompt()
-  if self.savePhase == "overwrite" then return SaveMenu.OVERWRITE_PROMPT end
-  if self.savePhase == "saving" then return SaveMenu.SAVING_PROMPT end
+  if self.savePhase == "overwrite" then
+    return SaveMenu.twoLines(Strings(SaveMenu.OVERWRITE_PROMPT_SOURCE))
+  end
+  if self.savePhase == "saving" then
+    return SaveMenu.twoLines(Strings(SaveMenu.SAVING_PROMPT_SOURCE))
+  end
   if self.savePhase == "done" then
     if self.saved then
       local name = (self.save.player and self.save.player.name) or "GOLD"
-      return { name .. " saved", "the game." }
+      return SaveMenu.twoLines(Strings("%s saved\nthe game.", name))
     end
-    return { "Could not save.", "" }
+    return SaveMenu.twoLines(Strings("Could not save."))
   end
-  return CHANGE_BOX_SAVE
+  return SaveMenu.twoLines(Strings(CHANGE_BOX_SAVE_SOURCE))
 end
 
 function PcMenu:updateChangeBox()
@@ -250,9 +284,12 @@ function PcMenu:updateChangeBox()
   if input:wasPressed("up") or input:wasPressed("down") then
     self.saveChoice = self.saveChoice == 1 and 2 or 1
   elseif input:wasPressed("a") then
+    -- home/menu.asm:345
+    self:playSfx("Sfx_ReadText2")
     self:acceptChangeBox()
   elseif input:wasPressed("b") then
     -- B out of a yes/no is NO (InterpretTwoOptionMenu returns carry).
+    self:playSfx("Sfx_ReadText2")
     self:refuseChangeBox()
   end
 end
@@ -344,12 +381,15 @@ function PcMenu:update(_dt)
     elseif input:wasPressed("down") then
       self.pickIndex = self.pickIndex < total and self.pickIndex + 1 or 1
     elseif input:wasPressed("a") then
+      -- engine/menus/scrolling_menu.asm:24
+      self:playSfx("Sfx_ReadText2")
       if self.pickIndex == (self.save.currentBox or 1) then
         self.picking = false
       else
         self:beginChangeBox(self.pickIndex)
       end
     elseif input:wasPressed("b") then
+      self:playSfx("Sfx_ReadText2")
       self.picking = false
     end
     return
@@ -360,8 +400,11 @@ function PcMenu:update(_dt)
   elseif input:wasPressed("down") then
     self.index = self.index < #self.entries and self.index + 1 or 1
   elseif input:wasPressed("a") then
+    -- home/menu.asm:476
+    self:playSfx("Sfx_ReadText2")
     self:choose()
   elseif input:wasPressed("b") then
+    self:playSfx("Sfx_ReadText2")
     self:close()
   end
 end
@@ -404,8 +447,8 @@ function PcMenu:drawPanel()
       Chrome.print(lines[2] or "", 1, 16)
       if self.savePhase == "confirm" or self.savePhase == "overwrite" then
         Chrome.box(YESNO_X, YESNO_Y, YESNO_W, YESNO_H)
-        Chrome.print("YES", YESNO_X + 2, YESNO_Y + 1)
-        Chrome.print("NO", YESNO_X + 2, YESNO_Y + 3)
+        Chrome.print(Strings("YES"), YESNO_X + 2, YESNO_Y + 1)
+        Chrome.print(Strings("NO"), YESNO_X + 2, YESNO_Y + 3)
         Chrome.cursor(YESNO_X + 1,
           YESNO_Y + (self.saveChoice == 1 and 1 or 3))
       end
@@ -413,7 +456,7 @@ function PcMenu:drawPanel()
       return
     end
     Chrome.box(0, 14, 20, 4)
-    Chrome.print("Which BOX?", 1, 16)
+    Chrome.print(Strings("Which BOX?"), 1, 16)
     love.graphics.setColor(1, 1, 1, 1)
     return
   end
@@ -424,7 +467,7 @@ function PcMenu:drawPanel()
   -- the way the cart's windows stack (src/ui/gen2/ItemPcMenu.lua does the
   -- same with the house's six-row item list).
   Chrome.box(0, 12, 20, 6)
-  Chrome.print("What?", 1, 14)
+  Chrome.print(Strings("What?"), 1, 14)
 
   -- ClearPCItemScreen: Textbox at (0,0) with a 10x18 interior, and a second
   -- at (0,12) with a 4x18 one.  GetMenuTextStartCoord then puts the first
@@ -438,7 +481,7 @@ function PcMenu:drawPanel()
   for i, entry in ipairs(self.entries) do
     local ty = i * 2
     if i == self.index then Chrome.cursor(1, ty) end
-    Chrome.print(entry.label, 2, ty)
+    Chrome.print(entry.builtin and Strings(entry.label) or entry.label, 2, ty)
   end
   love.graphics.setColor(1, 1, 1, 1)
 end
@@ -449,12 +492,10 @@ end
 
 function PcMenu:drawWidescreen(winW, winH)
   local G = love.graphics
-  G.setColor(1, 1, 1, 1)
-  G.rectangle("fill", 0, 0, winW, winH)
+  Chrome.letterbox(winW, winH, 1, 1, 1)
   local scale = Chrome.fitScale(winW, winH)
   G.push()
-  G.translate(math.floor((winW - 160 * scale) / 2),
-    math.floor((winH - 144 * scale) / 2))
+  G.translate(Chrome.fitOrigin(winW, winH, scale))
   G.scale(scale, scale)
   self:drawPanel()
   G.pop()

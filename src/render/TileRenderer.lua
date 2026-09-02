@@ -150,13 +150,10 @@ end
 
 -- true while the spinner arrow tiles should show the 'blur' graphic; false
 -- means draw nothing extra (the static window tile shows through,
--- matching the asm's restore-to-original behavior). The 8-tick
--- half-period approximates one GB movement step (2px/frame); this is a
--- deliberate approximation of wSimulatedJoypadStatesIndex bit-0 parity, not
--- a cycle-accurate replication -- the port's tweened scriptMove has no
--- direct equivalent discrete step counter.
+-- matching the asm's restore-to-original behavior).
+-- spinners.asm:17-22, home/overworld.asm:1844-1846, :49-52
 function TileRenderer.spinBlurActive()
-  return spinning and (math.floor(animFrame / 8) % 2 == 0)
+  return spinning and (math.floor(animFrame / 16) % 2 == 0)
 end
 
 -- ------------------------------------------------------------------
@@ -951,6 +948,13 @@ function TileRenderer.invalidate()
   frameImages = {}
   toggleImages = {}
   stripData = {}
+  -- RED++ per-map atlases are large Images; clear and release so an
+  -- in-process Play → launcher → Play loop does not keep every prior
+  -- session's bake in VRAM / Lua heap.
+  for key, img in pairs(gbcAtlasCache) do
+    safeRelease(img)
+    gbcAtlasCache[key] = nil
+  end
 end
 
 Assets.register(TileRenderer.invalidate)

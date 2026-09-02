@@ -12,9 +12,20 @@
 
 local Bag = require("src.inventory.Bag")
 local Chrome = require("src.ui.gen2.Chrome")
+local CommonText = require("src.core.gen2.CommonText")
+local GameVersion = require("src.core.GameVersion")
+local Gen2Save = require("src.core.gen2.Save")
 local PackGfx = require("src.ui.gen2.PackGfx")
 local Screens = require("src.ui.Screens")
+local Sound = require("src.core.Sound")
 local Strings = require("src.core.Strings")
+local WaitPlaySFX = require("src.ui.gen2.WaitPlaySFX")
+local MenuRepeat = require("src.ui.MenuRepeat")
+
+-- constants/sfx_constants.asm:3, :28
+local SFX_DEX_FANFARE_50_79, SFX_WRONG = 0, 25
+
+local LIST_DIRS = { "up", "down" }
 
 local PackMenu = {}
 PackMenu.__index = PackMenu
@@ -30,10 +41,10 @@ local LIST_SPACING = 2
 -- Display order and titles.  The cart shows the pocket name in a tab strip
 -- across the top; these are the strings it uses.
 local POCKETS = {
-  { id = "ITEM", label = "ITEMS" },
-  { id = "BALL", label = "POKé BALLS" },
-  { id = "KEY_ITEM", label = "KEY ITEMS" },
-  { id = "TM_HM", label = "TM/HM" },
+  { id = "ITEM", label = Strings.source("ITEMS") },
+  { id = "BALL", label = Strings.source("POKé BALLS") },
+  { id = "KEY_ITEM", label = Strings.source("KEY ITEMS") },
+  { id = "TM_HM", label = Strings.source("TM/HM") },
 }
 
 -- Five item rows fit under the tab strip, two lines each.
@@ -60,20 +71,37 @@ local VISIBLE_ROWS = 5
 -- Without this menu a TOSS is unreachable and the PACK is a one-verb screen,
 -- which is what "the pack only offers USE" is.
 local SUBMENU_LABEL = {
-  use = "USE", give = "GIVE", toss = "TOSS", sel = "SEL", quit = "QUIT",
+  use = Strings.source("USE"), give = Strings.source("GIVE"),
+  toss = Strings.source("TOSS"), sel = Strings.source("SEL"),
+  quit = Strings.source("QUIT"),
 }
 
 -- _AskThrowAwayText / _AskQuantityThrowAwayText / _ThrewAwayText
 -- (data/text/common_2.asm), the three lines TossMenu prints in order.
-local TOSS_HOW_MANY = { "Throw away how", "many?" }
+local TOSS_HOW_MANY = Strings.source("Throw away how\nmany?")
 
 -- _AskItemMoveText (data/text/common_2.asm:322), printed while wSwitchItem
 -- holds a row and the cursor is looking for its new home.
-local ASK_ITEM_MOVE = { "Where should this", "be moved to?" }
+local ASK_ITEM_MOVE = Strings.source("Where should this\nbe moved to?")
 
 -- _YouDontHaveAMonText and .AnEggCantHoldAnItemText, GiveItem's two refusals.
-local NO_POKEMON = { "You don't have a", "#MON!" }
-local EGG_CANT_HOLD = { "An EGG can't hold", "an item." }
+local NO_POKEMON = Strings.source("You don't have a\n#MON!")
+local EGG_CANT_HOLD = Strings.source("An EGG can't hold\nan item.")
+
+-- _CGB_PackPals' .KrisPackPals arm, and the BATTLETYPE_TUTORIAL test above it
+-- that forces the DUDE's (../pokecrystal/engine/gfx/cgb_layouts.asm:770-786).
+local function packGfxFor(menuGfx, save, tutorial)
+  local pack = menuGfx and menuGfx.pack
+  if not (pack and pack.palettesFemale) then return menuGfx end
+  if tutorial or not Gen2Save.isFemale(save) then return menuGfx end
+  local female = {}
+  for key, value in pairs(pack) do female[key] = value end
+  female.palettes = pack.palettesFemale
+  local out = {}
+  for key, value in pairs(menuGfx) do out[key] = value end
+  out.pack = female
+  return out
+end
 
 -- The PACK's cursor bytes.  Every pocket menu restores its own cursor and
 -- scroll before ScrollingMenu and writes them back after -- `ld a,
@@ -94,26 +122,52 @@ local function cursorStore(game)
   return mem
 end
 
--- OakThisIsntTheTimeText (data/text/common_2.asm), as the three rows it
--- prints: `text` / `line` / `cont`.  On the cart that is a two-row text box
--- that scrolls once; the PACK's description box here is four rows tall, so all
--- three fit at once and nothing has to scroll.  {PLAYER} is filled in from the
--- save, the way TextBox fills it everywhere else.
-local OAK_THIS_ISNT_THE_TIME = {
-  "OAK: {PLAYER}!",
-  "This isn't the",
-  "time to use that!",
-}
+-- home/text.asm:424
+local PAGE, SCROLL, LINE = "\f", "\v", "\n"
+
+local function messageTokens(text)
+  if type(text) ~= "string" then return text end
+  local out, start = {}, 1
+  while start <= #text + 1 do
+    local marker = text:find("[\n\f\v]", start)
+    out[#out + 1] = text:sub(start, (marker or (#text + 1)) - 1)
+    if not marker then break end
+    local code = text:sub(marker, marker)
+    if code == PAGE then out[#out + 1] = PAGE
+    elseif code == SCROLL then out[#out + 1] = SCROLL end
+    start = marker + 1
+  end
+  return out
+end
+
+-- home/text.asm:397
+local function messagePages(lines)
+  if type(lines) == "string" then return CommonText.pages(lines) or {} end
+  local pages, rows = {}, {}
+  local function flush(scroll)
+    if #rows > 0 then pages[#pages + 1] = rows end
+    rows = scroll and { rows[#rows] or "" } or {}
+  end
+  for _, line in ipairs(lines or {}) do
+    if line == PAGE then flush(false)
+    elseif line == SCROLL then flush(true)
+    else rows[#rows + 1] = line end
+  end
+  flush(false)
+  return pages
+end
+
+-- data/text/common_2.asm:627
+local OAK_THIS_ISNT_THE_TIME = Strings.source(
+  "OAK: {PLAYER}!\nThis isn't the\vtime to use that!")
 
 -- RepelUsedEarlierIsStillInEffectText (data/text/common_3.asm): static, and
 -- names REPEL no matter which of the three repel items is the one actually
 -- still ticking down -- the cart never reads the active item back out to
 -- print it.
-local REPEL_STILL_ACTIVE = {
-  "The REPEL used",
-  "earlier is still",
-  "in effect.",
-}
+-- ../pokecrystal/data/text/common_3.asm:1270 -- `cont` again, so two pages.
+local REPEL_STILL_ACTIVE = Strings.source(
+  "The REPEL used\nearlier is still\vin effect.")
 
 function PackMenu:wantsFillScale() return true end
 function PackMenu:drawsWidescreen() return true end
@@ -141,7 +195,11 @@ function PackMenu.new(game, opts)
   -- a rod or the ITEMFINDER on the way past (src/ui/gen2/HeldItemMenu.lua).
   self.give = opts.give and true or false
   self.battle = opts.battle and true or false
+  -- engine/items/pack.asm:1068 TutorialPack
+  self.tutorial = opts.tutorial and true or false
   self.cursorStore = cursorStore(game)
+  -- engine/menus/scrolling_menu.asm:6
+  self.hold = MenuRepeat.new(MenuRepeat.GEN2_DELAY, MenuRepeat.GEN2_RATE)
   self.pocketIndex = 1
   -- wLastPocket, unless the caller names one: DepositSellInitPackBuffers writes
   -- ITEM_POCKET over it, so an explicit pocket still wins.
@@ -154,7 +212,8 @@ function PackMenu.new(game, opts)
   end
   self:restoreCursor()
   -- The cart's own PACK tiles, when the cache has them.
-  self.gfx = PackGfx.new(game and game.data and game.data.gen2MenuGfx)
+  self.gfx = PackGfx.new(packGfxFor(
+    game and game.data and game.data.gen2MenuGfx, self.save, opts.tutorial))
   self:rebuild()
   return self
 end
@@ -192,6 +251,14 @@ function PackMenu:pocketOf(itemId)
   return (def and def.pocket) or "ITEM"
 end
 
+-- engine/items/tmhm.asm:341
+function PackMenu:tmhmKey(itemId)
+  local def = self.items and self.items[itemId]
+  local n = def and tonumber(def.tmNumber)
+  if n then return n end
+  return 1000 + ((def and tonumber(def.index)) or 0)
+end
+
 -- The name on the row.  An inventory key with no ItemAttributes row behind it
 -- (an older cache, a mod's own item, a driver seeding an id that is not in
 -- items.lua) still has to draw something a person can read, so the id stands
@@ -201,14 +268,25 @@ function PackMenu.label(itemId, def)
   return (tostring(itemId):gsub("_", " "))
 end
 
--- TMHMPocket (engine/items/tmhm.asm) writes GetMoveName's string under the
--- TM's own name, so the second line of a TM row is the MOVE's name and not the
--- constant the attributes row carries.
+-- TMHM_DisplayPocketItems (engine/items/tmhm.asm:381-385) places GetMoveName's
+-- string three tiles right of the row's number, so a TM/HM row reads as the
+-- MOVE's name and the TM's own item name is never printed.
 function PackMenu:moveLabel(moveId)
   if not moveId then return nil end
   local moves = self.game and self.game.data and self.game.data.moves
   local def = moves and moves[moveId]
   return (def and def.name) or (tostring(moveId):gsub("_", " "))
+end
+
+-- engine/items/tmhm.asm:357-375 -- the number a TM/HM row prints: a TM with
+-- PRINTNUM_LEADINGZEROS, an HM as 'H' and its own left-aligned ordinal.
+local function tmhmLabelFor(itemId, def)
+  local digits = tostring((def and def.tmLabel) or (def and def.name)
+    or itemId):match("(%d+)")
+  local n = tonumber(digits)
+  if not n then return nil end
+  if tostring(itemId):sub(1, 3) == "HM_" then return "H" .. n end
+  return ("%02d"):format(n)
 end
 
 function PackMenu:rebuild()
@@ -232,12 +310,21 @@ function PackMenu:rebuild()
         name = PackMenu.label(itemId, def),
         teaches = self:moveLabel(def and def.teaches),
         tmNumber = def and def.tmNumber,
+        tmhmLabel = (pocket == "TM_HM" and tmhmLabelFor(itemId, def)) or nil,
         -- A KEY_ITEM never shows one, and engine/items/tmhm.asm:390 skips the
         -- count for an HM only -- a TM prints ×NN like any other stack.
         showCount = pocket == "ITEM" or pocket == "BALL"
           or (pocket == "TM_HM" and tostring(itemId):sub(1, 3) ~= "HM_"),
       }
     end
+  end
+  -- engine/items/tmhm.asm:341
+  if pocket == "TM_HM" then
+    table.sort(rows, function(a, b)
+      local ka, kb = self:tmhmKey(a.id), self:tmhmKey(b.id)
+      if ka ~= kb then return ka < kb end
+      return a.id < b.id
+    end)
   end
   self.rows = rows
   self.index = math.min(self.index, #rows + 1)
@@ -251,6 +338,41 @@ end
 
 function PackMenu:isCancel()
   return self.index > #self.rows
+end
+
+-- home/menu.asm:746, :758
+function PackMenu:playSfx(name)
+  local data = self.game and self.game.data
+  local sfx = data and data.audio and data.audio.sfx
+  if sfx and sfx[Sound.resolve(data, name)] then Sound.play(data, name) end
+end
+
+-- engine/items/pack.asm:1312, home/audio.asm:220
+function PackMenu:playSfxTwice(name)
+  self:playSfx(name)
+  self.repeatSfx = WaitPlaySFX.arm(name)
+end
+
+function PackMenu:tickRepeatSfx()
+  local pending = self.repeatSfx
+  if not pending then return false end
+  if WaitPlaySFX.waiting(pending) then return true end
+  self.repeatSfx = nil
+  self:playSfx(pending.name)
+  return false
+end
+
+function PackMenu:showMessage(lines)
+  lines = messageTokens(lines)
+  self.message, self.messagePage = lines, 1
+  self.pagesSource, self.pages = lines, messagePages(lines)
+end
+
+function PackMenu:pagesFor(lines)
+  if self.pagesSource ~= lines then
+    self.pagesSource, self.pages = lines, messagePages(lines)
+  end
+  return self.pages
 end
 
 function PackMenu:ensureVisible()
@@ -271,6 +393,8 @@ function PackMenu:switchPocket(delta)
   self:restoreCursor()
   self:rebuild()
   self:storeCursor()
+  -- engine/items/pack.asm:1268
+  self:playSfx("Sfx_SwitchPockets")
 end
 
 -- The player name OakThisIsntTheTimeText addresses, same fallback the SAVE
@@ -289,6 +413,11 @@ function PackMenu:exitToField()
   local stack = self.game and self.game.stack
   if stack and stack.clear then
     stack:clear()
+    -- ../pokecrystal/home/map.asm:1927-1940
+    local world = self.game.world
+    if world and world.exitMenusFade and not world.mapSetup then
+      world:exitMenusFade()
+    end
   elseif self.onClose then
     -- No clear on this stack (a test harness, or a screen pushed on its own):
     -- at least give the pack back.
@@ -327,7 +456,7 @@ function PackMenu:useSelected()
   if self:inBattle() then
     local def = self.items and self.items[row.id]
     if def and def.battleMenu == "ITEMMENU_NOUSE" then
-      self.message = OAK_THIS_ISNT_THE_TIME
+      self:showMessage(Strings(OAK_THIS_ISNT_THE_TIME))
       return
     end
     if self.onChoose then
@@ -337,25 +466,34 @@ function PackMenu:useSelected()
     return
   end
   local world = self.world
-  local result = world and world.useFieldItem and world:useFieldItem(row.id)
+  local result, extra = nil, nil
+  if world and world.useFieldItem then result, extra = world:useFieldItem(row.id) end
   if result then
     if result == "nowhere" then
-      self.message = OAK_THIS_ISNT_THE_TIME
+      self:showMessage(Strings(OAK_THIS_ISNT_THE_TIME))
+    elseif result == "coin_case" then
+      -- _CoinCaseCountText (data/text/common_3.asm:336): "Coins:" then the
+      -- count, text_decimal 4 digits with PRINTNUM_LEFTALIGN_F so no padding.
+      self:showMessage(Strings(Strings.source("Coins:\n%d"), extra or 0))
+    elseif result == "blue_card" then
+      -- _BlueCardBalanceText (../pokecrystal/data/text/common_3.asm:1297).
+      self:showMessage(Strings(Strings.source("You now have\n%d points."),
+        extra or 0))
     elseif result == "repel_used" then
       -- ItemUsedText (data/text/common_3.asm): "<PLAYER> used the\n<ITEM>."
       -- World already wrote the counter and took the item out of the bag, so
       -- the row list is rebuilt under the message the way a TOSS would.
-      self.message = { Strings("{PLAYER} used the"), row.name .. "." }
+      self:showMessage(Strings(Strings.source("{PLAYER} used the\n%s."), row.name))
       self:rebuild()
     elseif result == "repel_active" then
-      self.message = REPEL_STILL_ACTIVE
+      self:showMessage(Strings(REPEL_STILL_ACTIVE))
     elseif result == "trophy_sent" then
-      -- _SentTrophyHomeText (data/text/common_3.asm).  Two pages on the cart
-      -- with sound_dex_fanfare_50_79 between them; the PACK's box here holds
-      -- all four rows at once, the way OAK_THIS_ISNT_THE_TIME's three fit.
-      -- World has already set the decoration's flag and taken the box.
-      self.message = { "There was a trophy", "inside!",
-                       "{PLAYER} sent the", "trophy home." }
+      -- ../pokecrystal/data/text/common_3.asm:1338
+      if world.playSfxNamed then
+        world:playSfxNamed("Sfx_DexFanfare5079", SFX_DEX_FANFARE_50_79)
+      end
+      self:showMessage(Strings(Strings.source(
+        "There was a trophy\ninside!\f{PLAYER} sent the\ntrophy home.")))
       self:rebuild()
     else
       self:exitToField()
@@ -380,7 +518,7 @@ function PackMenu:useSelected()
       return
     end
     if def and def.fieldMenu == "ITEMMENU_NOUSE" then
-      self.message = OAK_THIS_ISNT_THE_TIME
+      self:showMessage(Strings(OAK_THIS_ISNT_THE_TIME))
       return
     end
   end
@@ -395,28 +533,20 @@ end
 
 -- ------------------------------------------------------------- the submenu
 
--- Whether A on a row opens the item submenu.  Three packs on the cart skip it
--- and hand their row straight back, and all three are here:
 --
 --   DepositSellPack (pack.asm:931) -- the mart's SELL, the item PC's DEPOSIT
 --     and HeldItemMenu's GIVE.  Its jumptable is four ScrollingMenus and
 --     nothing else, which is why `give` and the empty-world callers answer
 --     their chooser directly.
 --   TutorialPack (pack.asm:1068) -- the DUDE's pack, same shape.
---   BattlePack (pack.asm:627) -- this one DOES have a submenu on the cart
---     (ItemSubmenu, USE / QUIT or QUIT alone), but it can neither toss, give
---     nor register, so the row it would add over this port's direct dispatch
---     is a second A press on the way to the same item effect.  The field
---     PACK is the one this bug is about; see src/ui/gen2/BattleState.lua for
---     the battle side.
 --
--- The test is the world rather than a flag because that is what already tells
--- a field PACK from a chooser here: MartMenu:enterSell and
+-- engine/items/pack.asm:627 BattlePack
 -- ItemPcMenu:enterDeposit both pass `world = {}` precisely so no field effect
 -- can fire, and Game2's START-menu PACK passes the real overworld.
 function PackMenu:hasSubmenu()
   if self.give then return false end
-  if self:inBattle() then return false end
+  if self.tutorial then return false end
+  if self:inBattle() then return true end
   local world = self.world
   return (world and world.useFieldItem) and true or false
 end
@@ -427,6 +557,13 @@ end
 -- gate and ItemPcMenu:cantToss take.
 function PackMenu:submenuRows(itemId)
   local def = self.items and self.items[itemId]
+  if self:inBattle() then
+    -- engine/items/pack.asm:783 ItemSubmenu, :745 .TMHMPocketMenu
+    local usable = not (def and def.battleMenu == "ITEMMENU_NOUSE")
+    if self:pocket().id == "TM_HM" then usable = false end
+    if usable then return { "use", "quit" } end
+    return { "quit" }
+  end
   local canToss = not (def and def.canToss == false)
   local canSelect = def ~= nil and def.canSelect == true
   local usable = not (def and def.fieldMenu == "ITEMMENU_NOUSE")
@@ -521,7 +658,7 @@ end
 -- -- the item is untouched and the PACK is exactly where it was.
 function PackMenu:tossItem(row)
   if not row then return end
-  self.message = TOSS_HOW_MANY
+  self:showMessage(Strings(TOSS_HOW_MANY))
   self.qtyState = {
     row = row,
     qty = 1,
@@ -535,13 +672,14 @@ function PackMenu:confirmToss()
   self.qtyState = nil
   local row, qty = state.row, state.qty
   self.confirm = {
-    prompt = { ("Throw away %d"):format(qty), row.name .. "(S)?" },
+    prompt = messageTokens(Strings(Strings.source(
+      "Throw away %d\n%s(S)?"), qty, row.name)),
     -- YesNoBox opens on YES; B and NO are the same `jr c, .finish`.
     choice = 1,
     onYes = function()
       Bag.remove(self.save, row.id, qty)
       self:rebuild()
-      self.message = { "Threw away", row.name .. "(S)." }
+      self:showMessage(Strings(Strings.source("Threw away\n%s(S)."), row.name))
     end,
   }
 end
@@ -558,7 +696,7 @@ function PackMenu:giveItem(row)
   local game = self.game
   local party = (self.save and self.save.party) or {}
   if #party == 0 then
-    self.message = NO_POKEMON
+    self:showMessage(Strings(NO_POKEMON))
     return
   end
   if not (game and game.stack) then return end
@@ -597,7 +735,8 @@ function PackMenu:giveToSlot(slot, row)
   if mon.isEgg then
     -- `cp EGG / jr nz, .give`: the refusal prints over the party list, which
     -- stays up (`jr .loop`) for another pick.
-    held:say({ EGG_CANT_HOLD }, function() game.stack:pop() end)
+    held:say(CommonText.pages(Strings(EGG_CANT_HOLD)),
+      function() game.stack:pop() end)
     return
   end
   held:giveItem(row.id)
@@ -608,7 +747,7 @@ function PackMenu:openTeachParty(row)
   local game = self.game
   local party = (self.save and self.save.party) or {}
   if #party == 0 then
-    self.message = NO_POKEMON
+    self:showMessage(Strings(NO_POKEMON))
     return
   end
   if not (game and game.stack) then return end
@@ -636,8 +775,13 @@ function PackMenu:openTeachParty(row)
         if id == moveId then allowed = true end
       end
       if not allowed then
+        -- engine/items/tmhm.asm:131
+        local world = game.world
+        if world and world.playSfxNamed then
+          world:playSfxNamed("Sfx_Wrong", SFX_WRONG)
+        end
         if game.say then
-          game:say(("%s can't learn %s!"):format(
+          game:say(Strings(Strings.source("%s can't learn %s!"),
             require("src.battle.gen2.Mon").displayName(mon), moveName))
         end
         return
@@ -645,7 +789,7 @@ function PackMenu:openTeachParty(row)
       for _, move in ipairs(mon.moves or {}) do
         if move.id == moveId then
           if game.say then
-            game:say(("%s already knows %s!"):format(
+            game:say(Strings(Strings.source("%s already knows %s!"),
               require("src.battle.gen2.Mon").displayName(mon), moveName))
           end
           return
@@ -670,6 +814,8 @@ function PackMenu:update(_dt)
     self.staleRows = nil
     self:rebuild()
   end
+  -- engine/items/pack.asm:1312, home/audio.asm:225
+  if self:tickRepeatSfx() then return end
   -- Pack_PrintTextNoScroll ends on a `prompt`, so the message holds the PACK
   -- until a button clears it and the list is untouchable underneath.  The
   -- quantity selector is the one thing drawn OVER a message rather than under
@@ -684,9 +830,16 @@ function PackMenu:update(_dt)
     self:updateSwitch(input)
     return
   end
+  -- home/joypad.asm:383
   if self.message then
     if input:wasPressed("a") or input:wasPressed("b") then
-      self.message = nil
+      local page = (self.messagePage or 1) + 1
+      if page <= #self:pagesFor(self.message) then
+        self.messagePage = page
+        self:playSfx("Sfx_ReadText2")
+      else
+        self.message, self.messagePage = nil, nil
+      end
     end
     return
   end
@@ -698,25 +851,26 @@ function PackMenu:update(_dt)
     self:updateSubmenu(input)
     return
   end
+  local dir, edge = MenuRepeat.direction(self.hold, input, LIST_DIRS)
   if input:wasPressed("left") then
     self:switchPocket(-1)
     return
   elseif input:wasPressed("right") then
     self:switchPocket(1)
     return
-  elseif input:wasPressed("up") then
-    self.index = self.index > 1 and self.index - 1 or self:total()
-    self:ensureVisible()
+  elseif dir == "up" then
+    self:stepCursor(-1, edge)
     return
-  elseif input:wasPressed("down") then
-    self.index = self.index < self:total() and self.index + 1 or 1
-    self:ensureVisible()
+  elseif dir == "down" then
+    self:stepCursor(1, edge)
     return
   elseif input:wasPressed("b") then
+    self:playSfx("Sfx_ReadText2")
     self:storeCursor()
     if self.onClose then self.onClose() end
     return
   elseif input:wasPressed("a") then
+    self:playSfx("Sfx_ReadText2")
     if self:isCancel() then
       self:storeCursor()
       if self.onClose then self.onClose() end
@@ -734,23 +888,37 @@ function PackMenu:update(_dt)
   end
 end
 
+-- engine/menus/scrolling_menu.asm
+function PackMenu:stepCursor(delta, edge)
+  local total = self:total()
+  local next = self.index + delta
+  if next < 1 then
+    next = edge and total or 1
+  elseif next > total then
+    next = edge and 1 or total
+  end
+  self.index = next
+  self:ensureVisible()
+end
+
 -- engine/items/pack.asm:1290 Pack_InterpretJoypad .select
+-- engine/items/tmhm.asm:207 -- the TM/HM pocket's joypad filter drops SELECT.
 function PackMenu:armSwitch()
+  if self:pocket().id == "TM_HM" then return end
   if self:isCancel() then return end
   if not self.rows[self.index] then return end
   self.switching = self.index
-  self.message = ASK_ITEM_MOVE
+  self:showMessage(Strings(ASK_ITEM_MOVE))
 end
 
 -- `.switching_item` (engine/items/pack.asm:1297): A or SELECT places, B backs
 -- out, and left/right cannot leave the pocket mid-move.
 function PackMenu:updateSwitch(input)
-  if input:wasPressed("up") then
-    self.index = self.index > 1 and self.index - 1 or self:total()
-    self:ensureVisible()
-  elseif input:wasPressed("down") then
-    self.index = self.index < self:total() and self.index + 1 or 1
-    self:ensureVisible()
+  local dir, edge = MenuRepeat.direction(self.hold, input, LIST_DIRS)
+  if dir == "up" then
+    self:stepCursor(-1, edge)
+  elseif dir == "down" then
+    self:stepCursor(1, edge)
   elseif input:wasPressed("a") or input:wasPressed("select") then
     self:placeSwitch()
   elseif input:wasPressed("b") then
@@ -767,12 +935,14 @@ function PackMenu:placeSwitch()
     self:rebuild()
     self:storeCursor()
   end
+  -- engine/items/pack.asm:1309, :1311
+  self:playSfxTwice("Sfx_SwitchPokemon")
   self:endSwitch()
 end
 
 function PackMenu:endSwitch()
   self.switching = nil
-  self.message = nil
+  self.message, self.messagePage = nil, nil
 end
 
 -- VerticalMenu over the submenu rows: up/down wrap, A picks, B is the carry
@@ -785,8 +955,10 @@ function PackMenu:updateSubmenu(input)
   elseif input:wasPressed("down") then
     menu.index = menu.index < total and menu.index + 1 or 1
   elseif input:wasPressed("a") then
+    self:playSfx("Sfx_ReadText2")
     self:chooseSubmenu()
   elseif input:wasPressed("b") then
+    self:playSfx("Sfx_ReadText2")
     self:closeSubmenu()
   end
 end
@@ -804,11 +976,13 @@ function PackMenu:updateQuantity(input)
   elseif input:wasPressed("left") then
     state.qty = qtyStep(state.qty, state.max, -10)
   elseif input:wasPressed("a") then
-    self.message = nil
+    self:playSfx("Sfx_ReadText2")
+    self.message, self.messagePage = nil, nil
     self:confirmToss()
   elseif input:wasPressed("b") then
+    self:playSfx("Sfx_ReadText2")
     self.qtyState = nil
-    self.message = nil
+    self.message, self.messagePage = nil, nil
   end
 end
 
@@ -818,9 +992,11 @@ function PackMenu:updateConfirm(input)
   if input:wasPressed("up") or input:wasPressed("down") then
     confirm.choice = confirm.choice == 1 and 2 or 1
   elseif input:wasPressed("b") then
+    self:playSfx("Sfx_ReadText2")
     self.confirm = nil
     if confirm.onNo then confirm.onNo() end
   elseif input:wasPressed("a") then
+    self:playSfx("Sfx_ReadText2")
     local yes = confirm.choice == 1
     self.confirm = nil
     if yes then
@@ -845,11 +1021,13 @@ function PackMenu:registerSelected()
   local world = not self:inBattle() and self.world or nil
   local ok = world and world.registerItem and world:registerItem(row.id)
   if ok then
+    -- engine/items/pack.asm:551
+    self:playSfx("Sfx_FullHeal")
     -- RegisteredItemText: "Registered the\n<item>."
-    self.message = { Strings("Registered the"), row.name .. "." }
+    self:showMessage(Strings(Strings.source("Registered the\n%s."), row.name))
   else
     -- CantRegisterText: "You can't register\nthat item."
-    self.message = { Strings("You can't register"), Strings("that item.") }
+    self:showMessage(Strings(Strings.source("You can't register\nthat item.")))
   end
 end
 
@@ -878,44 +1056,59 @@ function PackMenu:description()
   return def and def.description or nil
 end
 
+-- engine/gfx/cgb_layouts.asm:723-726 -- the cursor column (7,2) 1x9 takes
+-- palette $3, whose colour 3 is red (gfx/pack/pack.pal).
+function PackMenu:cursorAt(tx, ty, hollow)
+  local palette = self.gfx and self.gfx:available()
+    and self.gfx:colorsAt(tx, ty)
+  if palette then
+    Chrome.cursorThrough(tx, ty, palette, false, hollow)
+  else
+    Chrome.cursor(tx, ty, hollow)
+  end
+end
+
 -- The list, description and cursor, on top of whatever chrome was drawn.
 --
--- PlaceMenuItemQuantity (engine/menus/menu_2.asm:10) writes the ×N one row
--- DOWN and one column RIGHT of the name -- the quantity is the entry's second
--- line, not a right-aligned column, which is why every PACK row is two tiles
--- tall.  Its `lb bc, 1, 2` is a TWO-digit field with the leading digit blanked,
--- so the ones digit sits at name + 3 whether the count is 5 or 50.
+-- ScrollingMenu_CallFunctions1and2 (engine/menus/scrolling_menu.asm:424-429)
+-- steps the coord on by the header's `db 5, 8` COLUMN count before
+-- PlaceMenuItemQuantity (engine/menus/menu_2.asm:19-25) adds SCREEN_WIDTH + 1,
+-- so the ×N sits at name + 9 on the row BELOW the name, flush right in every
+-- pocket (#1425, #1693).  Its `lb bc, 1, 2` is a TWO-digit field with the
+-- leading digit blanked.  engine/items/tmhm.asm:392-403 writes that same
+-- column for a TM.
 --
 -- ScrollingMenu_PlaceCursor (engine/menus/scrolling_menu.asm:438) marks the
 -- row SELECT armed with the hollow ▷ while the solid ▶ goes on looking.
 function PackMenu:drawList(listX, listY)
+  -- engine/menus/scrolling_menu.asm:86 .a_button -> home/menu.asm:50
+  -- engine/items/pack.asm:1301 .select
+  local picked = not self.switching
+    and (self.submenu or self.qtyState or self.confirm or self.message)
+    and true or false
   for row = 1, VISIBLE_ROWS do
     local i = row + self.scroll
     local ty = listY + (row - 1) * LIST_SPACING
     if i <= #self.rows then
       local entry = self.rows[i]
-      if i == self.index then
-        Chrome.cursor(listX - 1, ty)
-      elseif i == self.switching then
-        Chrome.cursor(listX - 1, ty, true)
+      -- engine/items/tmhm.asm:355-385 (#1695)
+      if entry.tmhmLabel then
+        Chrome.printThrough(entry.tmhmLabel, listX - 3, ty, Chrome.DEFAULT_BOX_PALETTE)
       end
-      Chrome.print(entry.name, listX, ty)
-      if entry.teaches then
-        -- The TM pocket puts the move the TM teaches on that second line, and
-        -- its count at listX + 9 (engine/items/tmhm.asm:392) -- on the LABEL's
-        -- line here, since the move name owns the one below it.
-        Chrome.print(entry.teaches, listX + 1, ty + 1)
-        if entry.showCount then
-          Chrome.print("\xc3\x97" .. Chrome.number(entry.count, 2),
-            listX + 9, ty)
-        end
-      elseif entry.showCount then
-        Chrome.print("\xc3\x97" .. Chrome.number(entry.count, 2),
-          listX + 1, ty + 1)
+      if i == self.index then
+        self:cursorAt(listX - 1, ty, picked)
+      elseif i == self.switching then
+        self:cursorAt(listX - 1, ty, true)
+      end
+      Chrome.printThrough((entry.tmhmLabel and entry.teaches) or entry.name,
+        listX, ty, Chrome.DEFAULT_BOX_PALETTE)
+      if entry.showCount then
+        Chrome.printThrough("\xc3\x97" .. Chrome.number(entry.count, 2),
+          listX + 9, ty + 1, Chrome.DEFAULT_BOX_PALETTE)
       end
     elseif i == self:total() then
-      if i == self.index then Chrome.cursor(listX - 1, ty) end
-      Chrome.print("CANCEL", listX, ty)
+      if i == self.index then self:cursorAt(listX - 1, ty, picked) end
+      Chrome.printThrough(Strings("CANCEL"), listX, ty, Chrome.DEFAULT_BOX_PALETTE)
     end
   end
 end
@@ -928,8 +1121,11 @@ function PackMenu:drawDescription(ty)
   local lines = self.message or (self.confirm and self.confirm.prompt)
   if lines then
     local name = self:playerName()
-    for i, line in ipairs(lines) do
-      Chrome.print((line:gsub("{PLAYER}", name)), 1, ty + i - 2)
+    -- home/text.asm:397
+    local page = self:pagesFor(lines)[self.messagePage or 1] or {}
+    for i, line in ipairs(page) do
+      Chrome.printThrough((line:gsub("{PLAYER}", name)), 1, ty + (i - 1) * 2,
+        Chrome.DEFAULT_BOX_PALETTE)
     end
     return
   end
@@ -941,42 +1137,47 @@ function PackMenu:drawDescription(ty)
   -- text box uses.  PrintItemDescription writes them from decoord 1, 14, so
   -- the second line is row 16.  '\n' covers hand-written data.
   local first, second = description:match("^(.-)<NEXT>(.*)$")
-  if not first then first, second = description:match("^(.-)\n(.*)$") end
-  Chrome.print(first or description, 1, ty)
-  if second then Chrome.print(second, 1, ty + 2) end
+  if not first then first, second = description:match("^(.-)" .. LINE .. "(.*)$") end
+  Chrome.printThrough(first or description, 1, ty, Chrome.DEFAULT_BOX_PALETTE)
+  if second then Chrome.printThrough(second, 1, ty + 2, Chrome.DEFAULT_BOX_PALETTE) end
 end
 
--- The submenu box.  Every one of the seven headers is `menu_coords 0, top,
--- SCREEN_WIDTH - 14, TEXTBOX_Y - 1` -- the left six columns, growing UPWARD
--- from the description box so its bottom edge never moves.  The five-row
--- header is the one exception, reaching one row further down (TEXTBOX_Y), so
--- the bottom is 12 there and 11 otherwise; either way the first label sits one
--- row inside (STATICMENU_NO_TOP_SPACING) with the cursor a column left of it.
+-- ../pokecrystal/engine/items/pack.asm:162, :178, :313, :335, :355, :371,
+-- TEXTBOX_Y - 1`; ../pokegold/engine/items/pack.asm has the same ten at
+function PackMenu:submenuColumn()
+  local version = (self.save and self.save.version) or GameVersion.get()
+  return GameVersion.engine(version) == "crystal" and 13 or 0
+end
+
 function PackMenu:drawSubmenu()
   local menu = self.submenu
   local count = #menu.rows
-  local bottom = count >= 5 and 12 or 11
+  local x = self:submenuColumn()
+  -- ../pokegold/engine/items/pack.asm:313 ends on TEXTBOX_Y, pokecrystal:313
+  local bottom = (count >= 5 and x == 0) and 12 or 11
   local top = bottom - count * 2
-  Chrome.box(0, top, 7, bottom - top + 1)
+  Chrome.box(x, top, 7, bottom - top + 1)
   for i, id in ipairs(menu.rows) do
     local ty = top + 1 + (i - 1) * 2
-    if i == menu.index then Chrome.cursor(1, ty) end
-    Chrome.print(SUBMENU_LABEL[id] or id, 2, ty)
+    if i == menu.index then Chrome.cursorThrough(x + 1, ty, Chrome.DEFAULT_BOX_PALETTE) end
+    Chrome.printThrough(Strings(SUBMENU_LABEL[id] or id), x + 2, ty,
+      Chrome.DEFAULT_BOX_PALETTE)
   end
 end
 
 -- engine/items/buy_sell_toss.asm:133 BuySellToss_UpdateQuantityDisplay
 function PackMenu:drawQuantity()
   Chrome.box(15, 9, 5, 3)
-  Chrome.print("\xc3\x97" .. Chrome.number(self.qtyState.qty, 2, true), 16, 10)
+  Chrome.printThrough("\xc3\x97" .. Chrome.number(self.qtyState.qty, 2, true), 16, 10,
+    Chrome.DEFAULT_BOX_PALETTE)
 end
 
 -- YesNoBox's own coords, the same box every other Gen 2 screen here draws.
 function PackMenu:drawYesNo()
   Chrome.box(14, 7, 6, 5)
-  Chrome.print("YES", 16, 8)
-  Chrome.print("NO", 16, 10)
-  Chrome.cursor(15, self.confirm.choice == 1 and 8 or 10)
+  Chrome.printThrough(Strings("YES"), 16, 8, Chrome.DEFAULT_BOX_PALETTE)
+  Chrome.printThrough(Strings("NO"), 16, 10, Chrome.DEFAULT_BOX_PALETTE)
+  Chrome.cursorThrough(15, self.confirm.choice == 1 and 8 or 10, Chrome.DEFAULT_BOX_PALETTE)
 end
 
 function PackMenu:drawOverlays()
@@ -1003,9 +1204,10 @@ function PackMenu:drawPanel()
   -- boxes, the layout this screen shipped with.
   Chrome.clear()
   Chrome.box(0, 0, 20, 3)
-  Chrome.print(self:pocket().label, 2, 1)
+  Chrome.printThrough(Strings(self:pocket().label), 2, 1,
+    Chrome.DEFAULT_BOX_PALETTE)
   Chrome.box(0, 3, 20, 12)
-  self:drawList(2, 4)
+  self:drawList(5, 4)
   Chrome.box(0, 12, 20, 6)
   self:drawDescription(14)
   self:drawOverlays()
@@ -1018,12 +1220,10 @@ end
 
 function PackMenu:drawWidescreen(winW, winH)
   local G = love.graphics
-  G.setColor(1, 1, 1, 1)
-  G.rectangle("fill", 0, 0, winW, winH)
+  Chrome.letterbox(winW, winH, 1, 1, 1)
   local scale = Chrome.fitScale(winW, winH)
   G.push()
-  G.translate(math.floor((winW - 160 * scale) / 2),
-    math.floor((winH - 144 * scale) / 2))
+  G.translate(Chrome.fitOrigin(winW, winH, scale))
   G.scale(scale, scale)
   self:drawPanel()
   G.pop()

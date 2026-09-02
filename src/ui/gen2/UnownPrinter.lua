@@ -9,7 +9,7 @@
 -- is drawn and driven entirely on the cartridge, and only the A press
 -- (`farcall PrintUnownStamp`, engine/printer/printer.asm) walks the screen
 -- out the serial port to a Game Boy Printer.  There is no printer here, the
--- same reason PrintDiploma stays stubbed in Specials.lua, so A lands on the
+-- same reason PrintDiploma's own print goes nowhere, so A lands on the
 -- same arm a cartridge with nothing plugged into its link port takes: the
 -- stamp does not print and the screen stays up.  Everything else is the
 -- cart's.
@@ -191,8 +191,7 @@ function UnownPrinter:drawsWidescreen() return true end
 
 function UnownPrinter:drawWidescreen(winW, winH)
   local G = love.graphics
-  G.setColor(1, 1, 1, 1)
-  G.rectangle("fill", 0, 0, winW, winH)
+  Chrome.letterbox(winW, winH, 1, 1, 1)
   local scale = Chrome.fitScale(winW, winH)
   local ox, oy = Chrome.fitOrigin(winW, winH, scale)
   G.push()

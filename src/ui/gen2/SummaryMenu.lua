@@ -36,9 +36,8 @@
 --   $3f        the shiny ⁂ icon (stats_tiles tile 14)
 --   $40 / $41  the left and right HP/exp bar end caps
 --
--- The extractor does not carry that sheet yet, so `pageTile` draws those seven
--- shapes directly and takes the sheet the moment menu_gfx grows a `stats`
--- entry.  Everything that IS a glyph goes through the font: ◀ ($71), ▶ ($ed),
+-- The extractor writes that sheet as menu_gfx.stats, which `pageTile` draws.
+-- Everything that IS a glyph goes through the font: ◀ ($71), ▶ ($ed),
 -- № ($74), <ID> ($73), <LV> ($6e) and the row-7 rule's $62 (the empty HP/exp
 -- bar cell, which is FontBattleExtra's -- hence Font.useBattleExtra(true)
 -- around the whole screen, exactly as the party menu does).
@@ -64,9 +63,13 @@ local Font = require("src.render.Font")
 local GbcPalette = require("src.render.GbcPalette")
 local HpBar = require("src.battle.gen2.HpBar")
 local ItemEffects = require("src.core.gen2.ItemEffects")
+local Status = require("src.battle.Status")
+local TypeChart = require("src.battle.TypeChart")
 local Mon = require("src.battle.gen2.Mon")
+local MonAnimView = require("src.render.MonAnimView")
 local Palettes = require("src.world.gen2.Palettes")
 local Pokerus = require("src.core.gen2.Pokerus")
+local Strings = require("src.core.Strings")
 local Unown = require("src.core.gen2.Unown")
 
 local SummaryMenu = {}
@@ -95,20 +98,44 @@ local TILE_BAR_CAP_RIGHT = 0x41
 -- made of (StatsScreen_PlaceHorizontalDivider).
 local TILE_HORIZONTAL_DIVIDER = 0x62
 
+-- gfx/stats/pages.pal, the three palettes _CGB_StatsScreenHPPals copies to
+-- wBGPals1 slots 3-5 (engine/gfx/cgb_layouts.asm:199-212)
+local PAGE_PALETTES = {
+  { { 255, 255, 255 }, { 255, 156, 255 }, { 255, 123, 255 }, { 0, 0, 0 } },
+  { { 255, 255, 255 }, { 173, 255, 115 }, { 140, 255, 0 }, { 0, 0, 0 } },
+  { { 255, 255, 255 }, { 140, 255, 255 }, { 140, 255, 255 }, { 0, 0, 0 } },
+}
+
+-- gfx/stats/stats.pal, the colour LoadStatsScreenPals writes over colour 0 of
+-- BG palettes 0 and 2 (engine/gfx/color.asm:386-390).  #1693
+local PAGE_TINTS = {
+  { 255, 156, 255 },
+  { 173, 255, 115 },
+  { 140, 255, 255 },
+}
+
 -- PrintTempMonStats' .StatNames, and the wTempMon fields it prints beside
 -- them.  <NEXT> steps two rows, so the five labels are 2 rows apart and the
 -- values start one row below the first label.
-local STAT_LABELS = { "ATTACK", "DEFENSE", "SPCL.ATK", "SPCL.DEF", "SPEED" }
+local STAT_LABELS = {
+  Strings.source("ATTACK"), Strings.source("DEFENSE"),
+  Strings.source("SPCL.ATK"), Strings.source("SPCL.DEF"),
+  Strings.source("SPEED"),
+}
 local STAT_KEYS = {
   "attack", "defense", "specialAttack", "specialDefense", "speed",
 }
 
--- data/types/names.asm.  Every type constant prints as its own name except
--- the two the extractor has to disambiguate against Lua-unfriendly ids.
-local TYPE_NAMES = {
-  PSYCHIC_TYPE = "PSYCHIC",
-  CURSE_TYPE = "???",
-}
+local FAINTED_LABEL = Strings.source("FNT")
+local OK_LABEL = Strings.source("OK")
+local POKERUS_LABEL = Strings.source("POKéRUS")
+local TO_LABEL = Strings.source("TO")
+local PP_LABEL = Strings.source("PP")
+local ATTACK_POWER_LABEL = Strings.source("ATTK/")
+local OT_LABEL = Strings.source("OT/")
+local ID_LABEL = Strings.source("<ID>№.")
+local DEX_NUMBER_LABEL = Strings.source("№.")
+local EGG_LABEL = Strings.source("EGG")
 
 -- Gen 2 pics are 5x5, 6x6 or 7x7 and PadFrontpic centres the small ones in
 -- the 7x7 block PrepMonFrontpic lays at hlcoord 0, 0.  Same table the dex
@@ -127,18 +154,15 @@ end
 -- are the ASM's own `cp $6 / cp $b / cp $29` ladder, and the lines join with
 -- <NEXT> exactly as the db/next strings do.
 local EGG_FLAVOR = {
-  { below = 0x6, text = "It's making sounds<NEXT>inside. It's going"
-      .. "<NEXT>to hatch soon!" },
-  { below = 0xb, text = "It moves around<NEXT>inside sometimes."
-      .. "<NEXT>It must be close<NEXT>to hatching." },
-  { below = 0x29, text = "Wonder what's<NEXT>inside? It needs"
-      .. "<NEXT>more time, though." },
-  { text = "This EGG needs a<NEXT>lot more time to<NEXT>hatch." },
+  { below = 0x6, text = Strings.source("It's making sounds<NEXT>inside. It's going<NEXT>to hatch soon!") },
+  { below = 0xb, text = Strings.source("It moves around<NEXT>inside sometimes.<NEXT>It must be close<NEXT>to hatching.") },
+  { below = 0x29, text = Strings.source("Wonder what's<NEXT>inside? It needs<NEXT>more time, though.") },
+  { text = Strings.source("This EGG needs a<NEXT>lot more time to<NEXT>hatch.") },
 }
 
 local function eggFlavor(cycles)
   for _, entry in ipairs(EGG_FLAVOR) do
-    if not entry.below or cycles < entry.below then return entry.text end
+    if not entry.below or cycles < entry.below then return Strings(entry.text) end
   end
 end
 
@@ -203,12 +227,19 @@ end
 -- PlaceStatusString (engine/pokemon/mon_stats.asm): three letters, and a mon
 -- with no HP reads FNT whatever its status byte says.  Same lookup the party
 -- list makes; both screens call the same routine on the cart.
-local function statusText(mon)
-  if (mon.hp or 0) <= 0 then return "FNT" end
+local function statusText(mon, statuses)
+  if (mon.hp or 0) <= 0 then return Strings(FAINTED_LABEL) end
   local status = mon.status
   if not status then return nil end
-  local class = ItemEffects.STATUS_CLASS[tostring(status):lower()]
-  return class and class:upper()
+  local key = tostring(status):lower()
+  if statuses and statuses[key] then
+    return Strings(Status.hudLabelFor(statuses, key))
+  end
+  local class = ItemEffects.STATUS_CLASS[key]
+  if not class then return nil end
+  if not statuses then return class:upper() end
+  local id = Status.GEN2_ID_ALIASES[key] or key
+  return Strings(Status.hudLabelFor(statuses, id))
 end
 
 -- wTempMonPokerusStatus is one byte: the low nibble counts the days left and
@@ -307,6 +338,32 @@ function SummaryMenu:playCry()
   if ok and Sound and Sound.playCry then
     pcall(Sound.playCry, self.game.data, mon.species)
   end
+  self:startPicAnim()
+end
+
+-- StatsScreen_PlaceFrontpic loads ANIM_MON_MENU, the longer scene.  A cache
+-- with no `anim` row -- every Gold and Silver one -- leaves picAnim nil.
+-- ../pokecrystal/engine/pokemon/stats_screen.asm:889-901
+function SummaryMenu:startPicAnim()
+  local mon = self.mon
+  self.picAnim = MonAnimView.start(
+    mon and self.pokemon and self.pokemon[mon.species], mon, "menu",
+    function(path) return self:picImage(path) end)
+end
+
+-- AnimateFrontpic's .loop, one scene command per frame.
+-- ../pokecrystal/engine/gfx/pic_animation.asm:79-89
+function SummaryMenu:stepPicAnim()
+  local anim = self.picAnim
+  if not anim then return end
+  if anim:step() then self.picAnim = nil end
+end
+
+-- The sheet is one column of whole pictures, base picture first.
+function SummaryMenu:picAnimFrame()
+  local anim = self.picAnim
+  if not anim then return nil end
+  return anim:frame()
 end
 
 function SummaryMenu:speciesDef()
@@ -389,7 +446,7 @@ function SummaryMenu:typeNames()
   local second = types[2] or first
   local function name(id)
     if not id then return nil end
-    return TYPE_NAMES[id] or id
+    return TypeChart.displayName(id, self.game and self.game.data)
   end
   -- PrintMonTypes' .hide_type_2: a single-typed mon really has two of the same
   -- type, and the second name is blanked rather than printed twice.
@@ -406,7 +463,7 @@ function SummaryMenu:upperPlacements()
   local out = {}
   -- (8,0) '№' and (9,0) '.' are two `ld [hl]` writes, then PrintNum puts the
   -- dex number in three leading-zero digits at (10,0).
-  put(out, "№.", 8, 0)
+  put(out, Strings(DEX_NUMBER_LABEL), 8, 0)
   put(out, num(def and def.dex or 0, 3, true), 10, 0)
   put(out, levelText(mon.level), 14, 0)
   put(out, mon.nickname or mon.name or mon.species, 8, 2)
@@ -439,16 +496,17 @@ function SummaryMenu:pinkPlacements()
 
   -- .Status_Type is "STATUS/" <NEXT> "TYPE/", and <NEXT> is two rows down at
   -- the same column -- so the second label is at row 14, not row 13.
-  put(out, "STATUS/", 0, 12)
-  put(out, "TYPE/", 0, 14)
+  put(out, Strings("STATUS/"), 0, 12)
+  put(out, Strings("TYPE/"), 0, 14)
 
   local pokerus = pokerusState(mon)
   if pokerus == "infected" then
     -- .PkrsStr is "#RUS", and '#' is the four-tile POKé compression byte.
-    put(out, "POKéRUS", 1, 13)
+    put(out, Strings(POKERUS_LABEL), 1, 13)
   else
     if pokerus == "immune" then put(out, ".", 8, 8) end
-    put(out, statusText(mon) or "OK", 6, 13)
+    put(out, statusText(mon, self.game and self.game.data
+      and self.game.data.gen2Statuses) or Strings(OK_LABEL), 6, 13)
   end
 
   -- PrintMonTypes writes type 1 at (1,15) and type 2 two rows below it, and
@@ -458,13 +516,13 @@ function SummaryMenu:pinkPlacements()
   put(out, type1, 1, 15)
   put(out, type2, 1, 16)
 
-  put(out, "EXP POINTS", 10, 9)
+  put(out, Strings("EXP POINTS"), 10, 9)
   -- `lb bc, 3, 7`: a three-byte value in seven columns, so the field runs
   -- (13,10) to (19,10).
   put(out, num(mon.experience, 7), 13, 10)
-  put(out, "LEVEL UP", 10, 12)
+  put(out, Strings("LEVEL UP"), 10, 12)
   put(out, num(self:expToNext(), 7), 13, 13)
-  put(out, "TO", 14, 14)
+  put(out, Strings(TO_LABEL), 14, 14)
   -- The level printed at (17,14) is the NEXT one: LoadPinkPage bumps
   -- wTempMonLevel, calls PrintLevel, and puts it back.  MAX_LEVEL stays put.
   local level = mon.level or 1
@@ -476,9 +534,9 @@ end
 
 function SummaryMenu:greenPlacements()
   local out = {}
-  put(out, "ITEM", 0, 8)
+  put(out, Strings("ITEM"), 0, 8)
   put(out, self:itemName() or "---", 6, 8)
-  put(out, "MOVE", 0, 10)
+  put(out, Strings("MOVE"), 0, 10)
 
   -- ListMoves runs from (8,10) with wListMovesLineSpacing = SCREEN_WIDTH * 2,
   -- so the four names are two rows apart; ListMovePP runs from (12,11) with
@@ -493,7 +551,7 @@ function SummaryMenu:greenPlacements()
       put(out, self:moveName(entry), 8, nameY)
       -- Two $3e "P" tiles: `ld [hli], a` then `ld [hld], a` writes the same
       -- tile at (12,y) and (13,y).
-      put(out, "PP", 12, ppY)
+      put(out, Strings(PP_LABEL), 12, ppY)
       -- `pop hl` then three `inc hl` lands the numbers at (15,y): two digits,
       -- the '/' PrintNum's caller writes, then two more.
       put(out, num(entry.pp, 2), 15, ppY)
@@ -514,9 +572,9 @@ function SummaryMenu:bluePlacements()
   local out = {}
   -- IDNoString is "<ID>№." -- three single tiles, not the seven letters of
   -- "ID No." -- and OTString is "OT/".
-  put(out, "<ID>№.", 0, 9)
+  put(out, Strings(ID_LABEL), 0, 9)
   put(out, num(self:otId(), 5, true), 2, 10)
-  put(out, "OT/", 0, 12)
+  put(out, Strings(OT_LABEL), 0, 12)
   local ot = self:otName()
   put(out, ot, SummaryMenu.otColumn(ot), 13)
 
@@ -524,7 +582,7 @@ function SummaryMenu:bluePlacements()
   -- two rows apart, then `add hl, bc` and one more SCREEN_WIDTH puts the first
   -- value at (17,9) -- three columns wide, so every value ends at column 19.
   for i, label in ipairs(STAT_LABELS) do
-    put(out, label, 11, 8 + (i - 1) * 2)
+    put(out, Strings(label), 11, 8 + (i - 1) * 2)
     local value = (mon.stats or {})[STAT_KEYS[i]]
     put(out, num(value, 3), 17, 9 + (i - 1) * 2)
   end
@@ -555,7 +613,7 @@ function SummaryMenu:moveDetailPlacements()
     local entry = moves[slot]
     if entry then
       put(out, self:moveName(entry), 2, nameY)
-      put(out, "PP", 10, ppY)
+      put(out, Strings(PP_LABEL), 10, ppY)
       put(out, num(entry.pp, 2), 13, ppY)
       put(out, "/", 15, ppY)
       put(out, num(entry.maxPp or entry.pp, 2), 16, ppY)
@@ -571,20 +629,21 @@ function SummaryMenu:moveDetailPlacements()
     put(out, "┌─────┐", 0, 10)
     put(out, "│", 0, 11)
     put(out, "└", 6, 11)
-    put(out, "Where?", 1, 12)
+    put(out, Strings("Where?"), 1, 12)
     return out
   end
 
   -- String_MoveType_Top / _Bottom are box-drawing glyphs, and the plaque is
   -- open on its right: "┌─────┐" over "│TYPE/└".
   put(out, "┌─────┐", 0, 10)
-  put(out, "│TYPE/└", 0, 11)
-  put(out, "ATTK/", 11, 12)
+  put(out, "│" .. Strings("TYPE/") .. "└", 0, 11)
+  put(out, Strings(ATTACK_POWER_LABEL), 11, 12)
 
   local entry = moves[self.moveIndex]
   local def = entry and self:moveDef(entry.id)
   local moveType = def and def.type
-  put(out, moveType and (TYPE_NAMES[moveType] or moveType) or "---", 2, 12)
+  put(out, moveType and TypeChart.displayName(moveType,
+    self.game and self.game.data) or "---", 2, 12)
   -- `cp 2; jr c, .no_power`: a move with power 0 or 1 prints String_MoveNoPower
   -- rather than a number.
   local power = (def and def.power) or 0
@@ -618,12 +677,12 @@ end
 function SummaryMenu:eggPlacements()
   local mon = self.mon or {}
   local out = {}
-  put(out, "EGG", 8, 1)
+  put(out, Strings(EGG_LABEL), 8, 1)
   -- IDNoString / OTString, the same strings the blue page prints, with
   -- FiveQMarkString beside each: an egg's OT and ID are hidden.
-  put(out, "<ID>№.", 8, 3)
+  put(out, Strings(ID_LABEL), 8, 3)
   put(out, "?????", 11, 3)
-  put(out, "OT/", 8, 5)
+  put(out, Strings(OT_LABEL), 8, 5)
   put(out, "?????", 11, 5)
   local ty = 9
   for line in ((eggFlavor(mon.eggSteps or 0) or "") .. "<NEXT>")
@@ -723,6 +782,30 @@ function SummaryMenu:playSwapSfx()
   end
 end
 
+local function waitPlaySfx()
+  local ok, mod = pcall(require, "src.ui.gen2.WaitPlaySFX")
+  return ok and mod or nil
+end
+
+-- mon_menu.asm:1040
+function SummaryMenu:playSwapSfxTwice()
+  self:playSwapSfx()
+  local WaitPlaySFX = waitPlaySfx()
+  if WaitPlaySFX then
+    self.repeatSfx = WaitPlaySFX.arm("Sfx_SwitchPokemon")
+  end
+end
+
+function SummaryMenu:tickRepeatSfx()
+  local pending = self.repeatSfx
+  if not pending then return false end
+  local WaitPlaySFX = waitPlaySfx()
+  if WaitPlaySFX and WaitPlaySFX.waiting(pending) then return true end
+  self.repeatSfx = nil
+  self:playSwapSfx()
+  return false
+end
+
 -- MoveScreenLoop's .joy_loop.  A picks a move up (.a_button stores wMenuCursorY
 -- in wSwappingMove and draws the hollow cursor) and puts it down (.place_move);
 -- B drops it back on the row it came from and only then exits.
@@ -735,7 +818,9 @@ function SummaryMenu:updateMoveDetail(input)
     self.moveIndex = self.moveIndex < count and self.moveIndex + 1 or 1
   elseif input:wasPressed("a") then
     if self.swapFrom then
-      if self:swapMoves(self.swapFrom, self.moveIndex) then self:playSwapSfx() end
+      if self:swapMoves(self.swapFrom, self.moveIndex) then
+        self:playSwapSfxTwice()
+      end
       self.swapFrom = nil
     elseif moves[self.moveIndex] then
       self.swapFrom = self.moveIndex
@@ -760,8 +845,11 @@ function SummaryMenu:updateMoveDetail(input)
 end
 
 function SummaryMenu:update(_dt)
+  self:stepPicAnim()
   local input = self.game and self.game.input
   if not input then return end
+  -- mon_menu.asm:1040
+  if self:tickRepeatSfx() then return end
   if self.moveDetail then
     self:updateMoveDetail(input)
     return
@@ -821,12 +909,44 @@ end
 
 -- ----------------------------------------------------------------- drawing
 
--- A tile out of StatsScreenPageTilesGFX.  The extractor does not carry that
--- sheet, so each of the seven shapes it needs is drawn here; the moment
--- menu_gfx grows a `stats` entry this can take the real tiles instead.
-function SummaryMenu:pageTile(id, tx, ty)
+-- menu_gfx.stats, the 17 tiles LoadStatsScreenPageTilesGFX lands at vTiles2
+-- tile $31 (engine/gfx/load_font.asm:90-95)
+function SummaryMenu:statsTiles()
+  if self.statsSheet ~= nil then return self.statsSheet or nil end
+  local gfx = (self.menuGfx or {}).stats
+  local image = gfx and self:picImage(gfx.sheet)
+  if not image then
+    self.statsSheet = false
+    return nil
+  end
+  local w, h = image:getDimensions()
+  local quads = {}
+  for index = 0, (gfx.tiles or 17) - 1 do
+    quads[(gfx.firstTile or 0x31) + index] =
+      love.graphics.newQuad(index * 8, 0, 8, 8, w, h)
+  end
+  self.statsSheet = { image = image, quads = quads }
+  return self.statsSheet
+end
+
+-- A tile out of StatsScreenPageTilesGFX.  The fallback arm draws each of the
+-- seven shapes by hand for a cache built before menu_gfx.stats existed.
+function SummaryMenu:pageTile(id, tx, ty, colors)
   local G = love.graphics
   local px, py = tx * 8, ty * 8
+  local sheet = self:statsTiles()
+  if sheet and sheet.quads[id] then
+    G.setColor(1, 1, 1, 1)
+    local function body()
+      G.draw(sheet.image, sheet.quads[id], px, py)
+    end
+    if colors and GbcPalette.available() then
+      GbcPalette.with(colors, body)
+    else
+      body()
+    end
+    return
+  end
   G.setColor(0, 0, 0, 1)
   if id == TILE_VERTICAL_DIVIDER then
     G.rectangle("fill", px + 3, py, 2, 8)
@@ -847,11 +967,30 @@ end
 -- (17,5), all small ($36) first, then the one for this page redrawn large
 -- ($3a).  The routine writes the four tiles as [hli]/[hld], a row down, then
 -- [hli]/[hl] -- which is why it is a 2x2 block and not a 2x1 strip.
-function SummaryMenu:drawPageSquare(tx, ty, large)
+function SummaryMenu:drawPageSquare(tx, ty, large, colors)
   local G = love.graphics
   local px, py = tx * 8, ty * 8
   -- $3a..$3d for the page that is up, $36..$39 for the other two.
   local first = large and TILE_SQUARE_LARGE or TILE_SQUARE_SMALL
+  local sheet = self:statsTiles()
+  if sheet and sheet.quads[first] then
+    -- [hli] / [hld], a row down, [hli] / [hl]: the four tiles in that
+    -- order (engine/pokemon/stats_screen.asm:841-853).
+    local function body()
+      G.setColor(1, 1, 1, 1)
+      G.draw(sheet.image, sheet.quads[first], px, py)
+      G.draw(sheet.image, sheet.quads[first + 1], px + 8, py)
+      G.draw(sheet.image, sheet.quads[first + 2], px, py + 8)
+      G.draw(sheet.image, sheet.quads[first + 3], px + 8, py + 8)
+    end
+    if colors and GbcPalette.available() then
+      GbcPalette.with(colors, body)
+    else
+      body()
+    end
+    G.setColor(1, 1, 1, 1)
+    return
+  end
   local inset = first == TILE_SQUARE_LARGE and 2 or 5
   local size = 16 - inset * 2
   G.setColor(0, 0, 0, 1)
@@ -862,7 +1001,7 @@ end
 function SummaryMenu:drawPageIndicators()
   local columns = { 13, 15, 17 }
   for i, tx in ipairs(columns) do
-    self:drawPageSquare(tx, 5, i == self.page)
+    self:drawPageSquare(tx, 5, i == self.page, PAGE_PALETTES[i])
   end
 end
 
@@ -892,7 +1031,7 @@ end
 
 -- PrepMonFrontpic at hlcoord 0, 0: a 7x7 block with the pic padded into it and
 -- the rest of the block left at the palette's colour 0.
-function SummaryMenu:drawPicBlock(image, colors)
+function SummaryMenu:drawPicBlock(image, colors, quad, size)
   if not image then return end
   local G = love.graphics
   -- A fill behind the pic reads a palette colour directly, so it has to come
@@ -901,10 +1040,16 @@ function SummaryMenu:drawPicBlock(image, colors)
   G.setColor(blank[1] / 255, blank[2] / 255, blank[3] / 255, 1)
   G.rectangle("fill", 0, 0, 7 * 8, 7 * 8)
 
-  local wide = math.floor(image:getWidth() / 8)
+  local wide = math.floor((size or image:getWidth()) / 8)
   local pad = PIC_PAD[wide] or PIC_PAD[7]
   G.setColor(1, 1, 1, 1)
-  local function body() G.draw(image, pad[1] * 8, pad[2] * 8) end
+  local function body()
+    if quad then
+      G.draw(image, quad, pad[1] * 8, pad[2] * 8)
+    else
+      G.draw(image, pad[1] * 8, pad[2] * 8)
+    end
+  end
   if colors and GbcPalette.available() then
     GbcPalette.with(colors, body)
   else
@@ -919,6 +1064,8 @@ function SummaryMenu:drawPic()
   if not image then return end
   local colors = self.palettes and mon.species
     and Palettes.monColors(self.palettes, mon.species, mon.shiny) or nil
+  local sheet, quad, size = self:picAnimFrame()
+  if sheet then return self:drawPicBlock(sheet, colors, quad, size) end
   self:drawPicBlock(image, colors)
 end
 
@@ -980,9 +1127,14 @@ function SummaryMenu:drawEggIconFallback(colors)
   G.setColor(1, 1, 1, 1)
 end
 
-function SummaryMenu:drawPlacements(list)
+-- engine/gfx/color.asm:342-359
+function SummaryMenu:drawPlacements(list, palette)
   for _, entry in ipairs(list) do
-    Chrome.print(entry.text, entry.x, entry.y)
+    if palette then
+      Chrome.printThrough(entry.text, entry.x, entry.y, palette)
+    else
+      Chrome.print(entry.text, entry.x, entry.y)
+    end
   end
 end
 
@@ -996,8 +1148,26 @@ function SummaryMenu:drawHorizontalDivider()
   end
 end
 
+-- BG palette 0 as the stats screen leaves it: the page tint in colour 0, black
+-- ink in colour 3 (engine/gfx/color.asm:386-390).
+function SummaryMenu:lowerColors()
+  local tint = PAGE_TINTS[self.page] or PAGE_TINTS[PINK_PAGE]
+  return { tint, tint, tint, { 0, 0, 0 } }
+end
+
+-- StatsScreen_LoadGFX's .ClearBox: hlcoord 0, 8 / lb bc, 10, 20, the ten rows
+-- LoadStatsScreenPals then tints (engine/pokemon/stats_screen.asm:549-557).
+function SummaryMenu:drawPageBackground()
+  local G = love.graphics
+  local tint = GbcPalette.color(self:lowerColors(), 1) or { 255, 255, 255 }
+  G.setColor(tint[1] / 255, tint[2] / 255, tint[3] / 255, 1)
+  G.rectangle("fill", 0, 8 * 8, Chrome.SCREEN_W * 8, 10 * 8)
+  G.setColor(0, 0, 0, 1)
+end
+
 function SummaryMenu:drawVerticalDivider(tx)
-  for y = 8, 17 do self:pageTile(TILE_VERTICAL_DIVIDER, tx, y) end
+  local colors = self:lowerColors()
+  for y = 8, 17 do self:pageTile(TILE_VERTICAL_DIVIDER, tx, y, colors) end
 end
 
 function SummaryMenu:drawUpperHalf()
@@ -1015,40 +1185,42 @@ end
 function SummaryMenu:drawPinkPage()
   local mon = self.mon or {}
   local maxHp = mon.maxHp or (mon.stats and mon.stats.hp) or 0
+  local tint = PAGE_TINTS[self.page] or PAGE_TINTS[PINK_PAGE]
   -- DrawPlayerHP is DrawBattleHPBar with d = 6 and b = 0: "HP:" at (0,9), six
   -- bar cells, and the end cap at (8,9) -- which LoadPinkPage then rewrites as
   -- $41, the same shape from the stats sheet.
   if self.hud and self.hud:available() then
-    self.hud:drawHpBar(mon.hp, maxHp, 0, 9)
+    self.hud:drawHpBar(mon.hp, maxHp, 0, 9, tint)
   else
     HpBar.drawWithLabel(self.palettes, mon.hp, maxHp, 0, 9, Font)
   end
   self:drawVerticalDivider(9)
-  self:drawPlacements(self:pinkPlacements())
+  self:drawPlacements(self:pinkPlacements(), self:lowerColors())
 
   -- FillInExpBar is handed (11,16), adds 7 to reach the rightmost cell and
   -- fills eight of them walking left, with the $40/$41 caps outside at (10,16)
   -- and (19,16).
   local fraction = HpBar.expFraction(mon, self:growth(), Mon.experienceForLevel)
   if self.hud and self.hud:available() then
-    self.hud:drawExpBar(fraction, 11, 16)
+    self.hud:drawExpBar(fraction, 11, 16, tint)
   else
     -- No HUD sheet in the cache: the plain rule, which is HP_BAR_LENGTH_PX
     -- (48) wide rather than the exp bar's 64, so it stops two tiles short of
     -- the $41 cap.  A cache old enough to hit this has no bar tiles at all.
     HpBar.drawExp(self.palettes, fraction, 11 * 8, 16 * 8 + 3)
   end
-  self:pageTile(TILE_BAR_CAP_LEFT, 10, 16)
-  self:pageTile(TILE_BAR_CAP_RIGHT, 19, 16)
+  local colors = self:lowerColors()
+  self:pageTile(TILE_BAR_CAP_LEFT, 10, 16, colors)
+  self:pageTile(TILE_BAR_CAP_RIGHT, 19, 16, colors)
 end
 
 function SummaryMenu:drawGreenPage()
-  self:drawPlacements(self:greenPlacements())
+  self:drawPlacements(self:greenPlacements(), self:lowerColors())
 end
 
 function SummaryMenu:drawBluePage()
   self:drawVerticalDivider(10)
-  self:drawPlacements(self:bluePlacements())
+  self:drawPlacements(self:bluePlacements(), self:lowerColors())
 end
 
 function SummaryMenu:drawMoveDetail()
@@ -1101,6 +1273,7 @@ function SummaryMenu:drawPanel()
     self:drawMoveDetail()
   else
     Chrome.clear()
+    self:drawPageBackground()
     self:drawUpperHalf()
     if self.page == GREEN_PAGE then
       self:drawGreenPage()
@@ -1120,12 +1293,10 @@ end
 
 function SummaryMenu:drawWidescreen(winW, winH)
   local G = love.graphics
-  G.setColor(1, 1, 1, 1)
-  G.rectangle("fill", 0, 0, winW, winH)
+  Chrome.letterbox(winW, winH, 1, 1, 1)
   local scale = Chrome.fitScale(winW, winH)
   G.push()
-  G.translate(math.floor((winW - 160 * scale) / 2),
-    math.floor((winH - 144 * scale) / 2))
+  G.translate(Chrome.fitOrigin(winW, winH, scale))
   G.scale(scale, scale)
   self:drawPanel()
   G.pop()
@@ -1133,7 +1304,8 @@ end
 
 SummaryMenu.STAT_LABELS = STAT_LABELS
 SummaryMenu.STAT_KEYS = STAT_KEYS
-SummaryMenu.TYPE_NAMES = TYPE_NAMES
+SummaryMenu.PAGE_PALETTES = PAGE_PALETTES
+SummaryMenu.PAGE_TINTS = PAGE_TINTS
 SummaryMenu.levelText = levelText
 
 return SummaryMenu

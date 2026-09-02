@@ -7,10 +7,21 @@ SyncEngine.__index = SyncEngine
 
 SyncEngine.UPLOAD_DEBOUNCE = 5
 SyncEngine.AUTO_INTERVAL = 300
+SyncEngine.RESUME_MIN_GAP = 60
 SyncEngine.MAX_STEPS_PER_UPDATE = 8
 
 local IDLE_STATUS = "Ready"
 local UNLINKED_STATUS = "Not set up"
+
+local function unixSeconds(v)
+  local n = tonumber(v)
+  if not n or n ~= n or n <= 0 or n == math.huge or n == -math.huge then
+    return nil
+  end
+  return n
+end
+
+SyncEngine.unixSeconds = unixSeconds
 
 local function saveApi()
   return require("src.core.SaveData")
@@ -20,43 +31,129 @@ local function gameVersions()
   return require("src.core.GameVersion").ORDER
 end
 
-local function slotForPlaythrough(options, version, playthroughId)
-  local byVersion = options.playthroughIds and options.playthroughIds[version]
-  for slotId, id in pairs(byVersion or {}) do
-    if id == playthroughId then return slotId end
+local CART_PREFIX = "cart_"
+
+local function cartOfScope(key)
+  if type(key) ~= "string" then return nil end
+  if key:sub(1, #CART_PREFIX) ~= CART_PREFIX then return nil end
+  local id = key:sub(#CART_PREFIX + 1)
+  if id == "" then return nil end
+  return id
+end
+
+local function safeCartId(id)
+  if type(id) ~= "string" or id == "" or #id > 64 then return nil end
+  if not id:match("^[%w_%-]+$") then return nil end
+  return id
+end
+
+local function blobCart(save)
+  local meta = type(save) == "table" and save.meta or nil
+  return safeCartId(type(meta) == "table" and meta.cartId or nil)
+end
+
+local function cartInstalled(options, cartId)
+  local reg = type(options) == "table" and options.carts or nil
+  if type(reg) == "table" and type(reg[cartId]) == "table" then return true end
+  local ok, CartStore = pcall(require, "src.carts.CartStore")
+  if not ok or type(CartStore) ~= "table" then return false end
+  local fs = love and love.filesystem
+  if type(fs) ~= "table" or type(fs.getInfo) ~= "function" then return false end
+  local okInfo, info = pcall(fs.getInfo, CartStore.fileFor(cartId))
+  return okInfo and info ~= nil
+end
+
+local function syncScopes()
+  local SaveData = saveApi()
+  local out = {}
+  for _, version in ipairs(gameVersions()) do
+    out[#out + 1] = { key = version, version = version }
   end
-  return nil
+  local ok, ids = pcall(SaveData.cartsWithSlots)
+  if not ok or type(ids) ~= "table" then return out end
+  local okOpts, options = pcall(SaveData.loadOptions)
+  local reg = (okOpts and type(options) == "table"
+    and type(options.carts) == "table") and options.carts or {}
+  for _, id in ipairs(ids) do
+    local row = type(reg[id]) == "table" and reg[id] or nil
+    out[#out + 1] = { key = CART_PREFIX .. id, cart = id,
+                      version = row and row.base or nil }
+  end
+  return out
+end
+
+local function wireVersion(save, scope)
+  local GameVersion = require("src.core.GameVersion")
+  if not scope.cart and type(scope.version) == "string"
+      and GameVersion.VERSIONS[scope.version] then
+    return scope.version
+  end
+  local v = type(save) == "table" and save.version or nil
+  if type(v) == "string" and GameVersion.VERSIONS[v] then return v end
+  if type(scope.version) == "string" and GameVersion.VERSIONS[scope.version] then
+    return scope.version
+  end
+  return GameVersion.get()
+end
+
+local function slotForPlaythrough(options, version, playthroughId)
+  local root = (type(options) == "table" and type(options.playthroughIds) == "table")
+    and options.playthroughIds or {}
+  local byVersion = type(root[version]) == "table" and root[version] or nil
+  for slotId, id in pairs(byVersion or {}) do
+    if id == playthroughId then return version, slotId end
+  end
+  local bestKey, bestSlot
+  for key, byScope in pairs(root) do
+    if key ~= version and cartOfScope(key) and type(byScope) == "table" then
+      for slotId, id in pairs(byScope) do
+        if id == playthroughId and slotId ~= "legacy"
+            and (bestKey == nil or key < bestKey) then
+          bestKey, bestSlot = key, slotId
+        end
+      end
+    end
+  end
+  return bestKey, bestSlot
 end
 
 function SyncEngine.defaultSaves()
   return {
     list = function()
       local SaveData = saveApi()
-      local options = SaveData.loadOptions()
       local out = {}
-      for _, version in ipairs(gameVersions()) do
-        for _, slot in ipairs(SaveData.listSlots(version)) do
+      for _, scope in ipairs(syncScopes()) do
+        local slots = scope.cart and SaveData.listCartSlots(scope.cart)
+          or SaveData.listSlots(scope.version)
+        for _, slot in ipairs(slots) do
           if slot.exists then
-            local source = SaveData.readSlotSource(version, slot.id)
+            local source
+            if scope.cart then
+              source = SaveData.readCartSlotSource(scope.cart, slot.id)
+            else
+              source = SaveData.readSlotSource(scope.version, slot.id)
+            end
             local save = source and SaveData.decode(source)
             if type(save) == "table" then
               local meta = type(save.meta) == "table" and save.meta or {}
-              local id = meta.playthroughId
-              if type(id) ~= "string" or id == "" then
-                local byVersion = options.playthroughIds
-                  and options.playthroughIds[version]
-                id = byVersion and byVersion[slot.id] or nil
+              local id
+              if scope.cart then
+                id = SaveData.cartSlotPlaythroughId(scope.cart, slot.id, save)
+              else
+                id = SaveData.slotPlaythroughId(scope.version, slot.id, save)
               end
               if id then
                 local name, summary = SaveData.slotSummary(save)
                 out[#out + 1] = {
-                  version = version,
+                  version = wireVersion(save, scope),
+                  cart = scope.cart,
                   slot = slot.id,
                   playthroughId = id,
                   blob = source,
                   meta = {
-                    savedAt = tonumber(meta.savedAt),
-                    sessionStart = tonumber(meta.sessionStart),
+                    savedAt = unixSeconds(meta.savedAt)
+                      or unixSeconds(save.savedAt),
+                    sessionStart = unixSeconds(meta.sessionStart),
                     playthroughId = id,
                     format = meta.format,
                     engine = meta.engine,
@@ -83,36 +180,109 @@ function SyncEngine.defaultSaves()
       if type(save) ~= "table" then return nil, "the downloaded save is unreadable" end
       save.version = save.version or version
       local options = SaveData.loadOptions()
-      local slotId
+      local scopeKey, slotId, created
       if mode == "new" then
         save.meta = type(save.meta) == "table" and save.meta or {}
         save.meta.playthroughId = SaveData.newPlaythroughId()
       else
-        slotId = slotForPlaythrough(options, version, playthroughId)
+        scopeKey, slotId = slotForPlaythrough(options, version, playthroughId)
       end
       if not slotId then
-        slotId = SaveData.createSlot(version)
-        if not slotId then return nil, "could not make a save slot" end
+        local cartId = blobCart(save)
+        if cartId then
+          if not cartInstalled(options, cartId) then
+            return false, ("install the \"%s\" cart to receive its save")
+              :format(cartId)
+          end
+          scopeKey = CART_PREFIX .. cartId
+        else
+          scopeKey = version
+        end
       end
-      local ok, err = SaveData.writeSlot(version, slotId, save)
+      local cart = cartOfScope(scopeKey)
+      if not slotId then
+        if cart then
+          slotId = SaveData.createCartSlot(cart)
+        else
+          slotId = SaveData.createSlot(version)
+        end
+        if not slotId then return nil, "could not make a save slot" end
+        created = true
+      end
+      local ok, err
+      if cart then
+        ok, err = SaveData.writeCartSlot(cart, slotId, save)
+      else
+        ok, err = SaveData.writeSlot(version, slotId, save)
+      end
       if not ok then return nil, err or "could not write the save" end
       options = SaveData.loadOptions()
       options.playthroughIds = options.playthroughIds or {}
-      options.playthroughIds[version] = options.playthroughIds[version] or {}
-      options.playthroughIds[version][slotId] =
+      options.playthroughIds[scopeKey] = options.playthroughIds[scopeKey] or {}
+      options.playthroughIds[scopeKey][slotId] =
         save.meta and save.meta.playthroughId or playthroughId
       SaveData.saveOptions(options)
-      return slotId
+      return slotId, created == true, cart
     end,
   }
 end
 
 function SyncEngine.overlaps(a, b)
   if type(a) ~= "table" or type(b) ~= "table" then return false end
-  local aStart, aEnd = tonumber(a.sessionStart), tonumber(a.savedAt)
-  local bStart, bEnd = tonumber(b.sessionStart), tonumber(b.savedAt)
+  local aStart, aEnd = unixSeconds(a.sessionStart), unixSeconds(a.savedAt)
+  local bStart, bEnd = unixSeconds(b.sessionStart), unixSeconds(b.savedAt)
   if not (aStart and aEnd and bStart and bEnd) then return false end
   return aStart <= bEnd and bStart <= aEnd
+end
+
+-- Inline, under .meta, or under .remoteMeta, depending on the endpoint.
+function SyncEngine.metaOf(row)
+  if type(row) ~= "table" then return nil end
+  if type(row.meta) == "table" then return row.meta end
+  if type(row.remoteMeta) == "table" then return row.remoteMeta end
+  return row
+end
+
+-- Gen 2 stores playTime as a table, so meta.playTime is nil on a Gold save
+-- and summary.timeText is the only field that survives.
+local function playedMinutes(meta)
+  if type(meta) ~= "table" then return nil end
+  local summary = type(meta.summary) == "table" and meta.summary or nil
+  local text = summary and summary.timeText
+  if type(text) == "string" then
+    local hours, minutes = text:match("^(%d+):(%d%d)$")
+    if hours then return tonumber(hours) * 60 + tonumber(minutes) end
+  end
+  local seconds = tonumber(meta.playTime)
+  if seconds and seconds > 0 then return math.floor(seconds / 60) end
+  return nil
+end
+
+-- Same minute of playtime means the same point in the playthrough, so there
+-- is no fork.  Unknown playtime on either side is NOT a match.
+function SyncEngine.samePlaytime(a, b)
+  local left, right = playedMinutes(a), playedMinutes(b)
+  return left ~= nil and left == right
+end
+
+function SyncEngine.sameProgress(a, b)
+  if SyncEngine.samePlaytime(a, b) then return true end
+  if type(a) ~= "table" or type(b) ~= "table" then return false end
+  local left = type(a.summary) == "table" and a.summary or nil
+  local right = type(b.summary) == "table" and b.summary or nil
+  if not (left and right) then return false end
+  if type(left.name) ~= "string" or left.name == "" then return false end
+  return left.name == right.name and left.badges == right.badges
+    and left.timeText == right.timeText and left.dexCount == right.dexCount
+end
+
+function SyncEngine.displayMeta(meta)
+  if type(meta) ~= "table" then return meta end
+  local out = {}
+  for k, v in pairs(meta) do out[k] = v end
+  out.savedAt = unixSeconds(meta.savedAt)
+  out.sessionStart = unixSeconds(meta.sessionStart)
+  return out
 end
 
 function SyncEngine.new(opts)
@@ -133,6 +303,7 @@ function SyncEngine.new(opts)
   eng.modPlan = nil
   eng.shareCode = nil
   eng.clock = 0
+  eng.autoAt = SyncEngine.AUTO_INTERVAL
   eng.queue = {}
   eng.pending = nil
   eng.uploadAt = nil
@@ -195,6 +366,9 @@ function SyncEngine:_finish()
   self.error = nil
   self.state.lastSyncAt = self.now()
   self.status = self:defaultStatus()
+  if type(self.skipped) == "table" and #self.skipped > 0 then
+    self.status = self.skipped[1]
+  end
   self:_persist()
 end
 
@@ -258,6 +432,11 @@ function SyncEngine:update(dt)
     self.uploadAt = nil
     if self.state.enabled and self:linked() then self:syncNow() end
   end
+  if self.clock >= self.autoAt and not self:busy()
+      and (self.phase == "idle" or self.phase == "error")
+      and self.state.enabled and self:linked() then
+    self:syncNow()
+  end
   local steps = 0
   while not self.pending and #self.queue > 0
       and steps < SyncEngine.MAX_STEPS_PER_UPDATE do
@@ -296,6 +475,7 @@ function SyncEngine:createAccount(label)
     eng.phase = "idle"
     eng.status = "Sync account created"
     eng:_persist()
+    eng:syncNow()
   end)
 end
 
@@ -345,19 +525,20 @@ function SyncEngine:unlink()
     self:_forgetLocal()
     return true
   end
-  if self:busy() then return false, "sync is busy" end
+  if self:busy() then self:cancel() end
   self.phase = "checking"
   self.status = "Unlinking this device..."
   self.error = nil
   local handle, err = self.client:unlink(self.state.deviceId)
+  if not handle then
+    self:_forgetLocal()
+    return true
+  end
   return self:_request(handle, err, function(eng)
     eng:_forgetLocal()
-  end, function(eng, res)
-    if res.code == 401 or res.code == 404 then
-      eng:_forgetLocal()
-      return true
-    end
-    return false
+  end, function(eng)
+    eng:_forgetLocal()
+    return true
   end)
 end
 
@@ -385,11 +566,27 @@ function SyncEngine:setEnabled(enabled)
   return self.state.enabled
 end
 
+function SyncEngine:protectPlaythrough(version, playthroughId)
+  self.protectedKey = SyncState.key(version, playthroughId)
+end
+
+function SyncEngine:noteResumed()
+  if not (self.state.enabled and self:linked()) then return end
+  if self:busy() or self.phase == "conflict" then return end
+  if self.now() - (tonumber(self.state.lastSyncAt) or 0)
+      < SyncEngine.RESUME_MIN_GAP then
+    return
+  end
+  self:syncNow()
+end
+
 function SyncEngine:syncNow()
   if not self:linked() then return false, "this device is not linked" end
   if self.pending then return false, "sync is busy" end
+  self.autoAt = self.clock + SyncEngine.AUTO_INTERVAL
   self.queue = {}
   self.conflicts = {}
+  self.skipped = nil
   self.state.pendingConflicts = {}
   self.phase = "checking"
   self.status = "Checking for changes..."
@@ -426,24 +623,33 @@ function SyncEngine:_planFrom(remoteState)
       seen[key] = true
       local row = remote[key]
       local knownRev = SyncState.rev(self.state, key)
-      local stamp = SyncState.stamp(self.state, key)
-      local localChanged = stamp == nil
-        or tonumber(entry.meta and entry.meta.savedAt) ~= stamp
+      local stamp = unixSeconds(SyncState.stamp(self.state, key))
+      local liveStamp = unixSeconds(entry.meta and entry.meta.savedAt)
+      local localChanged
+      if liveStamp == nil and stamp == nil then
+        localChanged = knownRev == nil
+      else
+        localChanged = liveStamp ~= stamp
+      end
       local remoteRev = row and tonumber(row.rev)
       local remoteChanged = row ~= nil and remoteRev ~= knownRev
       if not row then
         self:_queueUpload(entry, key, false)
       elseif localChanged and remoteChanged then
-        self:_addConflict(entry, key, row)
+        if SyncEngine.sameProgress(entry.meta, SyncEngine.metaOf(row)) then
+          self:_queueUpload(entry, key, true)
+        else
+          self:_addConflict(entry, key, row)
+        end
       elseif localChanged then
         self:_queueUpload(entry, key, false)
-      elseif remoteChanged then
+      elseif remoteChanged and key ~= self.protectedKey then
         self:_queueDownload(key, entry.version, entry.playthroughId, "replace")
       end
     end
   end
   for key, row in pairs(remote) do
-    if not seen[key] then
+    if not seen[key] and key ~= self.protectedKey then
       local version, id = SyncState.splitKey(key)
       if version and id then
         self:_queueDownload(key, version, id, "replace", tonumber(row.rev))
@@ -454,19 +660,14 @@ function SyncEngine:_planFrom(remoteState)
 end
 
 function SyncEngine:_addConflict(entry, key, row)
-  local remoteMeta = row
-  if type(row.meta) == "table" then
-    remoteMeta = row.meta
-  elseif type(row.remoteMeta) == "table" then
-    remoteMeta = row.remoteMeta
-  end
+  local remoteMeta = SyncEngine.displayMeta(SyncEngine.metaOf(row))
   self.conflicts[#self.conflicts + 1] = {
     key = key,
     version = entry.version,
     playthroughId = entry.playthroughId,
     slot = entry.slot,
     entry = entry,
-    localMeta = entry.meta,
+    localMeta = SyncEngine.displayMeta(entry.meta),
     remoteMeta = remoteMeta,
     remoteRev = tonumber(row.rev),
     overlap = SyncEngine.overlaps(entry.meta, remoteMeta),
@@ -499,13 +700,20 @@ function SyncEngine:_queueUpload(entry, key, force)
     eng:_request(handle, err, function(e, res)
       local data = res.data or {}
       SyncState.setRev(e.state, key, tonumber(data.rev),
-        entry.meta and entry.meta.savedAt)
+        unixSeconds(entry.meta and entry.meta.savedAt))
       e:_persist()
       if not e:busy() then e:_finish() end
     end, function(e, res)
       if res.code == 409 then
         local row = res.data or {}
-        e:_addConflict(entry, key, row)
+        -- Retried with force only once: a forced write that still 409s is a
+        -- real refusal, and retrying it would spin.
+        if not force
+            and SyncEngine.sameProgress(entry.meta, SyncEngine.metaOf(row)) then
+          e:_queueUpload(entry, key, true)
+        else
+          e:_addConflict(entry, key, row)
+        end
         if not e:busy() then e:_finish() end
         return true
       end
@@ -525,16 +733,35 @@ function SyncEngine:_queueDownload(key, version, playthroughId, mode, knownRev)
         e:_fail("the server sent no save data")
         return
       end
-      local slotId, writeErr = e.saves.write(version, playthroughId, data.blob, mode)
-      if not slotId then
-        e:_fail(writeErr or "could not write the downloaded save")
+      local slotId, detail, cartId =
+        e.saves.write(version, playthroughId, data.blob, mode)
+      if slotId == false then
+        e.skipped = e.skipped or {}
+        e.skipped[#e.skipped + 1] =
+          tostring(detail or "this save was skipped")
+        if not e:busy() then e:_finish() end
         return
       end
-      if mode ~= "new" then
-        local meta = type(data.meta) == "table" and data.meta or {}
-        SyncState.setRev(e.state, key, tonumber(data.rev) or knownRev,
-          tonumber(meta.savedAt))
+      if not slotId then
+        e:_fail(detail or "could not write the downloaded save")
+        return
       end
+      local created = detail == true
+      local meta = type(data.meta) == "table" and data.meta or {}
+      if mode ~= "new" then
+        SyncState.setRev(e.state, key, tonumber(data.rev) or knownRev,
+          unixSeconds(meta.savedAt))
+      end
+      e.lastDownloads = e.lastDownloads or {}
+      e.lastDownloads[#e.lastDownloads + 1] = {
+        version = version,
+        cart = cartId,
+        slot = slotId,
+        created = created,
+        device = type(meta.device) == "string" and meta.device ~= ""
+          and meta.device or nil,
+      }
+      e.changed = true
       e:_persist()
       if not e:busy() then e:_finish() end
     end)
@@ -573,12 +800,13 @@ function SyncEngine:resolveConflict(key, choice)
   return true
 end
 
-function SyncEngine:uploadMods()
+function SyncEngine:uploadMods(includeOptions)
   if not self:linked() then return false, "this device is not linked" end
   if self:busy() then return false, "sync is busy" end
-  local manifest = SyncMods.build(self.modDeps)
+  local manifest = SyncMods.build(self.modDeps, includeOptions)
   self.phase = "uploading"
-  self.status = "Uploading the mod list..."
+  self.status = includeOptions and "Uploading the mod list and options..."
+    or "Uploading the mod list..."
   local handle, err = self.client:putMods(manifest)
   return self:_request(handle, err, function(eng)
     eng.phase = "idle"
@@ -595,19 +823,17 @@ function SyncEngine:fetchModPlan()
   return self:_request(handle, err, function(eng, res)
     local data = res.data or {}
     local manifest = type(data.manifest) == "table" and data.manifest or data
-    eng.modPlan = SyncMods.plan(manifest, eng.modDeps)
-    eng.phase = "idle"
-    eng.status = SyncMods.planEmpty(eng.modPlan)
-      and "Mods already match" or "Mod changes ready to apply"
+    eng:_takeModPlan(SyncMods.plan(manifest, eng.modDeps))
   end)
 end
 
-function SyncEngine:shareMods()
+function SyncEngine:shareMods(includeOptions)
   if not self:linked() then return false, "this device is not linked" end
   if self:busy() then return false, "sync is busy" end
-  local manifest = SyncMods.build(self.modDeps)
+  local manifest = SyncMods.build(self.modDeps, includeOptions)
   self.phase = "uploading"
-  self.status = "Sharing the mod list..."
+  self.status = includeOptions and "Sharing the mod list and options..."
+    or "Sharing the mod list..."
   local handle, err = self.client:shareMods(manifest)
   return self:_request(handle, err, function(eng, res)
     local data = res.data or {}
@@ -626,16 +852,44 @@ function SyncEngine:fetchShare(code)
   return self:_request(handle, err, function(eng, res)
     local data = res.data or {}
     local manifest = type(data.manifest) == "table" and data.manifest or data
-    eng.modPlan = SyncMods.plan(manifest, eng.modDeps)
-    eng.phase = "idle"
-    eng.status = SyncMods.planEmpty(eng.modPlan)
-      and "Mods already match" or "Mod changes ready to apply"
+    eng:_takeModPlan(SyncMods.plan(manifest, eng.modDeps))
   end)
+end
+
+function SyncEngine:_takeModPlan(plan)
+  self.modPlan = plan
+  self.phase = "idle"
+  if SyncMods.planHasOptions(plan) then
+    self.status = ("This list carries options for %d mods.")
+      :format(#plan.options)
+  elseif SyncMods.planEmpty(plan) then
+    self.status = "Mods already match"
+  else
+    self.status = "Mod changes ready to apply"
+  end
+end
+
+function SyncEngine:modOptionsAsk()
+  local plan = self.modPlan
+  if not SyncMods.planHasOptions(plan) then return nil end
+  if plan.applyOptions ~= nil then return nil end
+  return SyncMods.optionModIds(plan)
+end
+
+function SyncEngine:answerModOptions(importThem)
+  local plan = self.modPlan
+  if not SyncMods.planHasOptions(plan) then return false end
+  SyncMods.answerOptions(plan, importThem)
+  self.status = plan.applyOptions
+    and "Their mod options will be imported too"
+    or "Their mod options will be skipped"
+  return plan.applyOptions
 end
 
 function SyncEngine:applyModPlan(progress)
   if not self.modPlan then return false, "no mod plan" end
   if self.modApply then return false, "the mods are already being applied" end
+  self.modPlan.applyOptions = self.modPlan.applyOptions == true
   local steps = SyncMods.steps(self.modPlan, self.modDeps)
   if #steps == 0 then
     self.modPlan = nil

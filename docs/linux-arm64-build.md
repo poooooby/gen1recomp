@@ -1,10 +1,11 @@
 # Linux arm64 (aarch64) AppImage
 
 Releases ship `gen1recomp-<version>-linux-arm64.AppImage` alongside the
-existing x86_64 `gen1recomp-<version>-linux.zip`. It targets 64-bit ARM
+existing x86_64 `gen1recomp-<version>-linux-x86_64.AppImage`. It targets 64-bit ARM
 desktop Linux: Raspberry Pi 4/5 running Raspberry Pi OS, Armbian and other
 SBC distros, arm64 VMs on Apple Silicon, Ampere/Graviton desktops, and the
-aarch64 handhelds that run a full distro.
+aarch64 handhelds that run a full distro. See also
+[linux-appimage.md](linux-appimage.md) for shared AppImage failure modes.
 
 > The Anbernic RG34XXSP has its own PortMaster-style pack
 > (`gen1recomp-*-rg34xxsp-stockos64-mod.zip`, see
@@ -105,8 +106,9 @@ trixie.
 This is a statement about the *compile environment*, not about where the
 artifact runs — building on your own newer distro would silently raise that
 floor and strand every user on an older one, with no symptom until they
-download it. CI enforces the floor: `linux-arm64-build` fails if the highest
-required glibc symbol version climbs above 2.31.
+download it. `scripts/linux-arm64/verify_appimage.sh` enforces the floor in
+both CI (`linux-arm64-build`) and the release workflow: the build fails if
+the highest required glibc symbol version climbs above 2.31.
 
 ### Why five libraries are built from source
 
@@ -172,13 +174,15 @@ Three jobs, path-gated on `scripts/build_linux_arm64.sh`,
   exclude list still classifies known sonames correctly, that AppRun still
   launches `game.love` with `--fused`, and that the host-arch guard actually
   fires. Needs no container and no arm64 machine.
-- **`linux-arm64-build`** (`ubuntu-24.04-arm`) — the real build, then extracts
-  the artifact and asserts the layout, that every bundled object resolves
-  under AppRun's `LD_LIBRARY_PATH`, and that the glibc floor is still ≤ 2.31.
-  Uploads the AppImage for 7 days.
+- **`linux-arm64-build`** (`ubuntu-24.04-arm`) — the real build, then
+  `scripts/linux-arm64/verify_appimage.sh` extracts the artifact and asserts
+  the layout, that every bundled object resolves under AppRun's
+  `LD_LIBRARY_PATH`, and that the glibc floor is still ≤ 2.31. Uploads the
+  AppImage for 7 days.
 - **release** — `linux-arm64` runs on `ubuntu-24.04-arm`, reuses the shared
-  `game.love` from the `love-payload` job, and the AppImage is staged and
-  published like every other release asset.
+  `game.love` from the `love-payload` job, runs the same
+  `verify_appimage.sh` checks on the shipped image, and the AppImage is
+  staged and published like every other release asset.
 
 Unlike the Switch job, none of this needs secrets or self-hosted hardware, so
 it runs on fork PRs too.

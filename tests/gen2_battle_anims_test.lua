@@ -268,20 +268,26 @@ eq(overrideSide("minimize", 0), nil, "anim_minimize ($e9) is a cart dummy")
 -- battle screen, and the branch-heavy ones (Metronome, Bide, the multi-hit
 -- loops) are exactly where that would happen.
 local longest, longestName, stuck = 0, nil, 0
+local DroppedBg = require("src.battle.gen2.BgEffects").DROPPED
+eq(#DroppedBg, 0, "no BG effect id was dropped before the sweep")
 for move, key in pairs(data.moves) do
   for _, turn in ipairs({ 0, 1 }) do
-    local r = runner(key, { animId = move, turn = turn, param = 3 })
-    local frames = 0
-    local ok = pcall(function()
-      while r:step() and frames < 1500 do frames = frames + 1 end
-    end)
-    if not ok or frames >= 1500 then stuck = stuck + 1 end
-    if frames > longest then longest, longestName = frames, move end
+    for _, param in ipairs({ 0, 1, 2, 3 }) do
+      local r = runner(key, { animId = move, turn = turn, param = param })
+      local frames = 0
+      local ok = pcall(function()
+        while r:step() and frames < 1500 do frames = frames + 1 end
+      end)
+      if not ok or frames >= 1500 then stuck = stuck + 1 end
+      if frames > longest then longest, longestName = frames, move end
+    end
   end
 end
-eq(stuck, 0, "all 251 move animations terminate on both turns")
+eq(stuck, 0, "all 251 move animations terminate on both turns at params 0-3")
 check(longest > 0 and longest < 1500,
   ("the longest is %s at %d frames"):format(tostring(longestName), longest))
+eq(#DroppedBg, 0, "no BG effect id was dropped for want of an E entry ("
+  .. table.concat(DroppedBg, ", ") .. ")")
 
 -- BattleAnimObjects rows are six bytes and the struct's TILEID comes from the
 -- tile dict, not the row -- so an object queued before its sheet is loaded
@@ -449,24 +455,29 @@ eq(whirl.lcdc, "SCY", "Whirlpool scrolls vertically")
 eq(whirl.lyEnd, 0x5e, "over the whole screen, not one pic box")
 
 -- Surf: the ring is laid down on the first frame, and `.one` refuses to paint
--- anything until some other effect has opened the LCD-STAT window (which is
--- what BATTLE_BG_EFFECT_START_WATER is for).
+-- engine/battle_anims/functions.asm:1148, the SURF OBJECT, is what does.
 local surf = BgEffects.new(consts, { battleTurn = 0 })
 surf:queue("BATTLE_BG_EFFECT_SURF", 0, 0, 0)
 surf:playFrame()
 check(surf.surfWave ~= nil, "Surf builds its $40-byte wave ring")
 eq(surf.lyBackup[0x20], 0, "but paints nothing without an LCDC pointer")
-surf.lcdc = "SCY"
-surf.lyStart, surf.lyEnd = 0, 0x36
-surf:playFrame()
--- At amplitude 2 most rows of the ring round to zero; what matters is that
--- the window is painted at all.
-local painted = false
-for row = 1, 0x5e do
-  if (surf.lyBackup[row] or 0) ~= 0 then painted = true end
+
+-- data/moves/animations.asm:1126 BattleAnim_Surf, driven whole.
+local surfRun = runner(data.moves.SURF, { animId = "SURF" })
+local surfOpened, surfPainted = false, false
+for _ = 1, 120 do
+  if not surfRun:step() then break end
+  if surfRun.bg.lcdc == "SCY" and surfRun.bg.lyEnd == 0x5e then
+    surfOpened = true
+  end
+  if surfOpened then
+    for row = 1, 0x5e do
+      if (surfRun.bg.lyBackup[row] or 0) ~= 0 then surfPainted = true end
+    end
+  end
 end
-check(painted, "once one is set the water is on screen")
-eq(surf.lyBackup[0], 0, "and the row at lyStart stays flat")
+check(surfOpened, "the Surf object opens the window the BG effect waits on")
+check(surfPainted, "so the water rolls across the scanlines")
 
 -- The three water effects as a set: START opens the window and ends itself,
 -- WATER grows two scanlines a frame until its counter passes $20, END resets.

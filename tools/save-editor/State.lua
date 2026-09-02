@@ -26,6 +26,7 @@ function State.new()
     -- App.load's opts; nil in a bare `love . --editor` run.
     version = nil,
     slotId = nil,
+    modRoots = nil,
     -- Hosted inside the launcher process (Edit on a save row) rather than a
     -- standalone `--editor` window: Close returns to the launcher instead of
     -- quitting, and App calls onClose() to do it.
@@ -52,6 +53,11 @@ function State.new()
     -- without a z-order (#541).
     speciesPicker = nil,
 
+    -- move picker overlay: nil when closed, otherwise
+    -- { query, offset, slot = 1..4 }.  Same modal contract as speciesPicker;
+    -- the inspector opens it instead of cycling the catalog one tap at a time.
+    movePicker = nil,
+
     -- item picker overlay: nil when closed, otherwise
     -- { query, offset, dest = "bag"|"pc" }.  Same modal contract as
     -- speciesPicker above -- adding an item is now a full-screen picker
@@ -71,6 +77,7 @@ function State.new()
     itemPickOffset = 0, -- scroll position in the ADD ITEM list (#595)
     bagOffset = 0,
     pcOffset = 0,
+    pcSort = "index",
     itemsScroll = 0,    -- stacked-layout pixel scroll (#715)
 
     -- events

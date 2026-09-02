@@ -121,6 +121,21 @@ local DATA_UNBACKED = {
 }
 
 local dataProxies = setmetatable({}, { __mode = "kv" })
+local textPlain = setmetatable({}, { __mode = "kv" })
+
+-- ../pokecrystal/home/text.asm:548 PromptText, :566 DoneText
+local function plainText(text)
+  if type(text) ~= "table" then return text end
+  local hit = textPlain[text]
+  if hit then return hit end
+  local CommonText = rawRequire("src.core.gen2.CommonText")
+  hit = {}
+  for key, value in pairs(text) do
+    hit[key] = (type(value) == "string") and CommonText.plain(value) or value
+  end
+  textPlain[text] = hit
+  return hit
+end
 
 local function dataProxy(data)
   if not data then return nil end
@@ -129,7 +144,10 @@ local function dataProxy(data)
   hit = setmetatable({}, {
     __index = function(_, key)
       local renamed = DATA_RENAMES[key]
-      if renamed then return data[renamed] end
+      if renamed then
+        if key == "text" then return plainText(data[renamed]) end
+        return data[renamed]
+      end
       local why = DATA_UNBACKED[key]
       if why then
         warnOnce("data." .. key, "[%s] game.data.%s is Gen 1 only: %s",
@@ -197,9 +215,8 @@ local function buildGame()
   function translate.logicSpeed()
     return function()
       local g = live()
-      if not g then return 1 end
-      return math.max(1, tonumber(g.speedOverride)
-        or tonumber(g.options and g.options.speed) or 1)
+      if not g or not g.logicSpeed then return 1 end
+      return g:logicSpeed()
     end
   end
 
@@ -808,6 +825,33 @@ local function buildOverworld()
   local Movement = rawRequire("src.script.gen2.Movement")
   local HiddenItems = rawRequire("src.world.gen2.HiddenItems")
   local Bike = rawRequire("src.world.gen2.Bike")
+  local FieldMoves = rawRequire("src.world.gen2.FieldMoves")
+
+  -- home/map.asm:1869
+  local function stepAllowed(world, entity, dir, cx, cy)
+    local d = Map2.DELTA[dir]
+    if not (world.map and d and entity) then return true end
+    cx, cy = cx or entity.cellX, cy or entity.cellY
+    if not (cx and cy) then return true end
+    if not Permissions.stepPermitted(
+         function(px, py) return world:cellCollisionAcross(world.map, px, py) end,
+         cx, cy, dir) then
+      return false
+    end
+    local map = world.map
+    if entity == world.player and FieldMoves.isSurfing(world.playerState) then
+      map = world:surfMap(world.map)
+    end
+    local tx, ty = cx + d[1], cy + d[2]
+    if not map:inBounds(tx, ty) or not map:isWalkable(tx, ty) then return false end
+    for _, e in ipairs(world.entities or {}) do
+      if e ~= entity and not e.passable then
+        if e.cellX == tx and e.cellY == ty then return false end
+        if e.moving and e.targetX == tx and e.targetY == ty then return false end
+      end
+    end
+    return true
+  end
 
   local api = nil
   -- one WorldAPI instance, so queueScript reuses the five-verb allow list
@@ -1011,20 +1055,33 @@ local function buildOverworld()
 
   -- Gold has ONE movement slot; a second concurrent call is refused with a
   -- reason rather than dropped (src/world/gen2/WorldAPI.lua:171's recipe).
-  function ow.scriptMove(entity, dir, tiles, onDone)
+  function ow.scriptMove(entity, dir, tiles, onDone, opts)
     local world = w("scriptMove")
     if not world then return nil, "no overworld" end
     if world.moveState then return nil, "a movement is already running" end
     local step = Movement.stepByte(dir)
     if not step then return nil, "unknown direction: " .. tostring(dir) end
-    local bytes = {}
-    for _ = 1, math.max(0, tiles or 1) do bytes[#bytes + 1] = step end
-    bytes[#bytes + 1] = Movement.STEP_END
     local objectId = objectIdOf(world, entity)
     if not objectId then
       return nil, "no Gen 2 objectId for that entity: only the player and a "
         .. "mapped object (def.index) can be moved"
     end
+    local n = math.max(0, tiles or 1)
+    if opts and opts.collide and n > 0 then
+      local d = Map2.DELTA[dir]
+      local cx, cy = entity.cellX, entity.cellY
+      local allowed = 0
+      for _ = 1, n do
+        if not stepAllowed(world, entity, dir, cx, cy) then break end
+        allowed = allowed + 1
+        if d and cx and cy then cx, cy = cx + d[1], cy + d[2] end
+      end
+      if allowed < n then entity.facing = dir end
+      n = allowed
+    end
+    local bytes = {}
+    for _ = 1, n do bytes[#bytes + 1] = step end
+    bytes[#bytes + 1] = Movement.STEP_END
     world:beginMovement(objectId, bytes, onDone)
     return true
   end
@@ -1369,6 +1426,7 @@ COVERAGE[OW] = {
     .. "billsHouseBillExits tilesetHasWater surfBlockedHere "
     .. "checkSeafoamCurrent seafoamHolesFor boulderIntoHole openOaksPC "
     .. "dexRating cableClubReceptionist finishNurseHeal stepHealAnim "
+    .. "fishAnimFrames stepFishAnim tickFishAnim fishVerdict "
     .. "checkVictoryRewards offerGymTm runVictoryHook onStepComplete "
     .. "rollEncounter checkSpinner runSpinnerMoves rewrittenLastMap "
     .. "syncLastMapRewrite rememberOutdoor checkBadgeGate inSafariStepZone "
@@ -1401,7 +1459,8 @@ COVERAGE[OW] = {
       .. "objectId 1 is wLastTalked, not object zero",
     scriptMove = "the player maps to objectId 0 and a mapped object to "
       .. "def.index + 1; an entity with neither (a mod's own guest) is "
-      .. "REFUSED with a reason rather than moving the last-talked NPC",
+      .. "REFUSED with a reason rather than moving the last-talked NPC; "
+      .. "opts.collide truncates the walk at the first blocked step",
     connectionLanding = "Gen 1's five values (destDef, tilesetDef, x, y, "
       .. "conn); `conn` is Gold's connection record, keyed map/mapId + offset",
     timeOfDay = "recomputed from the clock every call and never cached, so a "
@@ -1541,7 +1600,7 @@ local function buildPartyMenu()
     elseif opts.battle and opts.onSwitch then
       prompt, battleSubmenu = "choose", true
     elseif opts.pickOnly then
-      prompt = "useItem"
+      prompt = opts.itemUse and "useItem" or "choose"
     elseif opts.onSwitch then
       -- src/ui/PartyMenu.lua:569: onSwitch OUTSIDE battle fires on A itself,
       -- so the field submenu must not swallow the press
@@ -1606,7 +1665,7 @@ COVERAGE["src.ui.PartyMenu"] = {
   warned = "keepOpen tmhm",
   absent = "drawIcon frameFor mirrorsIcon iconFrames sgbPalettes animateTo "
     .. "heal softboiledFrom battle subItems subIndex swapFrom blink onSwitch "
-    .. "pickOnly forceSwitch",
+    .. "pickOnly itemUse forceSwitch",
   notes = {
     new = "onSwitch(mon, menu) is wrapped onto onChoose(index, mon); opts."
       .. "battle carries only its BOOLEAN sense and self.battle is left nil "
@@ -1622,7 +1681,7 @@ COVERAGE["src.ui.PartyMenu"] = {
     onSwitch = "replacing menu.onSwitch on a LIVE instance writes a field "
       .. "Gen 2 never reads; pass it to .new instead",
     bottomMessage = "returns Gold's strings with <PK>/<MN> charmap glyphs, so "
-      .. "a compare against \"Use on which one?\" will not match",
+      .. "a compare against \"Use item on which\\nPOKéMON?\" will not match",
     ["hook ui.party.submenu"] = "same name and arity; rows carry `id` on Gold "
       .. "where Gen 1 carries `action`, and ctx.battle is a BOOLEAN, not a "
       .. "BattleState",
@@ -1670,8 +1729,8 @@ local function buildStartMenu()
   function overrides.new(game)
     local g = live() or game
     local save = g and g.save
-    if save and save.startMenuIndex then
-      Start2.lastIndex = save.startMenuIndex
+    if g and g.startMenuIndex then
+      Start2.lastIndex = g.startMenuIndex
     end
     return newOrig(g, {
       save = save,
@@ -1700,7 +1759,7 @@ COVERAGE["src.ui.StartMenu"] = {
     new = "synthesises onClose (stack:pop) and onChoose "
       .. "(Game2:openStartMenuItem); without them the menu cannot be left",
     index = "the cursor is menu.list.index on Gold (a Chrome.List)",
-    ["save.startMenuIndex"] = "copied INTO StartMenu.lastIndex on construct "
+    ["game.startMenuIndex"] = "copied INTO StartMenu.lastIndex on construct "
       .. "and never copied back: Gold's cursor is a class field, not save data",
     tx = "the box is fixed at Chrome.box(10, 0, 10, h); tx/ty/tw/th/anchor/"
       .. "maxVisible/startCloses/noSound do not exist and writes are inert",
@@ -1797,7 +1856,7 @@ local function buildBattleState()
     "syncSides", "playerHasPP", "lockedAction", "computeMusicKind",
     "throwBall", "ballChain", "tossAnimFor", "ballFlicker", "ballMissMessage",
     "storeCaughtMon", "safariAction", "safariEnemyTurn", "drawBallRow",
-    "drawClassic", "isWideBattleLayout", "wideLayout", "bgMode", "uiSize",
+    "drawClassic", "isWideBattleLayout", "wideLayout", "uiSize",
     "sgbPalettes", "trainerPalette", "trainerPicPath", "trainerTrueColor",
     "trainerSprite", "invalidate",
     "imageBattleScale", "resolveBattleScale", "backPlacement",
@@ -1881,12 +1940,12 @@ COVERAGE["src.battle.BattleState"] = {
   backed = "update draw __index isOpaque openParty swapMoves "
     .. "lowHealthAlarmActive playVictoryMusic say sayAuto openItems "
     .. "openReplacementMenu finish askNicknameUI playEntranceCry stampOT "
-    .. "tryRun wantsFillScale",
+    .. "tryRun wantsFillScale bgMode BG_WORLD_DIM",
   warned = "tryRun askNicknameUI",
   absent = "newWild newTrainer makeSafari makeGhost makeBattler resolveTurn "
     .. "computeDamage catchAttempt runRoll enter exit sgbPalettes "
-    .. "isWideBattleLayout wideLayout bgMode uiSize letterboxWhite "
-    .. "holdsUIAnchors BG_WORLD_DIM trainerPalette trainerPicPath "
+    .. "isWideBattleLayout wideLayout uiSize letterboxWhite "
+    .. "holdsUIAnchors trainerPalette trainerPicPath "
     .. "trainerTrueColor trainerSprite invalidate "
     .. "backPlacement frontPlacement StatBox drawClassic drawBallRow "
     .. "safariAction safariEnemyTurn throwBall storeCaughtMon field ruleset "
@@ -1901,8 +1960,13 @@ COVERAGE["src.battle.BattleState"] = {
       .. "takes its native safari path when it finds one",
     openParty = "Gold's takes a `forced` argument Gen 1's does not; a wrap "
       .. "must forward ... faithfully rather than normalising it away",
-    wantsFillScale = "returns TRUE unconditionally on Gold, which reads as "
-      .. "\"the player chose FILL\" and is not a choice at all",
+    wantsFillScale = "reads OPTION -> BATTLE SIZE (#1709), same fixed/fill "
+      .. "key as Gen 1; Gold has no WIDE layout, so FILL is the scale of the "
+      .. "160x144 panel and nothing more",
+    bgMode = "reads OPTION -> BATTLE BG (#1709), the same white/black/world "
+      .. "keys as Gen 1; Game2:paintBattleSurround paints the result, and "
+      .. "Gold's battle stays OPAQUE under world -- its map is drawn by "
+      .. "Game2:drawScene, not by StateStack finding the overworld below",
     swapMoves = "no disabled-slot migration and no sfx on Gold",
     sides = "self.battle.sides is the same { index, battlers, screens, "
       .. "hazards, tokens } shape, with the same index-1-is-player rule",

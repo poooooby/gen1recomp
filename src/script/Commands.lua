@@ -135,7 +135,11 @@ function Commands.show_text(ctx, textId, subs, extraOpts)
     end
   end
   -- MONEY_BOX (engine/menus/text_box.asm:133) reads the live wallet
-  if opts and opts.money == true then
+  if opts and opts.money == "choice" then
+    -- scripts/MtMoonPokecenter.asm:30
+    opts.money = function() return ctx.save.money end
+    opts.moneyWithChoice = true
+  elseif opts and opts.money == true then
     opts.money = function() return ctx.save.money end
   end
   ctx.game.stack:push(TextBox.new(ctx.game, text, function()
@@ -214,22 +218,23 @@ function Commands.jump_if_false(ctx, target)
   if not ctx.lastCheck then return target end
 end
 
--- give_item <itemId> [count] [gotText]: adds to the bag, plays the gift
--- jingle and shows the "got item!" box.  pokered's GiveItem (home/
+-- give_item <itemId> [count] [gotText] [fullText]: adds to the bag, plays
+-- the gift jingle and shows the "got item!" box.  pokered's GiveItem (home/
 -- give.asm) copies the item name to wStringBuffer and every gift script
 -- then prints a text ending "<PLAYER> got\n<item>!" with
 -- sound_get_item_1/sound_get_key_item.  gotText picks that per-script
 -- text (label or literal; {RAM:wStringBuffer} becomes the item name);
--- pass false when the script shows its own received-text row.
-function Commands.give_item(ctx, itemId, count, gotText)
+-- pass false when the script shows its own received-text row.  fullText
+-- picks the refusal text (scripts/BillsHouse.asm:184-186).
+function Commands.give_item(ctx, itemId, count, gotText, fullText)
   -- the bag can refuse at its configured capacity (20 in vanilla): halt
   -- the script, so later set_flag rows don't burn the gift -- make
   -- room and talk again, like the original (pokered's `jr nc, .bag_full`
   -- skips the received text entirely when AddItemToInventory refuses)
   if not require("src.inventory.Bag").add(
       ctx.save, itemId, count or 1, ctx.game.data) then
-    Commands.show_text(ctx, ctx.game.data.text
-      and ctx.game.data.text._BagFullText or Strings("You can't carry\nany more items!"))
+    Commands.show_text(ctx, fullText or (ctx.game.data.text
+      and ctx.game.data.text._BagFullText) or Strings("You can't carry\nany more items!"))
     return math.huge
   end
   local def = ctx.game.data.items[itemId]
@@ -294,7 +299,9 @@ end
 -- and battle music.
 function Commands.pushBattle(ctx, battle)
   if ctx.overworld and ctx.overworld.pushBattle then
-    ctx.overworld:pushBattle(battle)
+    -- engine/battle/battle_transitions.asm:28
+    ctx.overworld:pushBattle(battle,
+                             battle.kind == "trainer" and ctx.npc or nil)
   else
     Logger.warn("pushBattle: no overworld:pushBattle, skipping the transition wipe")
     ctx.game.stack:push(battle)
@@ -340,10 +347,8 @@ function Commands.start_battle(ctx, kind, a, b)
     ctx.lastBattleResult = result
     ctx.lastCheck = result == "win"
     if ctx.overworld then
-      -- A map script often follows a trainer battle with its own text.
-      -- Keep a level evolution behind that text: otherwise afterBattle
-      -- pushes the evolution screen, then this runner resumes and pushes
-      -- the trainer's text on top of it.
+      -- The map-side follow-up (stampClosedDoors, #372) rides behind the
+      -- script's own text; the evolution now runs in BattleState:finish.
       if result == "win" then
         ctx.afterScript = ctx.afterScript or {}
         table.insert(ctx.afterScript, function()
@@ -531,6 +536,16 @@ function Commands.set_field(ctx, key, value)
   ctx.save[key] = value
 end
 
+-- scripts/ChampionsRoom.asm:57
+function Commands.set_option(ctx, key, value)
+  local o = ctx.save.options
+  if not o then
+    o = {}
+    ctx.save.options = o
+  end
+  o[key] = value
+end
+
 function Commands.load_player_starter_name(ctx)
   local flags = ctx.save.flags or {}
   local species = flags.EVENT_CHOSE_PIKACHU and "PIKACHU"
@@ -702,7 +717,7 @@ local function askNickname(ctx, mon)
       return
     end
     Screens.push(ctx.game, "NamingScreen", {
-      title = Strings("NICKNAME?"), maxLen = 10,
+      title = Strings("NICKNAME?"), maxLen = 10, mon = mon,
       onDone = function(nick)
         if nick and #nick > 0 then mon.nickname = nick end
         ctx.lastCheck = success
@@ -722,7 +737,8 @@ end
 -- Box deposits also print SentToBoxText (give_pokemon.asm:36-37).
 -- skipNickname suppresses AskName for callers that name the gift themselves;
 -- no vanilla script uses it (pokeyellow scripts/OaksLab.asm, #1013)
-function Commands.give_pokemon(ctx, species, level, skipNickname)
+-- gotText prints GotMonText ahead of AskName (give_pokemon.asm:46).
+function Commands.give_pokemon(ctx, species, level, skipNickname, gotText)
   -- Native mods can transform a gift before the Pokémon object is created.
   -- This is intentionally an event rather than a special-case starter hook:
   -- mods can use the same seam for story gifts, fossils, or custom scripts.
@@ -756,6 +772,11 @@ function Commands.give_pokemon(ctx, species, level, skipNickname)
   ctx.lastCheck = true
   ctx.addedToParty = addedToParty
   ctx.boxNum = boxNum
+  -- engine/events/give_pokemon.asm:46
+  if gotText and ctx.runner then
+    Commands.text_sound(ctx, "Get_Item1")
+    Commands.show_text(ctx, "_GotMonText", { RAM = species })
+  end
   -- AskName: both AddPartyMon and SendNewMonToBox; skip mod-set nicks
   -- and callback-style callers with no script runner to yield on.
   if not gift.nickname and not skipNickname and ctx.runner then
@@ -793,6 +814,11 @@ end
 -- take_money <amount>: SubBCDPredef (engine/math/bcd.asm:193)
 function Commands.take_money(ctx, amount)
   ctx.save.money = math.max(0, (ctx.save.money or 0) - (amount or 0))
+end
+
+-- take_coins <amount>: SubBCDPredef (engine/events/prize_menu.asm:238-243)
+function Commands.take_coins(ctx, amount)
+  ctx.save.coins = math.max(0, (ctx.save.coins or 0) - (amount or 0))
 end
 
 -- Point LAST_MAP exits at an outdoor door (pokered wLastMap).  Keeps the
@@ -1211,6 +1237,16 @@ function Commands.replace_block(ctx, bx, by, blockId)
   if ctx.overworld then ctx.overworld:replaceBlock(bx, by, blockId) end
 end
 
+-- ss_anne_departs: scripts/VermilionDock.asm:80 .shift_columns_up, blocking
+-- until she has cleared her own width
+function Commands.ss_anne_departs(ctx)
+  local ow = ctx.overworld
+  if not ow or not ow.startSsAnneDeparture then return end
+  local runner = ctx.runner
+  ow:startSsAnneDeparture(function() runner:resume() end)
+  runner:yield()
+end
+
 -- set_tile_anim <anim|false>: override the current tileset's animation
 -- ("TILEANIM_WATER"; false stops it) until the next map change restores
 -- the record (setMap)
@@ -1295,11 +1331,14 @@ function FadeOverlay:update()
 end
 
 function FadeOverlay:draw()
-  if self.color == "white" then
-    love.graphics.setColor(1, 1, 1, self.alpha)
-  else
-    love.graphics.setColor(0, 0, 0, self.alpha)
+  local shade = (self.color == "white") and 1 or 0
+  -- home/fade.asm:26
+  local r = self.game and self.game.renderer
+  if r then
+    r.screenVeil = { shade, self.alpha }
+    return
   end
+  love.graphics.setColor(shade, shade, shade, self.alpha)
   love.graphics.rectangle("fill", 0, 0, 160, 144)
   love.graphics.setColor(1, 1, 1, 1)
 end
@@ -1422,7 +1461,7 @@ Commands.meta = {}
 for _, verb in ipairs({ "show_text", "ask", "choice", "start_battle", "warp",
     "open_mart", "trade", "push_screen", "record_hall_of_fame",
     "old_man_demo", "static_battle", "rival_battle", "give_item",
-    "give_pokemon", "fade", "pan_camera" }) do
+    "give_pokemon", "fade", "pan_camera", "ss_anne_departs" }) do
   Commands.meta[verb] = { foreground = true }
 end
 for _, verb in ipairs({ "show_text", "ask", "choice", "start_battle", "warp",
@@ -1430,7 +1469,8 @@ for _, verb in ipairs({ "show_text", "ask", "choice", "start_battle", "warp",
     "old_man_demo", "static_battle", "rival_battle", "give_item",
     "give_pokemon", "wait",
     "wait_flag", "move_player", "move_npc", "move_npc_to", "walk_npc",
-    "emote", "fade", "pan_camera", "play_once", "pikachu_make_way" }) do
+    "emote", "fade", "pan_camera", "play_once", "pikachu_make_way",
+    "ss_anne_departs" }) do
   local meta = Commands.meta[verb] or {}
   Commands.meta[verb] = meta
   meta.blocking = true

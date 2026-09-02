@@ -20,9 +20,7 @@
 --
 -- Note the cart's own bug, kept here: the level test reads wEnemyMonLevel
 -- BEFORE the enemy mon is loaded, so "stronger" is decided against whatever
--- the previous battle left there.  This port has no such stale byte, so it
--- compares honestly -- the one place the port is deliberately not bug-exact,
--- because the alternative is emulating an uninitialised variable.
+-- the previous battle left there (engine/battle/battle_transition.asm:164).
 --
 -- Everything that decides WHICH tiles go black is a pure function below and is
 -- covered by tests; the state at the bottom is the only part that draws.
@@ -55,7 +53,7 @@ local COLS, ROWS = 20, 18 -- SCREEN_WIDTH x SCREEN_HEIGHT, in tiles
 -- flash runs there is no four-entry palette left in the frame to permute.
 -- GbcPalette's remap shader puts one back: it matches each pixel to the BG
 -- palette entry that produced it and substitutes what the byte sends that entry
--- to, which is CopyPals exactly.  BattleTransition:drawFlash does that and
+-- to, which is CopyPals exactly.  BattleTransition:drawMap does that and
 -- falls back to flashVeil below -- the entry's mean shade against the identity
 -- %11100100 (3,2,1,0), normalised so 3,3,3,3 is solid black and 0,0,0,0 is
 -- solid white -- only when the exact pass cannot run.
@@ -98,13 +96,27 @@ function BattleTransition.flashVeil(pal)
   return (sum - 6) / 6
 end
 
+-- ../pokecrystal/engine/battle/battle_transition.asm:266-311
+BattleTransition.FLASH_SLOT_FRAMES =
+  #BattleTransition.FLASH_PALS * BattleTransition.FLASH_HOLD + 1
 BattleTransition.FLASH_FRAMES =
-  #BattleTransition.FLASH_PALS * BattleTransition.FLASH_HOLD
-    * BattleTransition.FLASH_CYCLES
+  BattleTransition.FLASH_SLOT_FRAMES * BattleTransition.FLASH_CYCLES
 
 --------------------------------------------------------------------------
 -- The Poke Ball overlay (trainer battles only)
 --------------------------------------------------------------------------
+
+BattleTransition.TRAINER_PAL = {
+  { 255, 148, 239 }, { 255, 90, 123 }, { 255, 41, 41 }, { 58, 58, 58 },
+}
+BattleTransition.TRAINER_PAL_DARK = {
+  { 255, 148, 239 }, { 255, 41, 41 }, { 255, 41, 41 }, { 255, 41, 41 },
+}
+-- ../pokecrystal/engine/battle/battle_transition.asm:689-701
+BattleTransition.RAMPED_OBJ = {
+  [Palettes.OW_PALETTE_ID.PAL_OW_TREE] = true,
+  [Palettes.OW_PALETTE_ID.PAL_OW_ROCK] = true,
+}
 
 -- `.PokeBallTransition`, 16 bigdw rows of 16 bits, stamped from hlcoord 2, 1.
 -- A set bit becomes BATTLETRANSITION_SQUARE; the drawing loop stops early on a
@@ -145,6 +157,26 @@ function BattleTransition.pokeballCells()
     end
   end
   return cells
+end
+
+-- ../pokecrystal/engine/battle/battle_transition.asm:151
+local SQUARE_TILE = {
+  "33333333", "30000003", "31000013", "31100113",
+  "31122113", "31222213", "32222223", "33333333",
+}
+
+function BattleTransition.squareTile() return SQUARE_TILE end
+
+function BattleTransition.squareShades(byte)
+  local shades = GbcPalette.bgpShades(byte)
+  local out = {}
+  for y = 1, 8 do
+    out[y] = {}
+    for x = 1, 8 do
+      out[y][x] = shades[tonumber(SQUARE_TILE[y]:sub(x, x)) + 1] + 1
+    end
+  end
+  return out
 end
 
 --------------------------------------------------------------------------
@@ -188,8 +220,8 @@ BattleTransition.SPIN_STEPS = {
   { "LOWER_LEFT",  "wedge1",  1, 11 },
 }
 
--- Each spin step holds for two frames (`call DelayFrame` twice).
-BattleTransition.SPIN_HOLD = 2
+-- ../pokecrystal/engine/battle/battle_transition.asm:381-402
+BattleTransition.SPIN_HOLD = 3
 
 -- Walk one wedge, marking cells in `black` (a [y * COLS + x] set).  The
 -- quadrant only decides two signs: RIGHT_QUADRANT_F flips the fill direction
@@ -230,8 +262,6 @@ end
 --------------------------------------------------------------------------
 
 -- `.boxes`: width, height, and the top-left corner, growing out of the middle
--- until the last one is the whole screen.  One box per WaitBGMap, i.e. one a
--- frame.
 BattleTransition.ZOOM_BOXES = {
   {  4,  2,  8, 8 },
   {  6,  4,  7, 7 },
@@ -243,6 +273,14 @@ BattleTransition.ZOOM_BOXES = {
   { 18, 16,  1, 1 },
   { 20, 18,  0, 0 },
 }
+-- ../pokecrystal/home/tilemap.asm:3-10
+BattleTransition.ZOOM_HOLD = 4
+
+-- ../pokecrystal/engine/battle/battle_transition.asm:29-32
+BattleTransition.OUTRO_LEAD = { spin = 2, speckle = 2, sine = 2, zoom = 1 }
+-- ../pokecrystal/engine/battle/battle_transition.asm:395-402
+BattleTransition.END_HOLD = { spin = 4, speckle = 4, sine = 1, zoom = 1 }
+
 -- `zoombox width, height, start y, start x` -- the macro's own argument order,
 -- which is why the third number is the ROW.
 function BattleTransition.zoomStep(black, box)
@@ -357,6 +395,15 @@ end
 function BattleTransition:drawsWidescreen() return true end
 function BattleTransition:wantsFillScale() return true end
 
+-- ../pokecrystal/engine/battle/battle_transition.asm:272-275
+local function darknessFor(world)
+  if not world then return false end
+  if world.daytime then return world.daytime == "DARK" end
+  local def = world.map and world.map.def
+  local hour = world.hour and world:hour() or nil
+  return Palettes.isDarkness(def, hour, world.flashUsed) and true or false
+end
+
 -- opts: world, trainer (bool), environment, playerLevel, enemyLevel,
 --       random(n), onDone
 function BattleTransition.new(game, opts)
@@ -389,12 +436,56 @@ function BattleTransition.new(game, opts)
   if not BattleTransition.STYLES[style] then style = vanillaStyle(ctx) end
   self.style = style
   self.trainer = opts.trainer and true or false
+  -- ../pokecrystal/engine/battle/battle_transition.asm:585-587
+  self.recolor = self.trainer
+  if opts.dark ~= nil then
+    self.dark = opts.dark and true or false
+  else
+    self.dark = darknessFor(self.world)
+  end
   self.black = {}
   self.frame = 0
   self.step = 0
-  self.phase = self.trainer and "pokeball" or "flash"
   self.sine = nil
+  self.phase = self.trainer and "pokeball" or "flash"
+  -- ../pokecrystal/engine/overworld/map_objects.asm:2191-2205
+  self.respawnFilter = function(npc) return self:keepsOpponent(npc) end
+  if self.world then
+    self.world.bgOverlay = function(s) self:drawBgLayer(s) end
+  end
   return self
+end
+
+function BattleTransition:keepsOpponent(npc)
+  local world = self.world
+  local vm = world and world.vm
+  if not (vm and vm.lastTalked) then return false end
+  if not (self.trainer or (vm.running and vm:running())) then return false end
+  return npc and npc.def and (npc.def.index or 0) + 1 == vm.lastTalked
+    or false
+end
+
+function BattleTransition:trainerRamp()
+  if not self.recolor then return nil end
+  return self.dark and BattleTransition.TRAINER_PAL_DARK
+    or BattleTransition.TRAINER_PAL
+end
+
+-- ../pokecrystal/engine/battle/battle_transition.asm:272-275
+function BattleTransition:flashFrames()
+  if self.dark then return BattleTransition.FLASH_CYCLES end
+  return BattleTransition.FLASH_FRAMES
+end
+
+function BattleTransition:beginOutro()
+  self.phase = "outro"
+  self.frame = 0
+  self.step = 0
+  self.ending = nil
+  self.captured = false
+  if self.style == "sine" then
+    self.sine = BattleTransition.sineFrames()
+  end
 end
 
 -- One logic frame.  The phases run in the jumptable's order and the state pops
@@ -412,14 +503,7 @@ function BattleTransition:update(_dt)
     return
   end
   if self.phase == "flash" then
-    if self.frame >= BattleTransition.FLASH_FRAMES then
-      self.phase = "outro"
-      self.frame = 0
-      self.step = 0
-      if self.style == "sine" then
-        self.sine = BattleTransition.sineFrames()
-      end
-    end
+    if self.frame >= self:flashFrames() then self:beginOutro() end
     return
   end
   if self.phase == "outro" then
@@ -435,36 +519,58 @@ end
 
 function BattleTransition:outroFrame()
   local style = self.style
+  self.captured = false
+  local world = self.world
+  if self.frame >= 1 and world and not world.spriteFilter then
+    world.spriteFilter = self.respawnFilter
+  end
+  if self.ending then
+    self.ending = self.ending - 1
+    if self.ending <= 0 then self:blackOut() end
+    return
+  end
+  local at = self.frame - (BattleTransition.OUTRO_LEAD[style] or 2)
+  if at < 0 then return end
   if style == "spin" then
-    if self.frame % BattleTransition.SPIN_HOLD ~= 1 then return end
+    if at % BattleTransition.SPIN_HOLD ~= 0 then return end
     self.step = self.step + 1
     local step = BattleTransition.SPIN_STEPS[self.step]
     if not step then
-      self:blackOut()
+      self:endOutro()
       return
     end
     BattleTransition.spinStep(self.black, step)
   elseif style == "zoom" then
+    if at % BattleTransition.ZOOM_HOLD ~= 0 then return end
     self.step = self.step + 1
     local box = BattleTransition.ZOOM_BOXES[self.step]
     if not box then
-      self:blackOut()
+      self:endOutro()
       return
     end
     BattleTransition.zoomStep(self.black, box)
   elseif style == "speckle" then
     self.step = self.step + 1
     if self.step > BattleTransition.SPECKLE_PASSES then
-      self:blackOut()
+      self:endOutro()
       return
     end
     BattleTransition.speckleStep(self.black, self.random)
   else -- sine
     self.step = self.step + 1
     if not (self.sine and self.sine[self.step]) then
-      self:blackOut()
+      self:endOutro()
       return
     end
+  end
+end
+
+function BattleTransition:endOutro()
+  local hold = BattleTransition.END_HOLD[self.style] or 0
+  if hold > 0 then
+    self.ending = hold
+  else
+    self:blackOut()
   end
 end
 
@@ -487,6 +593,14 @@ end
 function BattleTransition:finish()
   if self.finished then return end
   self.finished = true
+  local world = self.world
+  if world then
+    if world.bgOverlay then world.bgOverlay = nil end
+    if world.spriteFilter == self.respawnFilter then
+      world.spriteFilter = nil
+    end
+    world.peopleHidden = nil
+  end
   local stack = self.game and self.game.stack
   if stack then stack:pop() end
   if self.onDone then self.onDone() end
@@ -495,7 +609,8 @@ end
 -- The LY overrides this frame, or nil outside the sine outro.
 function BattleTransition:lyOverrides()
   if self.phase ~= "outro" or self.style ~= "sine" then return nil end
-  return self.sine and self.sine[self.step] or nil
+  if not (self.sine and self.step > 0) then return nil end
+  return self.sine[math.min(self.step, #self.sine)]
 end
 
 -- `black` covers the 20x18 tilemap; the window is bigger than that, so a cell
@@ -516,9 +631,10 @@ end
 
 -- The .pals row this frame is holding, or nil outside the flash phase.
 function BattleTransition:flashPal()
-  if self.phase ~= "flash" then return nil end
-  local index = math.floor(self.frame / BattleTransition.FLASH_HOLD)
-    % #BattleTransition.FLASH_PALS + 1
+  if self.phase ~= "flash" or self.dark then return nil end
+  local slot = self.frame % BattleTransition.FLASH_SLOT_FRAMES
+  local index = math.min(math.floor(slot / BattleTransition.FLASH_HOLD),
+    #BattleTransition.FLASH_PALS - 1) + 1
   return BattleTransition.FLASH_PALS[index]
 end
 
@@ -536,29 +652,73 @@ function BattleTransition:remapPalettes()
   return bg, Palettes.objectSet(world.palettes, world.daytime)
 end
 
+-- ../pokecrystal/engine/battle/battle_transition.asm:657-683
+function BattleTransition:bindRemap(byte)
+  if Tilt.active and Tilt.active() then return false end
+  if not GbcPalette.remapShader() then return false end
+  byte = byte or GbcPalette.BGP_IDENTITY
+  local ramp = self:trainerRamp()
+  local world = self.world
+  local def = world and world.map and world.map.def
+  local daytime = world and world.daytime
+  local palettes = world and world.palettes
+  local cache = self.remapCache
+  if not (cache and cache.byte == byte and cache.ramp == ramp
+          and cache.def == def and cache.daytime == daytime
+          and cache.palettes == palettes) then
+    local bg, obj = self:remapPalettes()
+    if not bg then return false end
+    local uniforms = GbcPalette.remapUniforms(bg, byte, obj, ramp,
+      ramp and BattleTransition.RAMPED_OBJ or nil)
+    if not uniforms then return false end
+    cache = { byte = byte, ramp = ramp, def = def, daytime = daytime,
+      palettes = palettes, uniforms = uniforms }
+    self.remapCache = cache
+  end
+  return GbcPalette.useRemapUniforms(cache.uniforms) and true or false
+end
+
 -- Draw the map through this frame's rBGP byte, exactly.  Returns false when the
 -- exact pass cannot run, which is the caller's cue to draw the world plainly
 -- and lay the brightness veil over it instead.
-function BattleTransition:drawFlash(w, h, pal)
-  local byte = BattleTransition.flashByte(pal)
-  if byte == GbcPalette.BGP_IDENTITY then
+function BattleTransition:drawMap(w, h, byte)
+  local ramp = self:trainerRamp()
+  if not ramp and (not byte or byte == GbcPalette.BGP_IDENTITY) then
     -- `dc 3, 2, 1, 0` twice in the table: the picture is simply itself.
-    self.world:draw()
+    self:drawWorld()
     return true
   end
   -- TILT projects the finished frame through a linear-filtered canvas, so its
   -- pixels are blends of palette colours rather than palette colours; matching
   -- them back would posterise the warp instead of flashing it.
-  if Tilt.active and Tilt.active() then return false end
-  local bg, obj = self:remapPalettes()
-  if not bg then return false end
   local canvas = self:capture(w, h)
   if not canvas then return false end
-  local applied = GbcPalette.useRemap(bg, byte, obj)
-  if not applied then return false end
+  if not self:bindRemap(byte) then return false end
   love.graphics.setColor(1, 1, 1, 1)
   love.graphics.draw(canvas, 0, 0)
   GbcPalette.clear()
+  self.overlayDrawn = self.captureLayered
+  return true
+end
+
+function BattleTransition:drawWorld()
+  self.overlayDrawn = false
+  self.world:draw()
+  return self.overlayDrawn
+end
+
+BattleTransition.TINT_ALPHA = 0.55
+
+function BattleTransition:drawTint(w, h)
+  local ramp = self:trainerRamp()
+  if not ramp then return false end
+  local color = GbcPalette.resolve(ramp)
+  local c = color and color[3]
+  if not c then return false end
+  local G = love.graphics
+  G.setColor(c[1] / 255, c[2] / 255, c[3] / 255, BattleTransition.TINT_ALPHA)
+  G.rectangle("fill", 0, 0, w, h)
+  G.setColor(1, 1, 1, 1)
   return true
 end
 
@@ -577,22 +737,21 @@ function BattleTransition:drawWidescreen(w, h)
   -- Cleared once the flash has been drawn exactly, so the veil below is only
   -- ever the fallback and the two can never both land on one frame.
   local pal = self:flashPal()
+  local byte = pal and BattleTransition.flashByte(pal) or nil
 
+  self.overlayDrawn = false
   if world and world.map then
     if ly then
       self:drawWavy(w, h, ly)
-    elseif pal and self:drawFlash(w, h, pal) then
+    elseif self:drawMap(w, h, byte) then
       pal = nil
     else
-      world:draw()
+      self:drawWorld()
+      self:drawTint(w, h)
     end
   else
     G.setColor(0, 0, 0, 1)
     G.rectangle("fill", 0, 0, w, h)
-  end
-
-  if self.phase == "pokeball" then
-    self:drawCells(w, h, BattleTransition.pokeballCells())
   end
 
   if pal then
@@ -604,7 +763,7 @@ function BattleTransition:drawWidescreen(w, h)
     end
   end
 
-  self:drawBlack(w, h)
+  if not self.overlayDrawn then self:drawTopLayer(w, h) end
   G.setColor(1, 1, 1, 1)
 end
 
@@ -619,19 +778,97 @@ function BattleTransition:grid(w, h)
     scale = math.max(1, math.floor(math.min(w / 160, h / 144)))
   end
   local size = 8 * scale
-  local ox = math.floor((w - 160 * scale) / 2)
-  local oy = math.floor((h - 144 * scale) / 2)
+  local Chrome = require("src.ui.gen2.Chrome")
+  local ox, oy = Chrome.fitOrigin(w, h, scale)
   return size, ox, oy
 end
 
-function BattleTransition:drawBlack(w, h)
-  local G = love.graphics
+function BattleTransition:drawTopLayer(w, h)
   local size, ox, oy = self:grid(w, h)
+  self:paintLayer(size, ox, oy, w, h)
+end
+
+-- ../pokecrystal/engine/battle/battle_transition.asm:609-646
+function BattleTransition:drawBgLayer(s)
+  if self.finished then return end
+  local world = self.world
+  if not (world and world.gbScreenOrigin) then return end
+  local G = love.graphics
+  local canvas = G.getCanvas()
+  local bw, bh
+  if canvas then
+    bw, bh = canvas:getDimensions()
+  else
+    bw, bh = Playfield.dimensions()
+  end
+  local sox, soy = world:gbScreenOrigin()
+  self:paintLayer(8 * s, sox * s, soy * s, bw, bh)
+  self.overlayDrawn = true
+end
+
+function BattleTransition:ballImage()
+  local ramp = self:trainerRamp()
+  local cache = self.ballCache
+  if cache and cache.ramp == ramp and cache.mode == GbcPalette.mode
+      and cache.custom == GbcPalette.customRamp then
+    return cache.image
+  end
+  local previous = GbcPalette.setBgp(nil)
+  local ok, image = pcall(function()
+    local data = love.image.newImageData(8, 8)
+    for y = 1, 8 do
+      for x = 1, 8 do
+        local c = GbcPalette.color(ramp, tonumber(SQUARE_TILE[y]:sub(x, x)) + 1)
+        data:setPixel(x - 1, y - 1, c[1] / 255, c[2] / 255, c[3] / 255, 1)
+      end
+    end
+    local made = love.graphics.newImage(data)
+    if made.setFilter then made:setFilter("nearest", "nearest") end
+    return made
+  end)
+  GbcPalette.setBgp(previous)
+  if not ok then image = nil end
+  self.ballCache = { ramp = ramp, mode = GbcPalette.mode,
+    custom = GbcPalette.customRamp, image = image }
+  return image
+end
+
+function BattleTransition:blackColor()
+  local ramp = self:trainerRamp()
+  if ramp then
+    local previous = GbcPalette.setBgp(nil)
+    local c = GbcPalette.color(ramp, 4)
+    GbcPalette.setBgp(previous)
+    if c then return c[1] / 255, c[2] / 255, c[3] / 255 end
+  end
+  return 0, 0, 0
+end
+
+function BattleTransition:paintLayer(size, ox, oy, w, h)
+  local G = love.graphics
+  if self.trainer then
+    local image = self:ballImage()
+    local scale = size / 8
+    G.setColor(1, 1, 1, 1)
+    for _, cell in ipairs(BattleTransition.pokeballCells()) do
+      local x = math.floor(ox + cell[1] * size)
+      local y = math.floor(oy + cell[2] * size)
+      if image then
+        G.draw(image, x, y, 0, scale, scale)
+      else
+        local r, g, b = self:blackColor()
+        G.setColor(r, g, b, 1)
+        G.rectangle("fill", x, y, size, size)
+        G.setColor(1, 1, 1, 1)
+      end
+    end
+  end
+  if not next(self.black) then return end
   local first = -math.ceil(ox / size)
   local last = math.ceil((w - ox) / size)
   local top = -math.ceil(oy / size)
   local bottom = math.ceil((h - oy) / size)
-  G.setColor(0, 0, 0, 1)
+  G.setColor(self:blackColor())
   for row = top, bottom - 1 do
     for col = first, last - 1 do
       if self:blackAt(col, row) then
@@ -639,38 +876,25 @@ function BattleTransition:drawBlack(w, h)
       end
     end
   end
-end
-
--- BATTLETRANSITION_SQUARE, the Poke Ball's own tile: a filled block in the
--- text palette rather than the black the wipe uses, so the ball reads against
--- the map behind it.
-function BattleTransition:drawCells(w, h, cells)
-  local G = love.graphics
-  local size, ox, oy = self:grid(w, h)
-  -- Shade 3 of the text palette, through the COLOR mode like every other
-  -- direct colour read.
-  local color = GbcPalette.color(nil, 4)
-  if color then
-    G.setColor(color[1] / 255, color[2] / 255, color[3] / 255, 1)
-  else
-    G.setColor(0, 0, 0, 1)
-  end
-  for _, cell in ipairs(cells) do
-    G.rectangle("fill", ox + cell[1] * size, oy + cell[2] * size, size, size)
-  end
+  G.setColor(1, 1, 1, 1)
 end
 
 -- The sine outro shifts whole scanlines, which needs the frame as a texture:
 -- the world is captured once and re-blitted a row at a time from then on.
 function BattleTransition:drawWavy(w, h, ly)
   local G = love.graphics
+  local world = self.world
+  -- ../pokecrystal/engine/battle/battle_transition.asm:320-321
+  local split = not (Tilt.active and Tilt.active())
+  if split then world.peopleHidden = true end
   local canvas = self:capture(w, h)
+  world.peopleHidden = nil
   if not canvas then
-    self.world:draw()
+    self:drawWorld()
     return
   end
   local scale = 1
-  if self.world.fitScale then scale = self.world:fitScale() end
+  if world.fitScale then scale = world:fitScale() end
   G.setColor(0, 0, 0, 1)
   G.rectangle("fill", 0, 0, w, h)
   G.setColor(1, 1, 1, 1)
@@ -678,6 +902,7 @@ function BattleTransition:drawWavy(w, h, ly)
   if not self.quad then
     self.quad = love.graphics.newQuad(0, 0, w, scale, w, h)
   end
+  local shaded = self:trainerRamp() and self:bindRemap(nil)
   for y = 0, rows - 1 do
     -- 144 overrides for however many screen rows the window has; a row past
     -- the end of the array holds the last value, the way the LCD keeps the
@@ -695,6 +920,16 @@ function BattleTransition:drawWavy(w, h, ly)
     elseif shift < 0 then
       G.draw(canvas, self.quad, -shift - w, y * scale)
     end
+  end
+  if shaded then
+    GbcPalette.clear()
+  else
+    self:drawTint(w, h)
+  end
+  self.overlayDrawn = self.captureLayered
+  if split and world.drawPeople and world.zoomScale then
+    G.setColor(1, 1, 1, 1)
+    world:drawPeople(world:zoomScale())
   end
 end
 
@@ -718,7 +953,7 @@ function BattleTransition:capture(w, h)
     G.origin()
     G.setCanvas(self.canvas)
     G.clear(0, 0, 0, 1)
-    self.world:draw()
+    self.captureLayered = self:drawWorld()
     G.setCanvas(previous)
     G.pop()
     self.captured = true

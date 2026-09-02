@@ -346,8 +346,8 @@ function InitClock:drawPanel()
   Chrome.printWrapped(self:pageText(), 1, 14, 18, 3)
   if self:confirming() then
     Chrome.box(14, 6, 6, 5)
-    Chrome.print("YES", 16, 7)
-    Chrome.print("NO", 16, 9)
+    Chrome.print(Strings("YES"), 16, 7)
+    Chrome.print(Strings("NO"), 16, 9)
     Chrome.cursor(15, self.yesNo == 1 and 7 or 9)
   end
 end
@@ -358,8 +358,7 @@ end
 
 function InitClock:drawWidescreen(winW, winH)
   local G = love.graphics
-  G.setColor(1, 1, 1, 1)
-  G.rectangle("fill", 0, 0, winW, winH)
+  Chrome.letterbox(winW, winH, 1, 1, 1)
   local scale = Chrome.fitScale(winW, winH)
   local ox, oy = Chrome.fitOrigin(winW, winH, scale)
   G.push()

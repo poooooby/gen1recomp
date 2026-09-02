@@ -12,6 +12,7 @@ local Font = require("src.render.Font")
 -- TypeChart.displayName maps it back to "PSYCHIC", like HallOfFame and the
 -- battle move-type box already do (#214).
 local TypeChart = require("src.battle.TypeChart")
+local LevelDisplay = require("src.ui.LevelDisplay")
 local Strings = require("src.core.Strings")
 local Stats = require("src.pokemon.Stats")
 local Status = require("src.battle.Status")
@@ -51,18 +52,36 @@ function SummaryMenu.new(game, mon)
     self.sprite = ok and img or nil
   end
   self.spriteTrueColor = self.sprite and trueColor or false
-  require("src.core.Sound").playCry(game.data, mon.species)
+  -- engine/pokemon/status_screen.asm:82,168-172
+  self.whiteHold = tonumber(require("src.render.Transition").flashFrames(game)) or 0
+  if self.whiteHold <= 0 then
+    self.whiteHold = 0
+    require("src.core.Sound").playCry(game.data, mon.species)
+  end
   return self
 end
 
 function SummaryMenu:update(dt)
+  if self.closing then return end
+  if self.whiteHold and self.whiteHold > 0 then
+    self.whiteHold = self.whiteHold - 1
+    if self.whiteHold == 0 then
+      require("src.core.Sound").playCry(self.game.data, self.mon.species)
+    end
+    return
+  end
   local input = self.game.input
   -- both A and B advance the pages (WaitForTextScrollButtonPress)
   if input:wasPressed("a") or input:wasPressed("b") then
     if self.page == 1 then
       self.page = 2
     else
-      self.game.stack:pop()
+      -- engine/pokemon/status_screen.asm:431, home/pokemon.asm:186
+      local Transition = require("src.render.Transition")
+      self.closing = true
+      self.game.stack:push(Transition.whiteFlash(self.game, nil, function()
+        self.game.stack:pop()
+      end))
     end
   end
 end
@@ -137,7 +156,9 @@ function SummaryMenu:draw()
   if self.page == 1 then
     -- level is page 1 only: StatusScreen2 opens with ClearScreenArea over
     -- (9,2) 5x10 (status_screen.asm:303-305). #280
-    printLevel(14, 2, mon.level)
+    if LevelDisplay.visible(mon, "summary", self.game) then -- RFC 0019
+      printLevel(14, 2, mon.level)
+    end
     drawLineBox(19, 1, 6, 10)
     -- engine/pokemon/status_screen.asm:120-125
     local PaletteFX = require("src.render.PaletteFX")
@@ -163,10 +184,10 @@ function SummaryMenu:draw()
     -- TYPE1/TYPE2/IDNo/OT column (10,9) with values indented (11,10)
     drawLineBox(19, 9, 8, 6)
     Font.draw(Strings("TYPE1/"), 80, 72)
-    Font.draw(def.types[1] and TypeChart.displayName(def.types[1]) or "", 88, 80)
+    Font.draw(def.types[1] and TypeChart.displayName(def.types[1], data) or "", 88, 80)
     if def.types[2] then
       Font.draw(Strings("TYPE2/"), 80, 88)
-      Font.draw(TypeChart.displayName(def.types[2]), 88, 96)
+      Font.draw(TypeChart.displayName(def.types[2], data), 88, 96)
     end
     -- TypesIDNoOTText's third row is "<ID>№/" (status_screen.asm:205-210):
     -- two single-tile glyphs and a slash, three columns wide, not the five
@@ -196,8 +217,12 @@ function SummaryMenu:draw()
     local nextExp = mon.level < 100
       and (Growth.expForLevel(def.growthRate, mon.level + 1) - mon.exp) or 0
     Font.draw(("%7d"):format(math.max(0, nextExp)), 56, 48)
-    HudTiles.statusTile(0x70, 112, 48) -- '<to>' at (14,6), was missing (#280)
-    printLevel(16, 6, math.min(100, mon.level + 1))
+    if LevelDisplay.visible(mon, "summary", self.game) then -- RFC 0019
+      -- the '<to>' arrow is half a sentence without the level it points at,
+      -- so the pair is hidden together
+      HudTiles.statusTile(0x70, 112, 48) -- '<to>' at (14,6), was missing (#280)
+      printLevel(16, 6, math.min(100, mon.level + 1))
+    end
     Font.drawBox(0, 8, 20, 10)
     for i = 1, 4 do
       local mv = mon.moves[i]
@@ -215,6 +240,10 @@ function SummaryMenu:draw()
     end
   end
   love.graphics.setColor(1, 1, 1, 1)
+  -- engine/pokemon/status_screen.asm:82
+  if self.whiteHold and self.whiteHold > 0 then
+    love.graphics.rectangle("fill", 0, 0, 160, 144)
+  end
 end
 
 return SummaryMenu

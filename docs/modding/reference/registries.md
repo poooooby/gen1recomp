@@ -342,7 +342,9 @@ accepted and merged as-is.
 | `source` | string |
 | `swarmGrass` | map of string -> {map?, rates, slots} |
 | `swarmWater` | map of string -> {map?, rate, slots} |
-| `treeSets` | map of string -> {common, rare} |
+| `timeFishGroups` | map of string | integer 0..255 -> {day, nite} |
+| `treeMonsAsleep` | {DAY, MORN, NITE} |
+| `treeSets` | map of string -> {common, rare?} |
 | `trees` | map of string -> string |
 | `water` | map of string -> {map?, rate, slots} |
 
@@ -385,7 +387,7 @@ accepted and merged as-is.
 | `hiddenItems` | map of string -> list of {item, x, y} |
 | `ledges` | list of {facing, input, ledgeTile, standingTile, tileset?} |
 | `playerPics` | {back?, demoBack?, front?, oakBack?} |
-| `townMap` | {background?, cursorOrder?, gridPixelSize?, locations?, nest?} |
+| `townMap` | {background?, cursorOrder?, gridPixelSize?, locations?, nest?, upArrow?} |
 
 ```lua
 mod.content.field:patch("boot", { startMap = "SABLE_COVE" })
@@ -509,6 +511,26 @@ mod.content.item_effects:register("MOON_FLUTE", { use = fn, field = true })
 mod.content.items:patch("POTION", { price = 100 })
 ```
 
+### On Gold (Gen 2)
+
+- semantics: `record`
+- target: `Data.items`
+
+The record differs; the registry name, the verbs and the id space
+do not.
+
+| field | type | required |
+|---|---|---|
+| `ball` | balls id | no |
+| `effect` | item_effects id | no |
+| `id` | string | yes |
+| `index` | integer 0..255 | no |
+| `machine` | {kind, move, number} | no |
+| `name` | string | yes |
+| `needsTarget` | boolean | no |
+| `price` | integer >= 0 | yes |
+| `tossable` | boolean | no |
+
 ## landmarks
 
 - semantics: `record`
@@ -598,7 +620,7 @@ mod.content.map_songs:override("PALLET_TOWN", "Music_Routes1")
 | `id` | string | yes |
 | `index` | integer >= 0 | no |
 | `label` | string | no |
-| `objects` | list of any value | no |
+| `objects` | list of {pokemon?, ...} | no |
 | `palette` | string | no |
 | `signs` | list of any value | no |
 | `tileset` | tilesets id | yes |
@@ -672,6 +694,34 @@ mod.content.move_effects:register("DRAIN_PP_EFFECT", { kind = "primary", run = f
 ```lua
 mod.content.moves:patch("BLIZZARD", { accuracy = 70 })
 ```
+
+### On Gold (Gen 2)
+
+- semantics: `record`
+- target: `Data.moves`
+
+The record differs; the registry name, the verbs and the id space
+do not.
+
+| field | type | required |
+|---|---|---|
+| `accuracy` | integer 0..100 | yes |
+| `anim` | any value | no |
+| `category` | one of "physical" | "special" | "status" | no |
+| `chargeText` | string | no |
+| `counterable` | boolean | no |
+| `effect` | move_effects id | yes |
+| `fixedDamage` | integer >= 1 | function | no |
+| `highCrit` | boolean | no |
+| `id` | string | yes |
+| `index` | integer 0..255 | no |
+| `multiHit` | integer >= 1 | list of integer >= 1 | no |
+| `name` | string | yes |
+| `power` | integer 0..255 | yes |
+| `pp` | integer 0..64 | yes |
+| `priority` | integer -7..7 | no |
+| `semiInvulnerable` | boolean | no |
+| `type` | type_chart id | yes |
 
 ## music
 
@@ -747,6 +797,7 @@ and reported. See the Gold subsection below for where it does land.
 | `index` | integer >= 0 | yes |
 | `map` | maps id | no |
 | `member` | string | no |
+| `name` | string | no |
 | `number` | integer 0..255 | no |
 
 ```lua
@@ -769,10 +820,11 @@ mod.content.phone_contacts:patch("PHONE_YOUNGSTER_JOEY", { map = "ROUTE_31" })
 | `baseStats` | {attack, defense, hp, special, speed} | yes |
 | `battleScaleBack` | number 0.25..4 | no |
 | `battleScaleFront` | number 0.25..4 | no |
+| `battleTheme` | music id | no |
 | `catchRate` | integer 0..255 | yes |
 | `cry` | cries id | no |
 | `dex` | integer >= 1 | yes |
-| `dexEntry` | {heightFt, heightIn, heightM?, kind, text, weight, weightKg?} | no |
+| `dexEntry` | {heightFt, heightIn, heightM?, kind, text, text2?, weight, weightKg?} | no |
 | `evolutions` | list of {item?, level?, method, species} | yes |
 | `frontSize` | integer 1..7 | yes |
 | `growthRate` | growth_rates id | yes |
@@ -807,6 +859,7 @@ do not.
 | `baseStats` | {attack, defense, hp, specialAttack, specialDefense, speed} | yes |
 | `battleScaleBack` | number 0.25..4 | no |
 | `battleScaleFront` | number 0.25..4 | no |
+| `battleTheme` | music id | no |
 | `catchRate` | integer 0..255 | yes |
 | `cry` | cries id | no |
 | `dex` | integer >= 1 | yes |
@@ -847,7 +900,7 @@ and reported. See the Gold subsection below for where it does land.
 
 | field | type | required |
 |---|---|---|
-| `channel` | integer 0..255 | yes |
+| `channel` | integer 0..255 | no |
 | `name` | string | no |
 
 ```lua
@@ -881,6 +934,25 @@ mod.content.radio_channels:register("PIRATE_RADIO", { channel = 9, name = "PIRAT
 ```lua
 mod.content.render_pipelines:register("voxel", { label = "VOXEL", levels = { "OFF", "15", "35", "50" }, drawWorld = fn })
 ```
+
+## rom_text
+
+- semantics: `record`
+- target: none
+
+Gen 2 only: Red, Blue and Yellow have no such system, so there is no
+Gen 1 table to merge into and a write here on a Gen 1 boot is dropped
+and reported. See the Gold subsection below for where it does land.
+- value: string
+
+```lua
+mod.content.rom_text:override("_WokeUpText", "%s se réveille !")
+```
+
+### On Gold (Gen 2)
+
+- semantics: `record`
+- target: `Data.text`
 
 ## rulesets
 
@@ -1101,8 +1173,10 @@ mod.content.tokens:register("CLOCK", function(game) return "12" end)
 | `id` | string | yes |
 | `index` | integer 0..255 | no |
 | `name` | string | yes |
+| `palette` | palettes id | no |
 | `paletteSource` | string | no |
-| `parties` | list of list of {level, species} | yes |
+| `parties` | list of list of {level, moves?, species} | yes |
+| `partyNames` | map of integer >= 1 -> string | no |
 | `pic` | file path | no |
 | `trueColor` | boolean | no |
 
@@ -1122,6 +1196,7 @@ do not.
 |---|---|---|
 | `attributes` | list of integer 0..255 | no |
 | `baseMoney` | integer >= 0 | no |
+| `battleTheme` | music id | no |
 | `encounterMusic` | music id | no |
 | `id` | string | no |
 | `index` | integer 0..255 | no |

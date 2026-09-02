@@ -74,6 +74,12 @@ if ok then
     peak = math.max(peak, math.abs(l), math.abs(r))
   end
   check(peak > 0.01, "TitleScreen renders audible samples (peak=" .. peak .. ")")
+  -- audio/drumkits.asm kit 5: the NR42 envelope rings on past the noise_note
+  -- script, so a snare must outlast the one frame its script occupies.
+  local frame = ChipSynth.SAMPLE_RATE / 60
+  local snare = engine:drumInstrumentGen2(5, 1)
+  check(snare[#snare].endSample > frame * 2,
+    "kit 5 snare rings past its script (" .. snare[#snare].endSample .. " samples)")
 end
 
 local bark = audio.songs.Music_NewBarkTown
@@ -140,9 +146,54 @@ if type(audio.cries) == "table" and audio.cries.MARILL then
     end
     check(frames < 60,
       ("channel 5 runs %.0f frames, under a second"):format(frames))
+
+    -- ../pokecrystal/audio/engine.asm:105
+    local ch = cryEng.channels[1]
+    local zero, worst = false, nil
+    for tempo = 1, 576 do
+      ch.frameTicks, ch.durationModifier, ch.noteLength = tempo, 0, 1
+      for length = 0, 15 do
+        if ch:durationTicksGen2(length) <= 0 then
+          zero, worst = true, ("tempo %d length %d"):format(tempo, length)
+        end
+      end
+    end
+    check(not zero, "SetNoteDuration never yields a zero-frame note"
+      .. (worst and (" (" .. worst .. ")") or ""))
   end
 else
   check(true, "cries table absent : re-import Gold for cry coverage (SKIP)")
+end
+
+-- ../pokecrystal/audio/cries.asm:486
+if type(audio.cries) == "table" and audio.cries.CYNDAQUIL then
+  local cry = audio.cries.CYNDAQUIL
+  eq(cry.length, 128, "CYNDAQUIL cry length word is 128")
+  local cryOk, cryEng = pcall(ChipSynth.newEngine, data, cry.header, {
+    sfx = true, allowLoops = false,
+    frequencyOffset = cry.pitch, cryLength = cry.length,
+  })
+  check(cryOk, "CYNDAQUIL cry engine builds"
+    .. (cryOk and "" or (": " .. tostring(cryEng))))
+  if cryOk then
+    for index = 1, 2 do
+      local frames, events, dropped = 0, 0, 0
+      for _ = 1, 128 do
+        local event = cryEng.channels[index]:nextEvent()
+        if not event then break end
+        events = events + 1
+        if event.duration * 60 < 0.5 then dropped = dropped + 1 end
+        frames = frames + event.duration * 60
+      end
+      eq(dropped, 0, ("channel %d drops no note"):format(index + 4))
+      eq(math.floor(frames + 0.5), 20,
+        ("channel %d runs the cart's 20 frames"):format(index + 4))
+      check(events == 17, ("channel %d keeps all 17 notes (%d)")
+        :format(index + 4, events))
+    end
+  end
+else
+  check(true, "CYNDAQUIL cry absent : re-import Gold for cry coverage (SKIP)")
 end
 
 -- Which sfx silence the music.  On the cart sfx channel N takes hardware
@@ -178,6 +229,27 @@ if type(audio.sfx) == "table" and audio.sfx.Sfx_RegisterPhoneNumber then
     "the three-channel Sfx_Fanfare is still named as a jingle")
 else
   check(true, "sfx table absent, re-import Gold for duck coverage (SKIP)")
+end
+
+if bark then
+  local function renderBark(rate, seconds)
+    ChipSynth.setSampleRate(rate)
+    local eng = ChipSynth.newEngine(data, bark, { allowLoops = true })
+    local event = eng.channels[1]:nextEvent()
+    local sd = ChipSynth.soundData(eng, math.floor(seconds * rate), 2)
+    return sd, event
+  end
+  local full, fullEvent = renderBark(44100, 0.5)
+  local half, halfEvent = renderBark(22050, 0.5)
+  ChipSynth.setSampleRate(44100)
+  eq(half:getSampleCount(), math.floor(full:getSampleCount() / 2),
+    "half the synth rate is half the samples for the same half second")
+  eq(half:getSampleRate(), 22050, "and the SoundData is tagged with it")
+  eq(halfEvent.register, fullEvent.register,
+    "the first note's frequency register does not move with the rate")
+  eq(halfEvent.volume, fullEvent.volume, "nor its volume")
+  check(math.abs(halfEvent.duration - fullEvent.duration) < 1e-9,
+    "nor how long it lasts in seconds")
 end
 
 S.finish()

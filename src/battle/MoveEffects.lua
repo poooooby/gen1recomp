@@ -11,10 +11,12 @@
 -- is the registry view of all three -- the merged Data.move_effects a
 -- battle dispatches on serves these same objects.
 
+local Damage = require("src.battle.Damage")
 local Logger = require("src.core.Logger")
 local StatusRegistry = require("src.battle.StatusRegistry")
 local TurnOrder = require("src.battle.TurnOrder")
 local TypeChart = require("src.battle.TypeChart")
+local Timing = require("src.core.Timing")
 local romText = require("src.core.RomText")
 local Strings = require("src.core.Strings")
 
@@ -57,6 +59,10 @@ local function changeStage(battle, who, stat, delta, fromEnemy)
   -- recomputed and QuarterSpeedDueToParalysis/HalveAttackDueToBurn re-run,
   -- re-baking the burn/para penalty and ending Haze's temporary lift.
   who.hazeStatReset = nil
+  if battle.ruleset and battle.ruleset.badgeBoostReapplyBug
+     and battle.kind ~= "link" and who == battle.player then
+    Damage.reapplyBadgeBoosts(who, stat)
+  end
   -- _MonsStatsRoseText/_MonsStatsFellText: "X's / STAT rose!"; the
   -- two-stage variants scroll "greatly" onto a third line
   local label = Strings(STAT_LABEL[stat])  -- looked up here, not at require (#811)
@@ -132,6 +138,11 @@ end
 
 local function statDownSide(stat)
   return function(battle, user, target)
+    -- engine/battle/effects.asm:552
+    if not user.isPlayer and battle.kind ~= "link"
+       and battle.rng(0, 255) < 64 then
+      return {}
+    end
     if target.substituteHP then return {} end
     if battle.rng(0, 255) >= 85 then return {} end -- 33 percent + 1 (85/256)
     -- StatModifierDownEffect's side-effect branch never runs MoveHitTest,
@@ -254,6 +265,7 @@ MoveEffects.primary = {
       -- Attack-halving and paralysis Speed-quartering on BOTH battlers
       -- until the next stat recompute (a stage change or switch-in).
       b.hazeStatReset = true
+      b.badgeExtraBoosts = nil
     end
     -- Gen 1 also removes the enemy's major status; if that cured sleep
     -- or freeze, the target forfeits its move this turn (haze.asm
@@ -276,6 +288,10 @@ MoveEffects.primary = {
   -- battle (#644).  The failed flag rides the message list so performMove can
   -- peel the announcement-time anim row without matching on printed text.
   SUBSTITUTE_EFFECT = function(battle, user)
+    -- ../pokered/engine/battle/move_effects/substitute.asm:2-3
+    if battle.waitBeforeMoveAnim then
+      battle:waitBeforeMoveAnim(Timing.SUBSTITUTE_ENTRY)
+    end
     if user.substituteHP then
       return { romText(battle.data, "_HasSubstituteText", "%s\nhas a SUBSTITUTE!", displayName(user)),
                failed = true }
@@ -291,6 +307,15 @@ MoveEffects.primary = {
     end
     user.mon.hp = user.mon.hp - cost
     user.substituteHP = cost + 1
+    -- ../pokered/engine/battle/move_effects/substitute.asm:47-55
+    user.substitutePending = true
+    if battle.animationsOn and battle.cancelMoveAnim
+       and not battle:animationsOn() then
+      battle:cancelMoveAnim()
+    end
+    if battle.actNext then
+      battle:actNext(function() user.substitutePending = nil end)
+    end
     -- _SubstituteText
     return { romText(battle.data, "_SubstituteText", "It created a\nSUBSTITUTE!") }
   end,
@@ -311,12 +336,18 @@ MoveEffects.primary = {
   -- returned strings can't express.
 
   TRANSFORM_EFFECT = function(battle, user, target)
-    -- transform.asm:31-53 (AnimationTransformMon) morphs the user's
-    -- on-screen pic into the target species; the port swaps user.sprite
-    -- via the same getImage/monPalette path makeBattler uses so the
-    -- change is visible (the renderer draws battler.sprite directly).
-    user.sprite = battle:speciesSprite(target.mon.species, user.isPlayer)
-                  or user.sprite
+    -- transform.asm:37-45
+    local pic = battle:speciesSprite(target.mon.species, user.isPlayer)
+    if battle.animationsOn and battle.cancelMoveAnim and not battle:animationsOn() then
+      battle:cancelMoveAnim()
+    end
+    if pic and battle.actNext then
+      battle:actNext(function()
+        user.sprite = pic
+        local pf = battle.picFxFor and battle:picFxFor(user)
+        if pf then pf.minimized = nil end
+      end)
+    end
     user.curStats = {
       hp = user.mon.stats.hp, -- HP is kept
       attack = target.curStats.attack, defense = target.curStats.defense,
@@ -574,6 +605,8 @@ MoveEffects.full = {
         local r = ctx.rng(0, 7)
         user.trappingTurns = ({ 1, 1, 1, 2, 2, 2, 3, 4 })[r + 1]
         user.trapDamage = ctx.rawDamage
+        -- PlayApplyingAttackSound (animations.asm:2639) replays it each turn
+        user.trapHitSfx = ctx.hitSfx
         -- remember the move so its animation can replay on each locked
         -- continuation (core.asm:3554-3566 -> GetPlayerAnimationType)
         user.trapMove = ctx.move.id
@@ -582,30 +615,15 @@ MoveEffects.full = {
   },
   THRASH_PETAL_DANCE_EFFECT = {
     -- ThrashPetalDanceEffect (effects.asm:791-808) runs before damage
-    -- (data/battle/special_effects.asm:22) and animates the setup turn
+    -- (data/battle/special_effects.asm:22, core.asm:3531-3552)
     beforeAccuracy = function(ctx)
       local user = ctx.user
-      if not user.thrashTurns then
-        ctx.battle:animBeforeMove(
-          user.isPlayer and "SHRINKING_SQUARE_ANIM" or "ANIM_B1", user.isPlayer)
-      end
-    end,
-    afterDamage = function(ctx)
-      local user = ctx.user
-      if not user.thrashTurns then
-        user.thrashTurns = ctx.rng(2, 3) -- 3-4 attacks total, then confusion
-        user.thrashMove = ctx.moveInst
-        user.thrashAnnounced = true
-      else
-        user.thrashTurns = user.thrashTurns - 1
-        if user.thrashTurns <= 0 then
-          user.thrashTurns, user.thrashMove, user.thrashAnnounced = nil, nil, nil
-          if not user.confusedTurns then
-            user.confusedTurns = ctx.rng(2, 5)
-            ctx.say(romText(ctx.battle.data, "_BecameConfusedText", "%s\nbecame confused!", displayName(user)))
-          end
-        end
-      end
+      if ctx.thrashing or user.thrashTurns then return end
+      user.thrashTurns = ctx.rng(2, 3) -- 3-4 attacks total, then confusion
+      user.thrashMove = ctx.moveInst
+      user.thrashAnnounced = true
+      ctx.battle:animBeforeMove(
+        user.isPlayer and "SHRINKING_SQUARE_ANIM" or "ANIM_B1", user.isPlayer)
     end,
   },
   JUMP_KICK_EFFECT = {
@@ -660,7 +678,9 @@ MoveEffects.full = {
       user.bideTurns = ctx.rng(2, 3)
       user.bideDamage = 0
       ctx.battle:cancelMoveAnim()
-      ctx.anim(user.isPlayer and "XSTATITEM_ANIM" or "XSTATITEM_DUPLICATE_ANIM")
+      ctx.battle:animBeforeMove(
+        user.isPlayer and "XSTATITEM_ANIM" or "XSTATITEM_DUPLICATE_ANIM",
+        user.isPlayer)
       ctx.say(Strings("%s\nis storing energy!", displayName(user)))
     end,
   },

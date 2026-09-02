@@ -66,6 +66,10 @@ local ITEMS = {
   -- BICYCLE, and both of those are claimed by useFieldItem.
   COIN_CASE = { id = "COIN_CASE", name = "COIN CASE", pocket = "KEY_ITEM",
     index = 0x47 },
+  -- ../pokecrystal/data/items/attributes.asm:242
+  BLUE_CARD = { id = "BLUE_CARD", name = "BLUE CARD", pocket = "KEY_ITEM",
+    index = 0x74, fieldMenu = "ITEMMENU_CURRENT",
+    battleMenu = "ITEMMENU_NOUSE" },
   REPEL = { id = "REPEL", name = "REPEL", pocket = "ITEM", index = 0x14,
     canSelect = true },
   SUPER_REPEL = { id = "SUPER_REPEL", name = "SUPER REPEL", pocket = "ITEM",
@@ -159,6 +163,14 @@ local function fakeMap(cells, opts)
     isWalkable = function(_, x, y)
       if not map:inBounds(x, y) then return false end
       return Permissions.isWalkable(map:cellCollision(x, y))
+    end,
+    objectStepPermitted = function(_, cx, cy, dir)
+      local d = Map.DELTA[dir]
+      if not d then return false end
+      local tx, ty = cx + d[1], cy + d[2]
+      if not map:inBounds(tx, ty) then return false end
+      return Permissions.objectStepPermitted(
+        map:cellCollision(cx, cy), map:cellCollision(tx, ty), dir)
     end,
     warpAt = function() return nil end,
   }
@@ -294,19 +306,51 @@ eq(landPack.message[1], "OAK: {PLAYER}!", "and the message is Oak's")
 eq(landGame.stack.cleared, 0, "rod on land does not quit the PACK")
 eq(chosen, nil, "rod on land never reaches onChoose")
 check(landWorld.fishing == nil, "rod on land starts no cast")
+-- home/text.asm:502
 landGame.input:press("a")
 landPack:update(0)
-check(landPack.message == nil, "a button clears the message")
+eq(landPack.messagePage, 2, "a button scrolls Oak's `cont` to its second page")
+landGame.input:press("a")
+landPack:update(0)
+check(landPack.message == nil, "and the next clears the message")
 
--- An item World claims nothing for still falls through to the PACK's own
--- onChoose (TM teaching).
+-- CoinCaseEffect (engine/items/item_effects.asm:2243) is a MenuTextboxWaitButton
+-- over _CoinCaseCountText: the PACK stays open and nothing reaches onChoose.
+landGame.save.player.coins = 250
 landPack.index = 3
 landGame.input:press("a")
 landPack:update(0)
 landGame.input:press("a")
 landPack:update(0)
-eq(chosen, "COIN_CASE", "an unhandled item reaches onChoose untouched")
+check(landPack.message ~= nil, "the COIN CASE prints inside the PACK")
+eq(landPack.message[1], "Coins:", "_CoinCaseCountText's first row")
+eq(landPack.message[2], "250", "and the count on the second")
+eq(chosen, nil, "the COIN CASE never reaches onChoose")
 eq(landGame.stack.cleared, 0, "and does not quit the PACK either")
+landGame.input:press("a")
+landPack:update(0)
+
+-- BlueCardEffect (../pokecrystal/engine/items/item_effects.asm:2251)
+do
+  landGame.save.inventory.BLUE_CARD = 1
+  landPack:rebuild()
+  landWorld:writeVar(0x18, 12)
+  landPack.index = 4
+  eq(landPack.rows[4].id, "BLUE_CARD", "the BLUE CARD is the fourth key item")
+  landGame.input:press("a")
+  landPack:update(0)
+  landGame.input:press("a")
+  landPack:update(0)
+  check(landPack.message ~= nil, "the BLUE CARD prints inside the PACK")
+  eq(landPack.message[1], "You now have", "_BlueCardBalanceText's first row")
+  eq(landPack.message[2], "12 points.", "and the balance on the second")
+  eq(chosen, nil, "the BLUE CARD never reaches onChoose")
+  eq(landGame.stack.cleared, 0, "and does not quit the PACK")
+  landGame.input:press("a")
+  landPack:update(0)
+  landGame.save.inventory.BLUE_CARD = nil
+  landPack:rebuild()
+end
 
 -- Facing water: the roll lands on $2 .FishGotSomething, the PACK quits
 -- (PACKSTATE_QUITRUNSCRIPT) and Script_FishCastRod's cast owns the world.
@@ -325,6 +369,16 @@ eq(seaGame.stack.cleared, 1, "rod on water quits the PACK")
 check(seaWorld.fishing ~= nil, "rod on water starts the cast")
 eq(seaWorld.fishing.outcome, "battle", "and the roll already hooked something")
 check(seaWorld:busy(), "the cast holds the world")
+-- ../pokecrystal/engine/menus/start_menu.asm:492
+check(seaWorld.mapSetup ~= nil, "the rod quits the PACK through ExitAllMenus")
+do
+  local exitGuard = 0
+  while seaWorld.mapSetup and exitGuard < 120 do
+    seaWorld:step()
+    exitGuard = exitGuard + 1
+  end
+end
+eq(seaWorld.fishing.phase, "cast", "the cast has not started under the white")
 -- pause 40, the bite, pause 40, then RodBiteText.
 runFrames(seaWorld, 41)
 eq(seaWorld.fishing.phase, "bite", "the cast runs out into the bite")
@@ -354,8 +408,16 @@ eq(busyWorld:useRod("OLD_ROD"), "nowhere", "no fishing from inside a battle")
 busyWorld.battleActive = nil
 busyWorld.vm = { running = function() return true end, update = function() end }
 eq(busyWorld:useRod("OLD_ROD"), "nowhere", "no fishing while a script runs")
-check(busyWorld:useFieldItem("COIN_CASE") == nil,
+check(busyWorld:useFieldItem("POTION") == nil,
   "useFieldItem passes an unhandled item back to the PACK")
+eq(busyWorld:useFieldItem("COIN_CASE"), "coin_case",
+  "the COIN CASE is ITEMMENU_CURRENT and World claims it")
+do
+  busyWorld:writeVar(0x18, 17)
+  local result, balance = busyWorld:useFieldItem("BLUE_CARD")
+  eq(result, "blue_card", "the BLUE CARD is ITEMMENU_CURRENT too")
+  eq(balance, 17, "and it comes back with wBlueCardBalance")
+end
 
 -- ---- A2. REPEL / SUPER REPEL / MAX REPEL ----------------------------------
 -- UseRepel (engine/items/item_effects.asm): the step count is the only thing
@@ -435,7 +497,8 @@ packGame.input:press("a")
 repelPack:update(0)
 eq(repelPack.message[1], "The REPEL used",
   "a REPEL already active refuses a second item with the static text")
-eq(repelPack.message[3], "in effect.", "the third line of the fixed text")
+eq(repelPack.message[4], "in effect.",
+  "with `cont` between it and the third line (data/text/common_3.asm:1270)")
 end
 
 -- ---- A3. SACRED ASH -------------------------------------------------------
@@ -563,6 +626,8 @@ local hitWorld, hitGame = fakeWorld(treeCells, fakePlayer(5, 5, "up"), {
   { species = "HOOTHOOT", nickname = "OWL",
     moves = { { id = "HEADBUTT", pp = 15 } } },
 })
+-- ../pokecrystal/engine/events/treemons.asm:126 GetTreeMon
+hitWorld.treemonRandom = function() return 0 end
 check(hitWorld:interact(), "the ask opens again")
 advanceText(hitWorld)
 answerYesNo(hitWorld, true)
@@ -599,6 +664,64 @@ local pastWorld = fakeWorld(treeCells, fakePlayer(5, 5, "down"), {
     moves = { { id = "HEADBUTT", pp = 15 } } },
 })
 check(not pastWorld:interact(), "facing away from the tree does nothing")
+
+-- ../pokecrystal/engine/events/treemons.asm:199 GetTreeScore
+do
+  local Enc = require("src.battle.gen2.Encounter")
+  eq(Enc.treeScore(5, 4, 12345), Enc.TREEMON_SCORE_GOOD,
+    "diff 1..4 is a GOOD tree")
+  eq(Enc.treeScore(5, 4, 17), Enc.TREEMON_SCORE_RARE,
+    "diff 0 is the 1-in-10 RARE tree")
+  eq(Enc.treeScore(5, 4, 0), Enc.TREEMON_SCORE_BAD, "diff 5..9 is BAD")
+  check(Enc.treeScore(0, 0, 0) ~= Enc.treeScore(-4, -4, 0),
+    "RefreshPlayerCoords' +4 is in the coordinate half")
+  check(Enc.treeScore(5, 4, 12345) ~= Enc.treeScore(5, 4, 0),
+    "and wPlayerID is in the other half")
+
+  -- ../pokecrystal/engine/events/treemons.asm:96 GetTreeMons
+  eq(Enc.treeSetUsable("TREEMON_SET_NONE", "crystal"), false,
+    "TREEMON_SET_NONE never rolls")
+  eq(Enc.treeSetUsable("TREEMON_SET_CITY", "crystal"), true,
+    "Crystal has no CITY set to refuse")
+  eq(Enc.treeSetUsable("TREEMON_SET_CITY", "gs"), false,
+    "but G/S's CITY table is dead data")
+  eq(Enc.treeSetUsable("TREEMON_SET_UNUSED", "gs"), false, "so is UNUSED")
+
+  -- ../pokecrystal/engine/battle/core.asm:6422 CheckSleepingTreeMon
+  eq(Enc.treeMonAsleep("SPEAROW", "NITE", "crystal"), true,
+    "SPEAROW is on the Nite list")
+  eq(Enc.treeMonAsleep("SPEAROW", "DARK", "crystal"), true,
+    "DARKNESS_F falls through to Nite")
+  eq(Enc.treeMonAsleep("SPEAROW", "DAY", "crystal"), false,
+    "and is awake by day")
+  eq(Enc.treeMonAsleep("HOOTHOOT", "DAY", "crystal"), true,
+    "HOOTHOOT is on the Day list")
+  eq(Enc.treeMonAsleep("HOOTHOOT", "DAY", "gs"), false,
+    "pokegold has no asleep table at all")
+end
+
+-- ../pokecrystal/engine/events/treemons.asm:126 GetTreeMon's three gates
+do
+  local function headbutt(rolls, otId)
+    local world = fakeWorld(treeCells, fakePlayer(5, 5, "up"), {
+      { species = "HOOTHOOT", nickname = "OWL",
+        moves = { { id = "HEADBUTT", pp = 15 } } },
+    })
+    world.game.save.player.id = otId
+    local index = 0
+    world.treemonRandom = function()
+      index = index + 1
+      return rolls[index] or 0
+    end
+    return world:tryHeadbutt(5, 4)
+  end
+  eq(headbutt({ 0 }, 0), "battle", "a BAD tree gives up a mon on a 0")
+  eq(headbutt({ 1 }, 0), "nothing", "and nothing on a 1")
+  eq(headbutt({ 4 }, 12345), "battle", "a GOOD tree still answers a 4")
+  eq(headbutt({ 5 }, 12345), "nothing", "but not a 5")
+  eq(headbutt({ 7 }, 17), "battle", "a RARE tree answers a 7")
+  eq(headbutt({ 8 }, 17), "nothing", "and refuses an 8")
+end
 
 -- ---- C. the cave encounter gate ------------------------------------------
 -- CanEncounterWildMon (engine/overworld/events.asm): a CAVE or DUNGEON map
@@ -914,8 +1037,12 @@ check(poolWorld:useFieldMove("WHIRLPOOL", SPINNER[1]).ok, "whirlpool cleared")
 runFrames(poolWorld, 1)
 eq(poolWorld.log[1], T.USE_WHIRLPOOL, "UseWhirlpoolText")
 advanceText(poolWorld)
+-- engine/events/overworld.asm:1142-1164
+eq(poolWorld.map.def.blocks[TREE_BLOCK_INDEX], 0x07,
+  "the whirlpool block is still on screen while the sfx plays (#1862)")
+runFrames(poolWorld, 4)
 eq(poolWorld.map.def.blocks[TREE_BLOCK_INDEX], 0x36,
-  "DisappearWhirlpool swaps block $07 for $36")
+  "DisappearWhirlpool swaps block $07 for $36 once the sfx ends")
 local wrongBlock = fieldWorld({ [4 * 100 + 5] = COLL_WHIRLPOOL }, SPINNER)
 check(not wrongBlock:useFieldMove("WHIRLPOOL", SPINNER[1]).ok,
   "a whirlpool collision over the wrong block is refused")
@@ -1701,14 +1828,21 @@ check(hw:mapSceneOf(3, 4) == nil,
   "a map with NO scene_var row answers nil, which the VM turns into $ff")
 check(hw:mapSceneOf(9, 9) == nil, "and an unresolvable pair is nil too")
 
+-- hw.tod is the production read (the unpinned wTimeOfDay split, #1557);
+-- hw.daytime is the palette pin it must NOT follow
+hw.tod = "DAY"
 eq(hw:timeOfDayId(), 1, "DAY is wTimeOfDay 1")
-hw.daytime = "MORN"
+hw.tod = "MORN"
 eq(hw:timeOfDayId(), 0, "MORN is 0")
-hw.daytime = "NITE"
+hw.tod = "NITE"
 eq(hw:timeOfDayId(), 2, "NITE is 2")
+hw.tod = "NITE"
 hw.daytime = "DARK"
-eq(hw:timeOfDayId(), 3, "DARKNESS is 3")
-hw.daytime = "DAY"
+eq(hw:timeOfDayId(), 2, "a PALETTE_DARK pin does not leak into wTimeOfDay")
+hw.tod = nil
+hw.daytime = "DARK"
+eq(hw:timeOfDayId(), 3, "DARKNESS is 3 only on the tod-less fallback arm")
+hw.tod, hw.daytime = nil, "DAY"
 eq(hw:gsVersion(), 0, "checkver: a Gold save is 0")
 eq(hookWorld({ version = "silver" }):gsVersion(), 1, "and a Silver save is 1")
 

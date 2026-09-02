@@ -1,19 +1,19 @@
 # Gen1Recomp
 
-A native LÖVE2D recreation of Poke Red, Blue and Yellow. The engine and map
-behavior are hand-written Lua; game data and graphics are decoded from a ROM
-supplied by the player.
+A native LÖVE2D recreation of Poke Red, Blue, Gold, Silver, and Crystal. The 
+engine and map behavior are hand-written Lua; game data and graphics are 
+decoded from a ROM supplied by the player.
 
 And before you say, "that's not a recomp", you're wrong. Recomp is an acronym. ***Reverse Engineering Causes Obsessive Mental Problems***
 
 [Click Here for the AI Use Disclosure!](AIDisclosure.md)
 
 > [!CAUTION]
-> **We are NOT affiliated with the website `gen1recomp[.]com`** That website is not run by this project, was not authorized by us, and we have no idea who operates it. It is impersonating this project; do not download anything from it, and treat anything it hosts or claims as untrustworthy. Even if the site currently links back to this repository, the people behind it can change its content at any time, so nothing on it should ever be trusted. This GitHub repository and the Discord linked below are the only official sources for this project. Also, as I assumed would eventually happen, the idiot that made that website now pumped it full of adware. Please stay away from that website.
+> **We are NOT affiliated with the website `gen1recomp[.]com`** That website is not run by this project, was not authorized by us, and we have no idea who operates it. It is impersonating this project; do not download anything from it, and treat anything it hosts or claims as untrustworthy. Even if the site currently links back to this repository, the people behind it can change its content at any time, so nothing on it should ever be trusted. This GitHub repository, the Discord, and https://gen1re.com are the only official sources for this project. Also, as I assumed would eventually happen, the idiot that made that website now pumped it full of adware. Please stay away from that website.
 
 <p align="center"><img src="https://raw.githubusercontent.com/bryanthaboi/gen1recomp/refs/heads/dev/assets/logo/logo.png"></p>
 
-**SUPPORT / ANNOUNCEMENTS / MODS:** [Discord](https://bois.icu)
+# [SUPPORT / ANNOUNCEMENTS / MODS ALL FOUND ON THE DISCORD](https://bois.icu)
 
 <p align="center">
 
@@ -53,18 +53,19 @@ And before you say, "that's not a recomp", you're wrong. Recomp is an acronym. *
 
 ### Watch the latest update video
 
-[![Watch the latest update video](https://img.youtube.com/vi/yi7LkWQPKKM/maxresdefault.jpg)](https://youtu.be/yi7LkWQPKKM)
-
+[![Watch the latest update video](https://img.youtube.com/vi/0hgtLDNGpdo/maxresdefault.jpg)](https://youtu.be/0hgtLDNGpdo)
 
 This project does not include a ROM, emulate the Game Boy, transpile assembly,
-or download a disassembly. A canonical US Poke Red, Blue, Yellow, Gold, or
-Silver ROM is the only game content input.
+or download a disassembly. A canonical US Poke Red, Blue, Yellow, Gold,
+Silver, or Crystal ROM is the only game content input.
 
 The ROM is verified, used during import, and then released from memory. It is
 not copied into the cache. Later launches load the private generated cache and
-do not ask for the ROM again. Red, Blue, Yellow, Gold, and Silver can all be
-imported side by side. Gold and Silver are Gen 2 Phase 1 (import + launcher;
-see `docs/gold-phase1.md`): the Gen 2 engine is still under construction.
+do not ask for the ROM again. Red, Blue, Yellow, Gold, Silver, and Crystal can
+all be imported side by side. Gold, Silver, and Crystal are Gen 2 Phase 1
+(import + launcher; see `docs/gold-phase1.md`): the Gen 2 engine is still under
+construction, and Crystal is the newest of the three, so the launcher lists it
+as Crystal (Beta).
 
 ## Quick Start
 
@@ -72,14 +73,17 @@ Open the desktop app. On first boot, choose your legally obtained `.gb` /
 `.gbc` file or drop it onto the window. Import takes a few seconds and the
 game starts automatically.
 
-Only the canonical US Red, Blue, Yellow (1 MiB), Gold, and Silver (2 MiB)
-ROMs are accepted. The importer verifies SHA-1 before creating any game data:
+Only the canonical US Red, Blue, Yellow (1 MiB), Gold, Silver, and Crystal
+(2 MiB) ROMs are accepted. The importer verifies SHA-1 before creating any
+game data:
 
 - Red: `ea9bcae617fdf159b045185467ae58b2e4a48b9a`
 - Blue: `d7037c83e1ae5b39bde3c30787637ba1d4c48ce2`
 - Yellow: `cc7d03262ebfaf2f06772c1a480c7d9d5f4a38e1`
 - Gold: `d8b8a3600a465308c9953dfa04f0081c05bdcb94`
 - Silver: `49b163f7e57702bc939d642a18f591de55d92dae`
+- Crystal (1.0): `f4cd194bdee0d04ca4eac29e09b8e4e9d818c133`
+- Crystal (1.1): `f2f52230b536214ef7c9924f483392993e226cfb`
 
 The packaged app contains neither a ROM nor pre-extracted game data. Music,
 sound effects, and cries are synthesized while the game runs from compact
@@ -123,24 +127,23 @@ supported out of the box.
 | `2`       | Cycle COLORS                                         |
 | `3`       | Cycle TILT (free-roam overworld)                     |
 | `4`       | Cycle ZOOM through every level (free-roam overworld) |
-| `5`       | Cycle GBC FX                                         |
 | `F1`      | Save                                                 |
 | `F2`      | Load                                                 |
 | `F10`     | Open / close the mod manager                         |
 
 
-COLORS, TILT, ZOOM, GBC FX, GAME SPEED, and VOID FILL are also in the
+COLORS, TILT, ZOOM, SHADER FX, GAME SPEED, and VOID FILL are also in the
 Options menu and persist in `options.lua`.
 
 ### Low-end devices
 
 **OPTIONS → PERFORMANCE** scales the port's optional extras for weaker
-hardware: **HIGH** (everything on), **BALANCED** (no 3D tilt or GBC FX),
+hardware: **HIGH** (everything on), **BALANCED** (no 3D tilt),
 **LOW** (also no survey zoom, FPS capped), or **AUTO** — the default, which
 picks a tier from your device (ARM handhelds → LOW, phones → BALANCED,
 normal desktops → HIGH, unchanged). It only scales presentation; the
 fixed-step game logic is identical on every tier, and a lower tier hides
-your tilt/zoom/GBC-FX preferences without forgetting them. Details in
+your tilt/zoom preferences without forgetting them. Details in
 [docs/new-features.md](docs/new-features.md#performance-tier-low-end-devices).
 
 ### Rulesets
@@ -174,6 +177,19 @@ famous bugs included:
 | `enemyUnlimitedPP`          | Off: enemies deplete PP and Struggle when empty        |
 | `hyperBeamSkipRechargeOnKO` | Off: HYPER BEAM always recharges, like Gen 2+          |
 | `randMin` / `randMax`       | Damage random factor 217-255, same as faithful         |
+
+## Online play
+
+The launcher has an **ONLINE** tab. Connect once and you get a lobby of who
+else is around, with what game and what rules: host a battle or join one,
+watch any live match or tournament as a spectator, run a bracket where
+everyone not playing watches the match that is on, or trade Pokemon between
+save files, yours or someone else's. Picking a battle opens the game
+straight into it, no intro and no overworld, and drops you back in the tab
+when it ends. Every room names exactly what it runs, so both sides are on
+the same engine, the same version and the same ruleset: vanilla, or a sealed
+custom cart that both players have installed. The in-game LINK menu is still
+there and is still local network only.
 
 ## Running From Source
 
@@ -220,23 +236,82 @@ entry: a desktop shortcut per game, a Steam entry, or a handheld frontend.
 
 | Option | Effect |
 | --- | --- |
-| `--game=red` | boot Red, skipping the launcher (`blue`, `yellow`, `gold` and `silver` too, or just `r` / `b` / `y` / `g` / `s`) |
+| `--game=red` | boot Red, skipping the launcher (`blue`, `yellow`, `gold`, `silver` and `crystal` too, or just `r` / `b` / `y` / `g` / `s` / `c`) |
+| `--cart=id` | boot the installed custom cart with that id |
 | `--slot=2` | load that save slot; takes a slot number or a slot id |
 | `--launcher` | open the launcher anyway, so you can edit a shortcut you already made |
+| `--no-sync` | skip the save sync a linked device otherwise runs before the game boots (`POKEPORT_LAUNCH_SYNC=0`) |
+| `--update` | check for a release first, and restart once into it if one is ready (`POKEPORT_LAUNCH_UPDATE=1`; `-update` works too) |
+
+If this device is linked for save sync, a shortcut now syncs before it boots
+so CONTINUE never loads a save another device has already moved past. The
+screen shows what it is doing and any button skips straight into the game; a
+sync conflict opens the launcher so you can pick a copy rather than booting
+over one.
+
+Android and iOS also accept the same launch request as a URL:
+
+```text
+gen1recomp++://launch?game=red
+```
+
+The URL parameters correspond to the desktop options:
+
+| URL | Effect |
+| --- | --- |
+| `gen1recomp++://launch?game=red` | boot Red directly |
+| `gen1recomp++://launch?game=red&cart=my_cart` | boot the installed custom cart `my_cart` |
+| `gen1recomp++://launch?game=red&slot=2` | boot Red and select save slot 2 |
+| `gen1recomp++://launch?game=red&launcher=1` | open the launcher on Red instead |
+| `gen1recomp++://launch?game=red&sync=0` | skip save sync |
+| `gen1recomp++://launch?game=red&update=1` | check for an update before booting |
+
+The `game` value accepts the same full names and aliases as `--game`. Boolean
+parameters accept `1`/`0`, `true`/`false`, `yes`/`no`, and `on`/`off`. Percent-encode
+values that contain characters reserved by URLs; the app decodes query values
+before applying them. `cart` is the installed cart id shown in the Custom Carts
+screen. Unknown parameters are ignored, and an invalid game or cart falls back
+to the launcher.
+
+To test a link on Android, use the installed application package:
+
+```bash
+adb shell am start -a android.intent.action.VIEW \
+  -d 'gen1recomp++://launch?game=red' \
+  com.theboisclub.pokemonred
+```
+
+To test a link in the iOS Simulator:
+
+```bash
+xcrun simctl openurl booted 'gen1recomp++://launch?game=red'
+```
+
+On a physical iPhone or iPad, open the URL from another app that can hand off
+custom URLs, such as Notes, Messages, or Safari.
 
 
-## Linux on arm64 (Raspberry Pi)
+## Linux desktop (AppImage / Flatpak)
 
-Alongside the x86_64 `gen1recomp-*-linux.zip`, every release ships
-`gen1recomp-*-linux-arm64.AppImage` for 64-bit ARM desktop Linux — Raspberry
-Pi 4/5, Armbian and other SBC distros, and arm64 VMs on Apple Silicon:
+Releases ship raw AppImages (no zip wrapper) plus an optional Flatpak bundle:
+
+- `gen1recomp-*-linux-x86_64.AppImage`
+- `gen1recomp-*-linux-arm64.AppImage` (Raspberry Pi 4/5, Armbian, arm64 VMs)
+- `gen1recomp-*-linux.flatpak` (see [docs/linux-flatpak.md](docs/linux-flatpak.md))
+
+```sh
+chmod +x gen1recomp-*-linux-x86_64.AppImage
+./gen1recomp-*-linux-x86_64.AppImage
+```
 
 ```sh
 chmod +x gen1recomp-*-linux-arm64.AppImage
 ./gen1recomp-*-linux-arm64.AppImage
 ```
 
-LÖVE publishes no aarch64 binary of any kind, so this artifact compiles the
+Shared troubleshooting (FUSE, curl, portable mode): [docs/linux-appimage.md](docs/linux-appimage.md).
+
+LÖVE publishes no aarch64 binary of any kind, so the arm64 artifact compiles the
 engine — and SDL2, OpenAL and the codecs — from source inside a Debian
 bullseye arm64 container. It needs only glibc 2.29+, libstdc++, freetype and
 zlib on the host; OpenGL, X11, Wayland, KMSDRM, ALSA and PulseAudio are all
@@ -251,6 +326,12 @@ Every release ships `gen1recomp++-*-ios.ipa`. Sideload it with AltStore
 (Windows or Mac) — see [docs/ios-sideload.md](docs/ios-sideload.md). To
 build and install from source on a Mac instead, see
 [docs/ios-install.md](docs/ios-install.md).
+
+On iOS, long-press an imported game cartridge in the launcher and choose the
+Home Screen action. For custom carts, open Custom Carts and use Home Screen on
+the cart row you want. iOS opens a configuration profile in Safari; approve it
+from Settings when prompted. The generated entry keeps the game's or cart's
+artwork and launches through the same `gen1recomp++://launch` URL format.
 
 <div>
     <a href="https://intradeus.github.io/http-protocol-redirector?r=sidestore://source?url=https://github.com/bryanthaboi/gen1recomp/raw/refs/heads/main/mobile/ios/app-repo.json"><img src="./.github/resources/sidestore-badge.png" alt="Add to SideStore" height="60"></a>

@@ -52,6 +52,8 @@ local STICK_OFF = 0.3
 -- "select".  Both roads reach SELECT; the one road that did not was Gold's,
 -- where src/core/Game2.lua used to answer `back` with love.event.quit().
 
+Input.PAD_ACTIONS = { speedUp = true, speedDown = true }
+
 local HAT_DIRECTIONS = {
   u = { "up" }, d = { "down" }, l = { "left" }, r = { "right" },
   lu = { "left", "up" }, ru = { "right", "up" },
@@ -82,8 +84,19 @@ function Input:applyBindings(overlay)
   for index, action in pairs(GamepadMap.rawBindings()) do
     joys[index] = action
   end
+  local acts = {}
+  for button, action in pairs(GamepadMap.DEFAULT_PAD_ACTIONS) do
+    acts[button] = action
+  end
   for actionId, binding in pairs(overlay or {}) do
-    if type(binding) == "table" then
+    if Input.PAD_ACTIONS[actionId] then
+      for button, action in pairs(acts) do
+        if action == actionId then acts[button] = nil end
+      end
+      if type(binding) == "table" and binding.pad then
+        acts[binding.pad] = actionId
+      end
+    elseif type(binding) == "table" then
       if binding.key then keys[binding.key] = actionId end
       if binding.pad then pads[binding.pad] = actionId end
     elseif type(binding) == "string" then
@@ -104,6 +117,11 @@ function Input:applyBindings(overlay)
   self.keyBindings = keys
   self.padBindings = pads
   self.joyBindings = joys
+  self.padActions = acts
+end
+
+function Input:padAction(button)
+  return self.padActions and self.padActions[button] or nil
 end
 
 -- Purely event-driven state (press sets true, release sets false) has no
@@ -281,6 +299,7 @@ end
 
 function Input:joystickpressed(joystick, button)
   if GamepadMap.ignoreRawForJoystick(joystick) then return end
+  if GamepadMap.isAccelerometer(joystick) then return end
   noteCapture(self, "joy", "pressed", button)
   local btn = self.joyBindings[button]
   if btn then press(self, btn, "joy:" .. button) end
@@ -288,6 +307,7 @@ end
 
 function Input:joystickreleased(joystick, button)
   if GamepadMap.ignoreRawForJoystick(joystick) then return end
+  if GamepadMap.isAccelerometer(joystick) then return end
   noteCapture(self, "joy", "released", button)
   local btn = self.joyBindings[button]
   if btn then release(self, btn, "joy:" .. button) end
@@ -330,6 +350,7 @@ end
 
 function Input:joystickaxis(joystick, axis, value)
   if GamepadMap.ignoreRawForJoystick(joystick) then return end
+  if GamepadMap.isAccelerometer(joystick) then return end
   if axis == 1 then
     self:gamepadaxis(joystick, "leftx", value)
   elseif axis == 2 then
@@ -343,6 +364,7 @@ end
 -- directions on top of a direction rebind.
 function Input:joystickhat(joystick, hat, direction)
   if GamepadMap.ignoreRawForJoystick(joystick) then return end
+  if GamepadMap.isAccelerometer(joystick) then return end
   local source = "hat:" .. hat
   for _, btn in ipairs(self.hatDirs[hat] or {}) do
     release(self, btn, source)
@@ -380,7 +402,8 @@ function Input:reconcile()
   local ok, joysticks = pcall(js.getJoysticks)
   if not ok or type(joysticks) ~= "table" then return end
   for _, j in ipairs(joysticks) do
-    if GamepadMap.ignoreRawForJoystick(j) then
+    if GamepadMap.isAccelerometer(j) then
+    elseif GamepadMap.ignoreRawForJoystick(j) then
       -- SDL-recognized pad: buttons + left stick, the gamepad surfaces
       if j.isGamepadDown then
         for button, btn in pairs(self.padBindings) do

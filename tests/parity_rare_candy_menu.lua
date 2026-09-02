@@ -29,8 +29,11 @@ local Bag = require("src.inventory.Bag")
 local realTextBox = package.loaded["src.render.TextBox"]
 local realBag = package.loaded["src.ui.BagMenu"]
 local realParty = package.loaded["src.ui.PartyMenu"]
+-- soundOpts only builds an opts table, so the real one runs against the stub.
+local soundOpts = require("src.render.TextBox").soundOpts
 package.loaded["src.render.TextBox"] = {
   new = function(_, text, done) return { textBox = true, text = text, done = done } end,
+  soundOpts = soundOpts,
 }
 package.loaded["src.ui.BagMenu"] = nil
 package.loaded["src.ui.PartyMenu"] = nil
@@ -142,12 +145,19 @@ do
   eq(game.save.inventory.RARE_CANDY, 2, "the candy was consumed")
   check(game.stack.states[1] == list,
         "the bag list is STILL on the stack under the level text (#796)")
+  -- .useRareCandy redraws the party menu before it prints
+  -- (item_effects.asm:1392-1418) #1594
+  check(isPicker(game.stack.states[2]),
+        "the party picker is the backdrop for the level text (#1594)")
 
   finishLevelUp(game, box)
+  for _, s in ipairs(game.stack.states) do
+    check(not isPicker(s), "the picker comes down when the sequence ends")
+  end
   eq(game.stack:top(), list,
      "after the stat window the bag is back on top (StartMenu_Item)")
   eq(list.index, row, "the cursor is still on the RARE CANDY row")
-  eq(list.items[row] and list.items[row].right, "x2",
+  eq(list.items[row] and list.items[row].count, 2,
      "the count refreshed in place")
 
   -- the point of the original's behavior: a second candy needs no menu trip
@@ -168,7 +178,7 @@ do
   check(isBox(box), "the last candy levels too")
   finishLevelUp(game, box)
   eq(game.stack:top(), list, "the bag stays open after the last candy")
-  eq(#list.items, 0, "the emptied row left the list")
+  eq(#list.items, 1, "the emptied row left the list, leaving only CANCEL")
   eq(game.save.inventory.RARE_CANDY, nil, "no candies left in the inventory")
 end
 

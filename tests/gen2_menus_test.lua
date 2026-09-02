@@ -201,16 +201,24 @@ confirmInput:press("a")
 confirm:update(0)
 check("A confirms", continued, true)
 
--- The clock box formats 12-hour time with an AM/PM half.
-check("midnight is 12 AM", (function()
-  local m = MainMenu.new(newGame(nil), { hasSave = false, save = false,
-    clock = { hour = 0, minute = 0, weekday = 1 } })
-  local hour = select(1, m:clockParts())
-  local display = hour % 12
-  if display == 0 then display = 12 end
-  return display .. (hour < 12 and " AM" or " PM")
-end)(), "12 AM")
+-- ../pokecrystal/engine/rtc/timeset.asm:675
+do
+  local function pinnedTime(hour, minute)
+    local m = MainMenu.new(newGame(nil), { hasSave = false, save = false,
+      clock = { hour = hour, minute = minute, weekday = 1 } })
+    return MainMenu.timeString(m:clockParts())
+  end
+  check("midnight is NITE 12", pinnedTime(0, 0), "NITE 12:00")
+  check("morning keeps its word", pinnedTime(5, 9), "MORN 5:09")
+  check("noon is DAY 12", pinnedTime(12, 30), "DAY 12:30")
+  check("evening wraps back to NITE", pinnedTime(20, 5), "NITE 8:05")
+end
 check("weekday names", MainMenu.DAYS[6], "FRIDAY")
+
+-- ../pokecrystal/engine/menus/intro_menu.asm:479
+check("CONTINUE reuses SAVE's panel constants",
+  MainMenu.PANEL == require("src.ui.gen2.SaveMenu").PANEL, true)
+check("CONTINUE offsets it to row 8", MainMenu.PANEL_Y, 8)
 
 -- ------------------------------------------------------- naming screen
 
@@ -356,35 +364,53 @@ local optionsGame, optionsInput = newGame(Save.newGame())
 local options = OptionsMenu.new(optionsGame, {
   options = Save.defaultOptions(),
 })
--- The cart's seven rows, then the port's: CONTROLS, audio, speed, display,
--- video mode, the mobile-gated touch three (buildRows), MAX FPS and CANCEL.
-check("twenty-three rows", #OptionsMenu.ROWS, 23)
+-- The cart's seven rows, then the port's: CONTROLS, audio, PERFORMANCE,
+-- speed, display, SHADER FX + SHADER FX 2 (the second slot added alongside
+check("thirty-one rows", #OptionsMenu.ROWS, 31)
 check("the cart's rows come first", OptionsMenu.ROWS[7].key, "frame")
 check("then the rebind screen", OptionsMenu.ROWS[8].id, "controls")
 check("then the port's audio group", OptionsMenu.ROWS[9].key, "musicVol")
-check("last row is CANCEL", OptionsMenu.ROWS[#OptionsMenu.ROWS].cancel, true)
-check("starts on TEXT SPEED", options:row().key, "textSpeed")
-check("default text speed", options.options.textSpeed, "MID")
+check("last row is BACK", OptionsMenu.ROWS[#OptionsMenu.ROWS].cancel, true)
+-- PRINT is wGBPrinterBrightness and there is no Game Boy Printer here, so
+-- buildRows hides it: the descriptor and the save key survive, the row does
+-- not reach the screen.
+local function hasRow(rows, key)
+  for _, row in ipairs(rows) do if row.key == key then return true end end
+  return false
+end
+check("PRINT is still a descriptor", hasRow(OptionsMenu.ROWS, "print"), true)
+check("but never reaches the screen", hasRow(options.rows, "print"), false)
+check("and the save keeps its value",
+  Save.defaultOptions().print ~= nil, true)
+-- The rows are grouped into pages now, so the top level opens on the SPEED
+-- group and TEXT SPEED is the first row of the page it opens.
+check("starts on the SPEED group", options:row().id, "group.speed")
+local speedPage = options:focusRow("textSpeed")
+check("TEXT SPEED is on a page", speedPage ~= options, true)
+check("and the cursor lands on it", speedPage:row().key, "textSpeed")
+check("default text speed", speedPage.options.textSpeed, "MID")
 optionsInput:press("right")
-options:update(0)
+speedPage:update(0)
 check("right cycles forward", options.options.textSpeed, "SLOW")
 optionsInput:press("right")
-options:update(0)
+speedPage:update(0)
 check("right wraps", options.options.textSpeed, "FAST")
 optionsInput:press("left")
-options:update(0)
+speedPage:update(0)
 check("left wraps back", options.options.textSpeed, "SLOW")
+check("a page edits the caller's own options table",
+  speedPage.options == options.options, true)
 
-optionsInput:press("down")
-options:update(0)
-check("down moves a row", options:row().key, "battleScene")
+local battlePage = options:focusRow("battleScene")
+check("BATTLE SCENE is on the battle page", battlePage:row().key, "battleScene")
 optionsInput:press("right")
-options:update(0)
+battlePage:update(0)
 check("battle scene toggles off", options.options.battleScene, false)
 
 -- FRAME is 1-8 and wraps.
-options.index = 7
-check("frame row", options:row().frame, true)
+local framePage = options:focusRow("frame")
+check("frame row", framePage:row().frame, true)
+options = framePage
 options.options.frame = 8
 optionsInput:press("right")
 options:update(0)
@@ -404,10 +430,10 @@ local exiting = OptionsMenu.new(exitGame, {
 })
 -- The screen's own rows, not ROWS: buildRows drops the touch three off a
 -- desktop, so the raw descriptor count overshoots CANCEL.
-exiting.index = #exiting.rows
+exiting.index = #exiting.view
 exitInput:press("a")
 exiting:update(0)
-check("CANCEL leaves", savedOptions ~= nil, true)
+check("BACK leaves", savedOptions ~= nil, true)
 
 -- --------------------------------------------------------- start menu
 
@@ -482,6 +508,99 @@ check("TM row names its move", pack.rows[1].teaches, "HEADBUTT")
 packInput:press("right")
 pack:update(0)
 check("pocket wraps around", pack:pocket().id, "ITEM")
+
+-- engine/items/tmhm.asm:341 -- TMHM_DisplayPocketItems walks wTMsHMs 1..57, so
+-- the pocket is TM01..TM50 then HM01..HM07 whatever order the player picked
+-- them up in, and tmhm.asm:207 keeps SELECT out of it entirely.
+do
+  local tmSave2 = Save.newGame()
+  tmSave2.inventory = {
+    HM_WATERFALL = 1, TM_NIGHTMARE = 2, HM_CUT = 1, TM_ROAR = 3,
+    TM_DYNAMICPUNCH = 12, TM_LEGACY = 1,
+  }
+  tmSave2.bagOrder = {
+    "HM_WATERFALL", "TM_NIGHTMARE", "HM_CUT", "TM_ROAR", "TM_DYNAMICPUNCH",
+    "TM_LEGACY",
+  }
+  local tmGame2, tmInput2 = newGame(tmSave2)
+  tmGame2.data.items = {
+    TM_DYNAMICPUNCH = { id = "TM_DYNAMICPUNCH", name = "TM01",
+      pocket = "TM_HM", index = 191, tmNumber = 1 },
+    TM_ROAR = { id = "TM_ROAR", name = "TM05", pocket = "TM_HM",
+      index = 195, tmNumber = 5 },
+    TM_NIGHTMARE = { id = "TM_NIGHTMARE", name = "TM50", pocket = "TM_HM",
+      index = 240, tmNumber = 50 },
+    HM_CUT = { id = "HM_CUT", name = "HM01", pocket = "TM_HM",
+      index = 241, tmNumber = 51 },
+    HM_WATERFALL = { id = "HM_WATERFALL", name = "HM07", pocket = "TM_HM",
+      index = 247, tmNumber = 57 },
+    -- A cache (or a mod) with no tmNumber falls back to the ItemNames index.
+    TM_LEGACY = { id = "TM_LEGACY", name = "TM??", pocket = "TM_HM",
+      index = 300 },
+  }
+  local tmPack = PackMenu.new(tmGame2, { pocket = "TM_HM" })
+  local function ids(rows)
+    local out = {}
+    for i = 1, #rows do out[i] = rows[i].id end
+    return table.concat(out, ",")
+  end
+  check("TM/HM pocket is TM-number ordered, not pickup ordered",
+    ids(tmPack.rows),
+    "TM_DYNAMICPUNCH,TM_ROAR,TM_NIGHTMARE,HM_CUT,HM_WATERFALL,TM_LEGACY")
+  check("the first row is TM01", tmPack.rows[1].id, "TM_DYNAMICPUNCH")
+  check("and a tmNumber-less item lands after HM07",
+    tmPack.rows[#tmPack.rows].id, "TM_LEGACY")
+  check("the TM keeps its count", tmPack.rows[1].showCount, true)
+  check("the HM shows none", tmPack.rows[4].showCount, false)
+
+  tmPack.index = 1
+  tmInput2:press("select")
+  tmPack:update(0)
+  check("SELECT cannot arm a TM/HM row", tmPack.switching, nil)
+  check("and prints no move prompt", tmPack.message, nil)
+
+  -- The other three pockets still reorder on SELECT (pack.asm:1290).
+  tmSave2.inventory.POTION = 1
+  tmSave2.inventory.SUPER_POTION = 1
+  tmSave2.bagOrder = { "POTION", "SUPER_POTION" }
+  tmGame2.data.items.POTION =
+    { id = "POTION", name = "POTION", pocket = "ITEM", index = 1 }
+  tmGame2.data.items.SUPER_POTION =
+    { id = "SUPER_POTION", name = "SUPER POTION", pocket = "ITEM", index = 2 }
+  tmPack.pocketIndex = 1
+  tmPack:rebuild()
+  tmPack.index = 1
+  tmInput2:press("select")
+  tmPack:update(0)
+  check("but the ITEM pocket still arms", tmPack.switching, 1)
+end
+
+-- item_data_constants.asm:47 MAX_ITEMS / MAX_BALLS / MAX_KEY_ITEMS, and the
+-- TM/HM pocket is wTMsHMs (ram/wram.asm:2421), NUM_TMS + NUM_HMS = 57 bytes:
+-- 50 add_tm rows and 7 add_hm rows in constants/item_constants.asm:220-293.
+do
+  local Bag = require("src.inventory.Bag")
+  check("ITEM pocket is MAX_ITEMS", Bag.capacity(packGame.data, "ITEM"), 20)
+  check("BALL pocket is MAX_BALLS", Bag.capacity(packGame.data, "BALL"), 12)
+  check("KEY_ITEM pocket is MAX_KEY_ITEMS",
+    Bag.capacity(packGame.data, "KEY_ITEM"), 25)
+  check("TM/HM pocket is NUM_TMS + NUM_HMS",
+    Bag.capacity(packGame.data, "TM_HM"), 57)
+
+  -- Bag.add tests the cap before inserting, so all 57 cart TM/HMs fit.
+  local tmData = { items = {}, constants = { bagSize = 2 } }
+  for i = 1, 58 do
+    tmData.items["TM_FIX_" .. i] = { id = "TM_FIX_" .. i, name = "TM" .. i,
+      pocket = "TM_HM", index = 200 + i }
+  end
+  check("a mod's bagSize resizes the ITEM pocket only",
+    Bag.capacity(tmData, "TM_HM"), 57)
+  local tmSave = { inventory = {}, bagOrder = {} }
+  for i = 1, 57 do Bag.add(tmSave, "TM_FIX_" .. i, 1, tmData) end
+  check("all 57 of them fit", Bag.slots(tmSave, tmData, "TM_HM"), 57)
+  check("and a 58th TM/HM id has no byte to live in",
+    Bag.add(tmSave, "TM_FIX_58", 1, tmData), false)
+end
 
 -- CANCEL sits one past the last row.
 check("cancel is past the end", pack:total(), #pack.rows + 1)
@@ -665,9 +784,51 @@ dexGame.data.gen2Pokedex = {
   newOrder = { "BULBASAUR", "IVYSAUR" },
   alphabeticalOrder = { "BULBASAUR", "IVYSAUR" },
 }
+dexGame.data.pokemon.BULBASAUR = { types = { "GRASS", "POISON" } }
+dexGame.data.pokemon.IVYSAUR = { types = { "GRASS", "POISON" } }
 local dex = PokedexMenu.new(dexGame, {})
 check("dex lists every entry", #dex.rows, 2)
 check("dex starts in NEW mode", dex:mode(), "NEW")
+
+-- The dex's ROM `db` labels are catalog strings, resolved at draw time.  Stub
+-- its tile primitives and inspect the exact text writes without a GPU.
+require("src.core.Strings").load({ strings = {
+  SEEN = "VUS", OWN = "PRIS", HT = "TAILLE", WT = "POIDS",
+  NEW = "JOHTO", ["NEW POKéDEX MODE"] = "MODE JOHTO",
+  ["<PK><MN> are listed by"] = "Les POKéMON suivent",
+  ["evolution type."] = "leur évolution.", TYPE1 = "TYPE A",
+  TYPE2 = "TYPE B", ["BEGIN SEARCH!!"] = "CHERCHER !!",
+  CANCEL = "ANNULER",
+} })
+drawn = {}
+dex.text = function(_, text, x, y) drawn[x .. ":" .. y] = text end
+dex.fill, dex.border, dex.tile = function() end, function() end, function() end
+dex.blank, dex.drawPic, dex.drawFootprint = function() end, function() end,
+  function() end
+dex:drawMainBackground()
+check("SEEN is localizable", drawn["1:11"], "VUS")
+check("OWN is localizable", drawn["1:14"], "PRIS")
+drawn = {}
+dex.optionIndex = 1
+dex:drawOption()
+check("a mode label is localizable", drawn["3:4"], "MODE JOHTO")
+check("a mode description is localizable",
+  drawn["1:14"], "Les POKéMON suivent")
+drawn = {}
+dex:drawSearch()
+check("TYPE1 is localizable", drawn["3:4"], "TYPE A")
+check("TYPE2 is localizable", drawn["3:6"], "TYPE B")
+check("BEGIN SEARCH is localizable", drawn["3:13"], "CHERCHER !!")
+check("the dex CANCEL row is localizable", drawn["3:15"], "ANNULER")
+drawn = {}
+dex.newEntry = true
+dex:drawEntryBody(dex.rows[1], dex.data.gen2Pokedex.entries.BULBASAUR)
+check("HT is localizable", drawn["9:7"], "TAILLE")
+check("WT is localizable", drawn["9:9"], "POIDS")
+dex.text, dex.fill, dex.border, dex.tile = nil, nil, nil, nil
+dex.blank, dex.drawPic, dex.drawFootprint = nil, nil, nil
+dex.newEntry = nil
+require("src.core.Strings").load(nil)
 -- Pokedex_UpdateMainScreen: SELECT opens the OPTION screen and START the
 -- SEARCH screen.  Neither cycles anything in place -- the mode changes when
 -- the OPTION screen's own cursor picks one and A confirms it.
@@ -693,6 +854,23 @@ end)(), "search")
 -- Pokedex_InitSearchScreen: TYPE1 starts on NORMAL and TYPE2 on "-----".
 check("TYPE1 starts on NORMAL", dex:searchTypeName(1), "NORMAL")
 check("TYPE2 starts blank", dex:searchTypeName(2), "-----")
+-- Display names come from the type registry, while matching stays on the
+-- stable type id.  Translating GRASS must still find a GRASS species.
+dex.data.type_chart = { types = { GRASS = { name = "HERBE" } } }
+dex.searchType[1] = 12 -- GRASS in SEARCH_TYPES
+check("the search wheel draws the translated type name",
+  dex:searchTypeName(1), "HERBE")
+dexSave.pokedex.seen.BULBASAUR = true
+dex:rebuild()
+dex:beginSearch()
+check("translated type display does not change search identity",
+  #dex.searchResults, 1)
+dex.data.type_chart = nil
+dexSave.pokedex.seen.BULBASAUR = nil
+dex.searchType[1] = 1
+dex.searchResults = nil
+dex.searchMessage = nil
+dex.view = "search"
 check("B leaves the SEARCH screen", (function()
   dexGame.input:press("b")
   dex:update(0)
@@ -839,16 +1017,13 @@ local colorRow = select(2, rowNamed("COLOR"))
 check("COLOR is a row", colorRow ~= nil, true)
 check("and it defaults to the cart's own colour",
   Save.DEFAULT_OPTIONS.color, "gbc")
-scrollOptions.options.color = "gbc"
-scrollOptions:cycle(colorRow, 1)
-check("right steps to DMG", scrollOptions.options.color, "dmg")
-scrollOptions:cycle(colorRow, 1)
-check("then CLASSIC", scrollOptions.options.color, "classic")
-scrollOptions:cycle(colorRow, 1)
-check("and wraps back to GBC", scrollOptions.options.color, "gbc")
-scrollOptions:cycle(colorRow, -1)
-check("left walks the ladder the other way", scrollOptions.options.color,
-  "classic")
+-- COLOR no longer cycles in place (tests/engine/gen2_palette_picker_test.lua
+-- covers the picker it opens instead, end to end); the ladder itself still
+-- steps via the `2` hotkey (src/core/Game2.lua:hotkey), untouched here.
+check("COLOR no longer cycles in place", colorRow.cycle, nil)
+check("COLOR opens the picker instead", type(colorRow.activate), "function")
+scrollOptions.options.color = "classic"
+GbcPalette.setMode("classic")
 check("CLASSIC is the only mode with a present pass",
   GbcPalette.presentColors() ~= nil, true)
 GbcPalette.setMode("dmg")
@@ -861,19 +1036,25 @@ check("GBC leaves a palette alone",
     1)[1], 1)
 check("and has no present pass", GbcPalette.presentColors(), nil)
 
-local zoomIndex, gbcfxIndex
+local zoomIndex, tiltIndex
 for i, row in ipairs(OptionsMenu.ROWS) do
   if row.label == "ZOOM" then zoomIndex = i end
-  if row.label == "GBC FX" then gbcfxIndex = i end
+  if row.label == "TILT" then tiltIndex = i end
 end
 check("VOID FILL follows ZOOM", OptionsMenu.ROWS[zoomIndex + 1].label,
   "VOID FILL")
 check("and TILT follows VOID FILL", OptionsMenu.ROWS[zoomIndex + 2].label,
   "TILT")
-check("VIDEO MODE follows GBC FX", OptionsMenu.ROWS[gbcfxIndex + 1].label,
-  "VIDEO MODE")
-check("and TOUCH PAD follows it", OptionsMenu.ROWS[gbcfxIndex + 2].label,
-  "TOUCH PAD")
+-- By sequence rather than by offset, so inserting a row in the display block
+-- moves the whole run instead of breaking six separate index assertions.
+do
+  local run = { "TILT", "COLOR", "UI LETTERBOX", "SHADER FX",
+                "SHADER FX 2", "VIDEO MODE", "SCREEN POS", "TOUCH PAD" }
+  for at, want in ipairs(run) do
+    check("display block order: " .. want,
+      OptionsMenu.ROWS[tiltIndex + at - 1].label, want)
+  end
+end
 
 local videoRow = select(2, rowNamed("VIDEO MODE"))
 check("VIDEO MODE is a row", videoRow ~= nil, true)
@@ -1383,10 +1564,10 @@ local expnGear = newGear({ landmark = "LANDMARK_PALLET_TOWN",
   clock = { hour = 14, minute = 0, weekday = 1 } })
 check("and airs with it", expnGear:stations()[7].station, "POKE_FLUTE_RADIO")
 
--- .EvolutionRadio wants STATUSFLAGS_ROCKET_SIGNAL_F and one of three
--- landmarks around the Lake of Rage.
+-- .EvolutionRadio wants STATUSFLAGS_ROCKET_SIGNAL_F.
+-- pokegold constants/engine_flags.asm
 local rageGear = newGear({ landmark = "LANDMARK_LAKE_OF_RAGE",
-  save = { flags = { ROCKET_SIGNAL = true } },
+  save = { engineFlags = { [14] = true } },
   clock = { hour = 14, minute = 0, weekday = 1 } })
 check("20.5 airs by the Lake of Rage", rageGear:stations()[8].station,
   "EVOLUTION_RADIO")
@@ -1576,7 +1757,20 @@ local function newMart(save, opts)
   opts.save = save
   opts.items = martItems
   opts.marts = martData
-  return MartMenu.new(game, opts), input, game
+  local mart = MartMenu.new(game, opts)
+  -- ../pokecrystal/home/print_text.asm:1
+  local step = mart.update
+  function mart:update(dt)
+    local saved = input.wasPressed
+    input.wasPressed = function() return false end
+    for _ = 1, 600 do
+      if not (self.typer and not self.typer:done()) then break end
+      step(self, dt)
+    end
+    input.wasPressed = saved
+    return step(self, dt)
+  end
+  return mart, input, game
 end
 
 -- GetMart: only an id below NUM_MARTS is a mart at all, and everything else
@@ -2350,12 +2544,10 @@ end
 bagPocketChecks()
 
 -- ---------------------------------------------------------------------------
--- SaveMenu's write chime (engine/menus/save.asm:110, `ld de, SFX_SAVE / call
--- PlaySFX` right after ResumeGameLogic).
+-- SaveMenu's save chime (engine/menus/save.asm:259, `ld de, SFX_SAVE / call
 --
 -- SFX_SAVE is an INDEX into the sfx pointer table, so a wrong id plays the
 -- wrong sound rather than nothing, and no assertion here can see the mistake
--- from the number alone.  The check is therefore the resolution: writeNow ->
 -- SaveMenu:playSfx -> sfxOrder[id + 1], against the shipped Gold cache, must
 -- name Sfx_Save.  $1f used to sit there, which is SFX_ENTER_DOOR.
 -- Wrapped in a function for the same 200-local reason as the blocks above.
@@ -2381,12 +2573,77 @@ local function saveSfxChecks()
   local SaveMenu = require("src.ui.gen2.SaveMenu")
   local menu = SaveMenu.new({ data = { audio = audio } },
     { save = {}, existed = false, writer = function() return true end })
-  menu:writeNow()
+  menu:playSfx(SaveMenu.SFX_SAVE)
   Sound.play = realPlay
 
   check("saving rings SFX_SAVE", rang, "Sfx_Save")
 end
 saveSfxChecks()
+
+-- engine/items/pack.asm:1307 .place_insert, home/audio.asm:220 WaitPlaySFX
+local function packSwitchSfxChecks()
+  local Sound = require("src.core.Sound")
+  local realPlay, realBusy, realFrames =
+    Sound.play, Sound.sfxBusy, Sound.waitFramesFor
+  local rang = {}
+  Sound.play = function(_, name) rang[#rang + 1] = name end
+
+  local save = Save.newGame()
+  save.inventory = { POTION = 1, ANTIDOTE = 1 }
+  local game, input = newGame(save)
+  game.data.items = {
+    POTION = { id = "POTION", name = "POTION", pocket = "ITEM", index = 1 },
+    ANTIDOTE = { id = "ANTIDOTE", name = "ANTIDOTE", pocket = "ITEM",
+      index = 2 },
+  }
+  game.data.audio = { sfx = { Sfx_SwitchPokemon = {} } }
+  local menu = PackMenu.new(game, { pocket = "ITEM" })
+  check("two rows to shuffle", #menu.rows, 2)
+
+  menu.index = 1
+  input:press("select")
+  menu:update(0)
+  check("SELECT picks the row up", menu.switching, 1)
+  input:press("down")
+  menu:update(0)
+  check("the cursor moves under it", menu.index, 2)
+  input:press("a")
+  menu:update(0)
+  check("the place ends the switch", menu.switching, nil)
+  check("and beeps once in that frame", #rang, 1)
+  menu:update(0)
+  check("the second beep follows on the next tick", #rang, 2)
+  check("both are the switch cue",
+    rang[1] == "Sfx_SwitchPokemon" and rang[2] == "Sfx_SwitchPokemon", true)
+  menu:update(0)
+  check("and there is no third", #rang, 2)
+
+  -- home/audio.asm:225 WaitSFX, home/delay.asm:14
+  Sound.sfxBusy = function() return true end
+  Sound.waitFramesFor = function() return 3 end
+  rang = {}
+  menu.index = 1
+  input:press("select")
+  menu:update(0)
+  input:press("down")
+  menu:update(0)
+  input:press("a")
+  menu:update(0)
+  check("the place beeps", #rang, 1)
+  local held = menu.index
+  input:press("down")
+  menu:update(0)
+  check("the pending beep holds the list", menu.index, held)
+  check("with no second beep yet", #rang, 1)
+  menu:update(0)
+  check("still waiting", #rang, 1)
+  menu:update(0)
+  check("the budget releases the second beep", #rang, 2)
+
+  Sound.play, Sound.sfxBusy, Sound.waitFramesFor = realPlay, realBusy,
+    realFrames
+end
+packSwitchSfxChecks()
 
 -- ------------------------------------------------- the mod row contract
 --
@@ -2417,7 +2674,8 @@ local function modRowChecks()
   local og, oi = newGame(nil)
   local om = OptionsMenu.new(og, { options = Save.defaultOptions() })
   check("gen2 OPTION takes the hook's row", om.rows[#om.rows].id, "modrow")
-  om.index = #om.rows
+  -- A hook row is in no group, so it stays on the top level.
+  check("and keeps it reachable there", om:focusRow("modrow"), om)
   oi:press("a")
   om:update(0)
   check("A on a mod row calls activate", fired, 1)

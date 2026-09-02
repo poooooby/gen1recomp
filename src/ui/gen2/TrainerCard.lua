@@ -38,7 +38,10 @@
 -- leader's own palette.
 
 local Chrome = require("src.ui.gen2.Chrome")
+local Font = require("src.render.Font")
 local GbcPalette = require("src.render.GbcPalette")
+local Gen2Save = require("src.core.gen2.Save")
+local Strings = require("src.core.Strings")
 local TileSheet = require("src.ui.gen2.TileSheet")
 
 local TrainerCard = {}
@@ -61,11 +64,50 @@ local TILE_COLON = 0x2e
 
 -- Johto then Kanto, in badge order.
 local JOHTO_BADGES = {
-  "ZEPHYR", "HIVE", "PLAIN", "FOG", "STORM", "MINERAL", "GLACIER", "RISING",
+  Strings.source("ZEPHYR"), Strings.source("HIVE"), Strings.source("PLAIN"),
+  Strings.source("FOG"), Strings.source("STORM"), Strings.source("MINERAL"),
+  Strings.source("GLACIER"), Strings.source("RISING"),
 }
 local KANTO_BADGES = {
-  "BOULDER", "CASCADE", "THUNDER", "RAINBOW", "SOUL", "MARSH", "VOLCANO",
-  "EARTH",
+  Strings.source("BOULDER"), Strings.source("CASCADE"),
+  Strings.source("THUNDER"), Strings.source("RAINBOW"), Strings.source("SOUL"),
+  Strings.source("MARSH"), Strings.source("VOLCANO"), Strings.source("EARTH"),
+}
+local JOHTO_BADGES_LABEL = Strings.source("JOHTO BADGES")
+local KANTO_BADGES_LABEL = Strings.source("KANTO BADGES")
+
+-- Badge captions have room for four font glyphs, not four Lua bytes.  The
+-- distinction matters as soon as a translation starts with an accented
+-- character (or uses a multi-byte charmap sequence).
+local function badgeCaption(text)
+  text = text or ""
+  local spans = Font.split(text)
+  if #spans <= 4 then return text end
+  -- Same "#" -> POKé trap src/ui/gen2/PrizeMenu.lua's clampToTiles guards
+  -- against: the 4-glyph cut can land inside a macro's multi-glyph expansion
+  -- (four spans sharing one source byte's `to`), and text:sub there would
+  -- still copy the whole source byte, re-expanding past the budget on the
+  -- next Font.split. Back up to the last span whose source byte the next
+  -- span does NOT share.
+  local cut = 4
+  while cut > 0 and spans[cut].to == spans[cut + 1].to do
+    cut = cut - 1
+  end
+  if cut == 0 then return "" end
+  return text:sub(1, spans[cut].to)
+end
+
+-- The two slots _CGB_TrainerCard swaps by gender: CHRIS and FALKNER/KrisPalette.
+-- ../pokecrystal/engine/gfx/cgb_layouts.asm:619-624, data/trainers/palettes.asm:9-12
+local PLAYER_PALETTE, BORDER_PALETTE = 1, 2
+
+-- Kris's attrmap: the border takes CHRIS's palette, the portrait takes hers,
+-- the top-right corner follows the border, and Clair's face borrows hers
+-- (../pokecrystal/engine/gfx/cgb_layouts.asm:649-666, :698-712).
+local FEMALE_ZONES = {
+  { 14, 1, 5, 7, BORDER_PALETTE },
+  { 18, 1, 1, 1, PLAYER_PALETTE },
+  { 14, 14, 4, 2, BORDER_PALETTE },
 }
 
 -- TrainerCard_JohtoBadgesOAM lists the badges in wJohtoBadges bit order,
@@ -92,10 +134,13 @@ function TrainerCard.new(game, opts)
 
   local gfx = (opts.menuGfx or data.gen2MenuGfx or {}).trainerCard
   self.gfx = gfx
+  self.female = Gen2Save.isFemale(self.save) and gfx ~= nil
+    and gfx.cardFemale ~= nil
   if gfx then
     -- One palette lookup per cell, flattened from the FillBoxCGB zones the
     -- way PackGfx does it.  Anything outside a zone is palette 1.
     self.zone = {}
+    self.zoneDefault = BORDER_PALETTE
     for _, z in ipairs(gfx.paletteZones or {}) do
       for y = z[2], z[2] + z[4] - 1 do
         for x = z[1], z[1] + z[3] - 1 do
@@ -103,11 +148,22 @@ function TrainerCard.new(game, opts)
         end
       end
     end
+    if self.female then
+      self.zoneDefault = PLAYER_PALETTE
+      for _, z in ipairs(FEMALE_ZONES) do
+        for y = z[2], z[2] + z[4] - 1 do
+          for x = z[1], z[1] + z[3] - 1 do
+            self.zone[y * SCREEN_W + x] = z[5]
+          end
+        end
+      end
+    end
     local function paletteFor(_, tx, ty)
       return self:colorsAt(tx, ty)
     end
     self.card = TileSheet.new({
-      path = gfx.card, wide = gfx.cardTilesWide or 16, firstTile = 0,
+      path = (self.female and gfx.cardFemale) or gfx.card,
+      wide = gfx.cardTilesWide or 16, firstTile = 0,
       paletteFor = paletteFor,
     })
     self.status = TileSheet.new({
@@ -152,7 +208,8 @@ function TrainerCard:pair(colors)
 end
 
 function TrainerCard:colorsAt(tx, ty)
-  local index = (self.zone and self.zone[ty * SCREEN_W + tx]) or 2
+  local index = (self.zone and self.zone[ty * SCREEN_W + tx])
+    or self.zoneDefault or BORDER_PALETTE
   return self:palette(index)
 end
 
@@ -242,16 +299,24 @@ end
 -- TrainerCard_PrintTopHalfOfCard runs once, in .InitRAM, and no page redraws
 -- it -- so the name, ID, money and portrait stay on screen behind the badge
 -- pages too.
+function TrainerCard:print(text, tx, ty)
+  Chrome.printThrough(text, tx, ty, self:colorsAt(tx, ty))
+end
+
+function TrainerCard:cursor(tx, ty, hollow)
+  Chrome.cursorThrough(tx, ty, self:colorsAt(tx, ty), false, hollow)
+end
+
 function TrainerCard:drawTopHalf()
   local player = (self.save or {}).player or {}
   self:frame(0, 5)
-  Chrome.print("NAME/", 2, 2)
-  Chrome.print(player.name or "GOLD", 7, 2)
+  self:print(Strings("NAME/"), 2, 2)
+  self:print(player.name or "GOLD", 7, 2)
   self:tile(self.card, TILE_ID_NO[1], 2, 4)
   self:tile(self.card, TILE_ID_NO[2], 3, 4)
-  Chrome.print(Chrome.number(player.id or 0, 5, true), 5, 4)
-  Chrome.print("MONEY", 2, 6)
-  Chrome.print(moneyText(player.money), 7, 6)
+  self:print(Chrome.number(player.id or 0, 5, true), 5, 4)
+  self:print(Strings("MONEY"), 2, 6)
+  self:print(moneyText(player.money), 7, 6)
   for x = 1, 12 do self:tile(self.card, TILE_DIVIDER, x, 3) end
   self:tile(self.card, TILE_DIVIDER_END, 13, 3)
   self:drawPortrait()
@@ -269,22 +334,22 @@ function TrainerCard:drawCard()
 
   -- `#` is the compression byte for POKé, four tiles, so spelling it out is
   -- what the cart actually draws.
-  Chrome.print("POKéDEX", 2, 10)
-  Chrome.print("PLAY TIME", 2, 12)
-  Chrome.print(Chrome.number(self:caughtCount(), 3), 15, 10)
+  self:print(Strings("POKéDEX"), 2, 10)
+  self:print(Strings("PLAY TIME"), 2, 12)
+  self:print(Chrome.number(self:caughtCount(), 3), 15, 10)
 
   local time = save.playTime or {}
-  Chrome.print(Chrome.number(time.hours or 0, 4), 11, 12)
+  self:print(Chrome.number(time.hours or 0, 4), 11, 12)
   -- The colon is $2e, which belongs to CardStatusGFX rather than the card
   -- sheet, and TrainerCard_Page1_PrintGameTime xors it with ' ' every 32
   -- frames -- which is what makes the clock look like it is running.
   if math.floor(self.frames / 32) % 2 == 0 then
     self:tile(self.status, TILE_COLON, 15, 12)
   end
-  Chrome.print(Chrome.number(time.minutes or 0, 2, true), 16, 12)
+  self:print(Chrome.number(time.minutes or 0, 2, true), 16, 12)
 
-  Chrome.print("BADGES", 12, 15)
-  Chrome.cursor(18, 15)
+  self:print(Strings("BADGES"), 12, 15)
+  self:cursor(18, 15)
 end
 
 -- TrainerCard_Page2_3_PlaceLeadersFaces: four tiles across the top row, then
@@ -368,22 +433,22 @@ function TrainerCard:drawPlain()
   Chrome.clear()
   if self.page == 1 then
     Chrome.box(0, 0, 20, 9)
-    Chrome.print("NAME/", 2, 2)
-    Chrome.print(player.name or "GOLD", 7, 2)
-    Chrome.print("ID No", 2, 4)
-    Chrome.print(Chrome.number(player.id or 0, 5, true), 5, 4)
-    Chrome.print("MONEY", 2, 6)
-    Chrome.print(moneyText(player.money), 7, 6)
+    Chrome.printThrough(Strings("NAME/"), 2, 2, Chrome.DEFAULT_BOX_PALETTE)
+    Chrome.printThrough(player.name or "GOLD", 7, 2, Chrome.DEFAULT_BOX_PALETTE)
+    Chrome.printThrough(Strings("ID No"), 2, 4, Chrome.DEFAULT_BOX_PALETTE)
+    Chrome.printThrough(Chrome.number(player.id or 0, 5, true), 5, 4, Chrome.DEFAULT_BOX_PALETTE)
+    Chrome.printThrough(Strings("MONEY"), 2, 6, Chrome.DEFAULT_BOX_PALETTE)
+    Chrome.printThrough(moneyText(player.money), 7, 6, Chrome.DEFAULT_BOX_PALETTE)
     Chrome.box(0, 8, 20, 10)
-    Chrome.print("POKéDEX", 2, 10)
-    Chrome.print(Chrome.number(self:caughtCount(), 3), 15, 10)
-    Chrome.print("PLAY TIME", 2, 12)
+    Chrome.printThrough(Strings("POKéDEX"), 2, 10, Chrome.DEFAULT_BOX_PALETTE)
+    Chrome.printThrough(Chrome.number(self:caughtCount(), 3), 15, 10, Chrome.DEFAULT_BOX_PALETTE)
+    Chrome.printThrough(Strings("PLAY TIME"), 2, 12, Chrome.DEFAULT_BOX_PALETTE)
     local time = save.playTime or {}
-    Chrome.print(Chrome.number(time.hours or 0, 4), 11, 12)
-    Chrome.print(":", 15, 12)
-    Chrome.print(Chrome.number(time.minutes or 0, 2, true), 16, 12)
-    Chrome.print("BADGES", 12, 15)
-    Chrome.cursor(18, 15)
+    Chrome.printThrough(Chrome.number(time.hours or 0, 4), 11, 12, Chrome.DEFAULT_BOX_PALETTE)
+    Chrome.printThrough(":", 15, 12, Chrome.DEFAULT_BOX_PALETTE)
+    Chrome.printThrough(Chrome.number(time.minutes or 0, 2, true), 16, 12, Chrome.DEFAULT_BOX_PALETTE)
+    Chrome.printThrough(Strings("BADGES"), 12, 15, Chrome.DEFAULT_BOX_PALETTE)
+    Chrome.cursorThrough(18, 15, Chrome.DEFAULT_BOX_PALETTE)
     return
   end
   local names = self.page == 2 and JOHTO_BADGES or KANTO_BADGES
@@ -394,12 +459,14 @@ function TrainerCard:drawPlain()
   -- player.badges on both pages to match.
   local held = player.badges or {}
   Chrome.box(0, 0, 20, 9)
-  Chrome.print(self.page == 2 and "JOHTO BADGES" or "KANTO BADGES", 2, 2)
+  Chrome.printThrough(Strings(self.page == 2 and JOHTO_BADGES_LABEL or
+    KANTO_BADGES_LABEL), 2, 2, Chrome.DEFAULT_BOX_PALETTE)
   Chrome.box(0, 8, 20, 10)
   for i, name in ipairs(names) do
     local tx = 2 + ((i - 1) % 4) * 4
     local ty = 10 + math.floor((i - 1) / 4) * 3
-    Chrome.print((held[i] or held[name]) and name:sub(1, 4) or "----", tx, ty)
+    local label = (held[i] or held[name]) and badgeCaption(Strings(name)) or "----"
+    Chrome.printThrough(label, tx, ty, Chrome.DEFAULT_BOX_PALETTE)
   end
 end
 
@@ -409,9 +476,7 @@ function TrainerCard:drawPanel()
     love.graphics.setColor(1, 1, 1, 1)
     return
   end
-  local G = love.graphics
-  G.setColor(1, 1, 1, 1)
-  G.rectangle("fill", 0, 0, SCREEN_W * 8, SCREEN_H * 8)
+  Chrome.paletteFill(0, 0, SCREEN_W * 8, SCREEN_H * 8, Chrome.DEFAULT_BOX_PALETTE)
   local player = (self.save and self.save.player) or {}
   if self.page == 1 then
     self:drawCard()
@@ -424,7 +489,7 @@ function TrainerCard:drawPanel()
     -- the same table page 2 reads.
     self:drawBadges(JOHTO_BADGES, player.badges or {})
   end
-  G.setColor(1, 1, 1, 1)
+  love.graphics.setColor(1, 1, 1, 1)
 end
 
 function TrainerCard:draw()
@@ -433,12 +498,10 @@ end
 
 function TrainerCard:drawWidescreen(winW, winH)
   local G = love.graphics
-  G.setColor(1, 1, 1, 1)
-  G.rectangle("fill", 0, 0, winW, winH)
+  Chrome.letterbox(winW, winH, 1, 1, 1)
   local scale = Chrome.fitScale(winW, winH)
   G.push()
-  G.translate(math.floor((winW - 160 * scale) / 2),
-    math.floor((winH - 144 * scale) / 2))
+  G.translate(Chrome.fitOrigin(winW, winH, scale))
   G.scale(scale, scale)
   self:drawPanel()
   G.pop()

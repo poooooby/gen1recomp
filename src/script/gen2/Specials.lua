@@ -1,7 +1,7 @@
 -- The `special` command's handlers (data/events/special_pointers.asm).
 --
 -- Lifted out of src/script/gen2/Vm.lua because the two are different kinds of
--- code: the VM is one interpreter with a shared control flow, and this is 112
+-- code: the VM is one interpreter with a shared control flow, and this is 169
 -- INDEPENDENT routines that happen to share a dispatch table.  Growing them
 -- inside runList's else-chain would have buried the interpreter.
 --
@@ -9,9 +9,9 @@
 -- which the extractor turns into constants.specialOrder, and Vm:specialName
 -- resolves the one into the other; keying on the label rather than on the
 -- number means a repointed table cannot silently call the wrong routine, and
--- it means a test can assert the mapping against the cache.  This cache's
--- order has 112 rows -- the asm file's 113 `add_special` matches include the
--- MACRO line itself.
+-- it means a test can assert the mapping against the cache.  A Gold cache's
+-- order has 112 rows and a Crystal one 169 -- the asm files' `add_special`
+-- match counts are one higher each, because they include the MACRO line.
 --
 -- Three kinds of entry live here:
 --
@@ -52,6 +52,7 @@
 --              it, plus the fruit trees and the daily rollover Kurt waits on.
 local Apricorns = require("src.core.gen2.Apricorns")
 local BugContest = require("src.core.gen2.BugContest")
+local GameVersion = require("src.core.GameVersion")
 local Happiness = require("src.core.gen2.Happiness")
 local Phone = require("src.core.gen2.Phone")
 local Pokerus = require("src.core.gen2.Pokerus")
@@ -151,6 +152,12 @@ local function answer(vm, value)
   vm.scriptVar = value or 0
 end
 
+-- WaitSFX (pokegold home/audio.asm); a test stub that calls a handler off
+-- the coroutine has no sfx to drain.
+local function drainSfx()
+  if coroutine.running() then coroutine.yield({ kind = "waitsfx" }) end
+end
+
 -- Every routine that ends `call GetPokemonName / jp
 -- CopyPokemonName_Buffer1_Buffer3` puts a name where the next writetext's
 -- {STRBUF} will find it.
@@ -174,6 +181,20 @@ local function selectMon(vm, prompt)
   picked = picked or {}
   return picked.index, picked.mon
 end
+
+Specials.shared = {
+  TRUE = TRUE,
+  FALSE = FALSE,
+  block = Specials.block,
+  hooks = hooks,
+  party = party,
+  save = save,
+  data = data,
+  answer = answer,
+  nameMon = nameMon,
+  selectMon = selectMon,
+  showRawHeld = showRawHeld,
+}
 
 --------------------------------------------------------------------------
 -- Magikarp lengths (engine/events/magikarp.asm)
@@ -437,8 +458,10 @@ H.BugContestJudging = function(vm)
       local what = (h.monName and h.monName(entry.species)) or entry.species
         or ""
       vm:showRaw(Strings(row.page, who, what))
+      -- pokegold engine/events/bug_contest/judging.asm:29-32
+      drainSfx()
       if h.playSfxNamed then h.playSfxNamed(row.sfx) end
-      vm:showRaw(Strings(row.score, entry.score or 0))
+      vm:showRaw(Strings(row.score, entry.score or 0), nil, nil, true)
     end
   end
   answer(vm, place)
@@ -664,8 +687,8 @@ H.DayCareMon2 = function(vm) dayCareMon(vm, "lady") end
 -- its own common_* text: the extractor does not reach the common banks.
 local MOVE_DELETER_TEXT = {
   intro = Strings.source(
-    "Um… Oh, yes, I'm\nthe MOVE DELETER.\n\nI can make #MON\n"
-    .. "forget moves.\n\nShall I make a\n#MON forget?"),
+    "Um… Oh, yes, I'm\nthe MOVE DELETER.\fI can make #MON\n"
+    .. "forget moves.\fShall I make a\n#MON forget?"),
   declined = Strings.source("No? Come visit me\nagain."),
   whichMon = Strings.source("Which #MON?"),
   egg = Strings.source("An EGG doesn't\nknow any moves!"),
@@ -765,23 +788,23 @@ end
 -- `special` byte only points at the routine, not at the text bank behind it.
 local NAME_RATER_TEXT = {
   hello = Strings.source(
-    "Hello, hello! I'm\nthe NAME RATER.\n\nI rate the names\nof #MON.\n\n"
+    "Hello, hello! I'm\nthe NAME RATER.\fI rate the names\nof #MON.\f"
     .. "Would you like me\nto rate names?"),
   comeAgain = Strings.source("OK, then. Come\nagain sometime."),
-  whichMon = Strings.source("Which #MON's\nnickname should I\nrate for you?"),
+  whichMon = Strings.source("Which #MON's\nnickname should I\vrate for you?"),
   egg = Strings.source("Whoa… That's just\nan EGG."),
   perfectName = Strings.source(
-    "Hm… {STRBUF}?\nWhat a great name!\nIt's perfect.\n\nTreat {STRBUF}\n"
+    "Hm… {STRBUF}?\nWhat a great name!\vIt's perfect.\fTreat {STRBUF}\n"
     .. "with loving care."),
   betterName = Strings.source(
-    "Hm… {STRBUF}…\nThat's a fairly\ndecent name.\n\nBut, how about a\n"
-    .. "slightly better\nnickname?\n\nWant me to give it\na better name?"),
-  whatName = Strings.source("All right. What\nname should we\ngive it, then?"),
-  finished = Strings.source("That's a better\nname than before!\n\nWell done!"),
+    "Hm… {STRBUF}…\nThat's a fairly\vdecent name.\fBut, how about a\n"
+    .. "slightly better\vnickname?\fWant me to give it\na better name?"),
+  whatName = Strings.source("All right. What\nname should we\vgive it, then?"),
+  finished = Strings.source("That's a better\nname than before!\fWell done!"),
   sameName = Strings.source(
-    "It might look the\nsame as before,\n\nbut this new name\n"
-    .. "is much better!\n\nWell done!"),
-  named = Strings.source("All right. This\n#MON is now\nnamed {STRBUF}."),
+    "It might look the\nsame as before,\fbut this new name\n"
+    .. "is much better!\fWell done!"),
+  named = Strings.source("All right. This\n#MON is now\vnamed {STRBUF}."),
 }
 
 -- IsNewNameEmpty: the typed name is empty if every character up to the
@@ -1058,7 +1081,7 @@ end
 -- -- is drawn on the cartridge itself, and only the A press farcalls
 -- PrintUnownStamp.  src/ui/gen2/UnownPrinter.lua is that viewer and takes the
 -- A press nowhere, which is what a cartridge with nothing in its link port
--- does; PrintDiploma next door has no viewer half at all and stays a stub.
+-- does; PrintDiploma next door shows its page and prints nothing either.
 --
 -- `ld a, [wUnownDex] / and a / ret z` is the gate: with no Unown caught the
 -- special returns before it draws anything.  The routine never writes
@@ -1117,6 +1140,10 @@ H.FadeOutToBlack = function(vm) fade(vm, "outBlack") end
 H.FadeInFromWhite = function(vm) fade(vm, "inWhite") end
 H.FadeInFromBlack = function(vm) fade(vm, "inBlack") end
 
+-- engine/tilesets/timeofday_pals.asm:130: FillWhiteBGColor, then the same
+-- c=$9 / b=4 time-pal walk FadeInFromWhite runs, stepped by hand.
+H.BattleTowerFade = function(vm) fade(vm, "inWhite") end
+
 -- ClearBGPalettes / ClearBGPalettesBufferScreen / ClearTilemap: the screen is
 -- blanked to the background colour under a fade that is already down.  The
 -- port fades with a flat sheet, so the sheet IS the cleared screen.
@@ -1152,12 +1179,36 @@ H.LoadUsedSpritesGFX = function(vm)
   if h.reloadSprites then h.reloadSprites(false) end
 end
 
+-- ../pokecrystal/engine/overworld/warp_connection.asm:311, `ld b, SCGB_MAPPALS / jp
+-- GetSGBLayout`: the map's own palette layout, reapplied and nothing else.
+H.LoadMapPalettes = function(vm)
+  local h = hooks(vm)
+  if h.reloadSprites then h.reloadSprites(true) end
+end
+
+-- engine/overworld/overworld.asm:40: the used-sprite list rebuilt and its
+-- VRAM pack reloaded, with no palette pass -- LoadUsedSpritesGFX's arm.
+H.RefreshSprites = function(vm)
+  local h = hooks(vm)
+  if h.reloadSprites then h.reloadSprites(false) end
+end
+
 -- UpdatePlayerSprite: the player's sheet is a pure function of wPlayerState
 -- (data/sprites/player_sprites.asm ChrisStateSprites), which is what makes
 -- getting on and off a Lapras a one-byte change rather than an animation.
 H.UpdatePlayerSprite = function(vm)
   local h = hooks(vm)
   if h.updatePlayerSprite then h.updatePlayerSprite() end
+end
+
+-- engine/events/specials.asm:21 -> engine/overworld/map_objects.asm:2515:
+-- bit 7 of wScriptVar gates the routine, bits 6-4 are the OBJ palette.
+H.SetPlayerPalette = function(vm)
+  local value = (vm.scriptVar or 0) % 0x100
+  if value < 0x80 then return end
+  vm.playerPalette = math.floor(value / 0x10) % 8
+  local h = hooks(vm)
+  if h.setPlayerPalette then h.setPlayerPalette(vm.playerPalette) end
 end
 
 -- ---- 58-62 sound and the water --------------------------------------------
@@ -1331,7 +1382,18 @@ H.GiveShuckle = function(vm)
   end
   mon.ot = Specials.MANIA_OT
   mon.otId = Specials.MANIA_OT_ID
+  local record = save(vm)
   list[#list + 1] = mon
+  -- ../pokecrystal/engine/events/shuckle.asm:18-19
+  if Mon.hasCaughtData(record and record.version) then
+    Mon.setGiftCaughtData(mon, "unknown")
+  end
+  -- TryAddMonToParty's .registerpokedex (engine/pokemon/move_mon.asm:188-196) #1719
+  if record then
+    record.pokedex = record.pokedex or { seen = {}, caught = {} }
+    record.pokedex.seen[mon.species] = true
+    record.pokedex.caught[mon.species] = true
+  end
   answer(vm, TRUE)
 end
 
@@ -1445,6 +1507,22 @@ local function trailingDigitsShared(a, b)
 end
 Specials.trailingDigitsShared = trailingDigitsShared
 
+-- pokegold/constants/pokemon_data_constants.asm:122-123
+local NUM_BOXES, NUM_BOXES_JP = 14, 9
+
+-- pokegold/engine/events/lucky_number.asm:22-102: sBox (the OPEN box) is walked
+-- before .BoxesLoop skips it, and .BoxesLoop stops at NUM_BOXES_JP not NUM_BOXES.
+local function luckyNumberBoxOrder(record)
+  local current = math.floor(tonumber(record and record.currentBox) or 1)
+  local last = GameVersion.fixes().luckyNumberBoxes and NUM_BOXES or NUM_BOXES_JP
+  local order = { current }
+  for index = 1, last do
+    if index ~= current then order[#order + 1] = index end
+  end
+  return order
+end
+Specials.luckyNumberBoxOrder = luckyNumberBoxOrder
+
 local function luckyPrizeFor(shared)
   if shared >= 5 then return 1 end
   if shared >= 3 then return 2 end
@@ -1508,8 +1586,9 @@ H.CheckForLuckyNumberWinners = function(vm)
     end
   end
   for _, mon in ipairs(party(vm)) do consider(mon, false) end
-  for _, box in pairs((record and record.boxes) or {}) do
-    for _, mon in ipairs(box or {}) do consider(mon, true) end
+  local boxes = (record and record.boxes) or {}
+  for _, index in ipairs(luckyNumberBoxOrder(record)) do
+    for _, mon in ipairs(boxes[index] or {}) do consider(mon, true) end
   end
   answer(vm, best)
   if bestMon then
@@ -1586,9 +1665,17 @@ local KURT_MENU_FLAGS = 0x80 + 0x20
 -- CANCEL.  Both refusals -- FindApricornsInBag's `scf` for a pack with no
 -- apricorn in it at all, and the `jr c, .nope` for pressing B -- answer
 -- `xor a`, which is the FALSE `.Cancel` waits on.
+--
+-- ../pokecrystal/engine/events/kurt.asm:19-45 is the same routine with a
+-- quantity menu bolted on, and its `xor a / ld [wKurtApricornQuantity], a`
+-- (:24) and `ld a, [wItemQuantityChange] / ld [...], a` (:45) are what
+-- ../pokecrystal/maps/KurtsHouse.asm:197's `verbosegiveitemvar LEVEL_BALL,
+-- VAR_KURT_APRICORNS` counts out.  Kurt_SelectQuantity is not ported, so the
+-- count written here is the one apricorn Apricorns.takeApricorn tosses.
 H.SelectApricornForKurt = function(vm)
   local h = hooks(vm)
   local record = save(vm)
+  if h.setKurtApricornQuantity then h.setKurtApricornQuantity(0) end
   local list = Apricorns.bagList(record and record.inventory)
   if list.empty then return answer(vm, FALSE) end
 
@@ -1612,7 +1699,10 @@ H.SelectApricornForKurt = function(vm)
   local item = h.itemIndex and h.itemIndex(apricorn)
   if not item or item == 0 then return answer(vm, FALSE) end
   answer(vm, item)
-  Apricorns.takeApricorn(record, apricorn)
+  if Apricorns.takeApricorn(record, apricorn)
+      and h.setKurtApricornQuantity then
+    h.setKurtApricornQuantity(1)
+  end
 end
 
 -- ---- 88-89 the first party slot -------------------------------------------
@@ -1694,7 +1784,8 @@ H.RandomPhoneWildMon = function(vm)
   local entry = contact and contact.map and grass and grass[contact.map]
   local slots = entry and entry.slots
   if not slots then return end
-  local daytime = (w and w.daytime) or "DAY"
+  -- wTimeOfDay, not the palette pin (wildmons.asm:861)
+  local daytime = (w and (w.tod or w.daytime)) or "DAY"
   if daytime == "DARK" then daytime = "NITE" end
   local slot = (slots[daytime] or slots.DAY or {})[Specials.random(4)]
   if slot and slot.species then nameSpecies(vm, slot.species) end
@@ -1860,10 +1951,11 @@ H.DaisysGrooming = function(vm) haircut(vm, "daisy") end
 -- the cart puts them in two DIFFERENT buffers (wStringBuffer3,
 -- wStringBuffer4) in the one textbox, and the VM's {STRBUF} substitution
 -- only ever carries one value.
+-- `para` is `\f` (home/text.asm:403), `cont` is `\v` (home/text.asm:442), the
 local OAK_PC_TEXT = {
   completion = Strings.source("Current #DEX\ncompletion level:"),
   counts = Strings.source(
-    "%d #MON seen\n%d #MON owned\n\nPROF.OAK's\nRating:"),
+    "%d #MON seen\n%d #MON owned\fPROF.OAK's\nRating:"),
 }
 
 -- OakRatings (data/events/pokedex_ratings.asm).  Each row is (cap, sfx,
@@ -1876,39 +1968,39 @@ local OAK_RATINGS = {
   { max = 9, sfx = "Sfx_DexFanfareLessThan20", text = Strings.source(
     "Look for #MON\nin grassy areas!") },
   { max = 19, sfx = "Sfx_DexFanfareLessThan20", text = Strings.source(
-    "Good. I see you\nunderstand how to\nuse # BALLS.") },
+    "Good. I see you\nunderstand how to\vuse # BALLS.") },
   { max = 34, sfx = "Sfx_DexFanfare2049", text = Strings.source(
-    "You're getting\ngood at this.\n\nBut you have a\nlong way to go.") },
+    "You're getting\ngood at this.\fBut you have a\nlong way to go.") },
   { max = 49, sfx = "Sfx_DexFanfare2049", text = Strings.source(
-    "You need to fill\nup the #DEX.\n\nCatch different\nkinds of #MON!") },
+    "You need to fill\nup the #DEX.\fCatch different\nkinds of #MON!") },
   { max = 64, sfx = "Sfx_DexFanfare5079", text = Strings.source(
-    "You're trying--I\ncan see that.\n\nYour #DEX is\ncoming together.") },
+    "You're trying--I\ncan see that.\fYour #DEX is\ncoming together.") },
   { max = 79, sfx = "Sfx_DexFanfare5079", text = Strings.source(
-    "To evolve, some\n#MON grow,\n\nothers use the\neffects of STONES.") },
+    "To evolve, some\n#MON grow,\fothers use the\neffects of STONES.") },
   { max = 94, sfx = "Sfx_DexFanfare80109", text = Strings.source(
-    "Have you gotten a\nfishing ROD? You\n\ncan catch #MON\nby fishing.") },
+    "Have you gotten a\nfishing ROD? You\fcan catch #MON\nby fishing.") },
   { max = 109, sfx = "Sfx_DexFanfare80109", text = Strings.source(
-    "Excellent! You\nseem to like col-\nlecting things!") },
+    "Excellent! You\nseem to like col-\vlecting things!") },
   { max = 124, sfx = "Sfx_CaughtMon", text = Strings.source(
-    "Some #MON only\nappear during\n\ncertain times of\nthe day.") },
+    "Some #MON only\nappear during\fcertain times of\nthe day.") },
   { max = 139, sfx = "Sfx_CaughtMon", text = Strings.source(
-    "Your #DEX is\nfilling up. Keep\nup the good work!") },
+    "Your #DEX is\nfilling up. Keep\vup the good work!") },
   { max = 154, sfx = "Sfx_DexFanfare140169", text = Strings.source(
-    "I'm impressed.\nYou're evolving\n\n#MON, not just\ncatching them.") },
+    "I'm impressed.\nYou're evolving\f#MON, not just\ncatching them.") },
   { max = 169, sfx = "Sfx_DexFanfare140169", text = Strings.source(
-    "Have you met KURT?\nHis custom #\nBALLS should help.") },
+    "Have you met KURT?\nHis custom #\vBALLS should help.") },
   { max = 184, sfx = "Sfx_DexFanfare170199", text = Strings.source(
-    "Wow. You've found\nmore #MON than\n\nthe last #DEX\nresearch project.") },
+    "Wow. You've found\nmore #MON than\fthe last #DEX\nresearch project.") },
   { max = 199, sfx = "Sfx_DexFanfare170199", text = Strings.source(
-    "Are you trading\nyour #MON?\n\nIt's tough to do\nthis alone!") },
+    "Are you trading\nyour #MON?\fIt's tough to do\nthis alone!") },
   { max = 214, sfx = "Sfx_DexFanfare200229", text = Strings.source(
-    "Wow! You've hit\n200! Your #DEX\nis looking great!") },
+    "Wow! You've hit\n200! Your #DEX\vis looking great!") },
   { max = 229, sfx = "Sfx_DexFanfare200229", text = Strings.source(
-    "You've found so\nmany #MON!\n\nYou've really\nhelped my studies!") },
+    "You've found so\nmany #MON!\fYou've really\nhelped my studies!") },
   { max = 239, sfx = "Sfx_DexFanfare230Plus", text = Strings.source(
-    "Magnificent! You\ncould become a\n\n#MON professor\nright now!") },
+    "Magnificent! You\ncould become a\f#MON professor\nright now!") },
   { max = 248, sfx = "Sfx_DexFanfare230Plus", text = Strings.source(
-    "Your #DEX is\namazing! You're\n\nready to turn\nprofessional!") },
+    "Your #DEX is\namazing! You're\fready to turn\nprofessional!") },
   -- The top band (251 real species, the table's cap of 255 covers it): this
   -- is the ONLY place the ROM checks "has the player finished the #DEX", and
   -- it does it here rather than handing off to anything.  The actual diploma
@@ -1916,11 +2008,11 @@ local OAK_RATINGS = {
   -- Celadon Mansion 3F reads VAR_DEXCAUGHT for itself and is what runs
   -- `special Diploma` (H.Diploma below, src/ui/gen2/Diploma.lua) and
   -- then sets EVENT_ENABLE_DIPLOMA_PRINTING for the Graphic Artist's
-  -- `special PrintDiploma` (also stubbed: "printer: no Game Boy Printer").
+  -- `special PrintDiploma` (H.PrintDiploma, specials/crystal_extras.lua).
   -- A finished #DEX here just means every rating after this one is this
   -- same line.
   { max = 255, sfx = "Sfx_DexFanfare230Plus", text = Strings.source(
-    "Whoa! A perfect\n#DEX! I've\n\ndreamt about this!\nCongratulations!") },
+    "Whoa! A perfect\n#DEX! I've\fdreamt about this!\nCongratulations!") },
 }
 
 -- CountSetBits over wPokedexSeen/wPokedexCaught.  The port's dex is a
@@ -1954,12 +2046,10 @@ H.ProfOaksPCBoot = function(vm)
   vm:showRaw(Strings(OAK_PC_TEXT.counts, seen, caught))
   local rating = findOakRating(caught)
   local h = hooks(vm)
+  -- pokegold engine/events/prof_oaks_pc.asm:18-20 PlaySFX / JoyWaitAorB / WaitSFX
+  drainSfx()
   if h.playSfxNamed then h.playSfxNamed(rating.sfx) end
-  vm:showRaw(Strings(rating.text))
-  -- `call PlaySFX / call JoyWaitAorB / call WaitSFX`: the fanfare is left
-  -- playing under the rating text, and the caller (OaksLab's own script)
-  -- waits it out before closing the box.
-  coroutine.yield({ kind = "waitsfx" })
+  vm:showRaw(Strings(rating.text), nil, nil, true)
 end
 
 -- The whose-PC menu's PROF.OAK's PC row (src/ui/gen2/CenterPcMenu.lua) runs
@@ -2026,7 +2116,7 @@ Specials.ROAMERS = Roamers.SPECIES
 H.InitRoamMons = function(vm)
   local record = save(vm)
   if not record then return end
-  Roamers.init(record, { force = true })
+  Roamers.init(record, { force = true, data = data(vm) })
 end
 
 -- ---- the #DEX-completion diploma -------------------------------------------
@@ -2327,7 +2417,7 @@ end
 -- layout, PrintPartyMonPage1) and then SendScreenToPrinter walks it out the
 -- serial port to a physical Game Boy Printer.  There is no peripheral for it
 -- to reach here -- the same reason H.UnownPrinter's A press goes nowhere and
--- PrintDiploma stays stubbed below -- so `ldh a, [hPrinter] / and a / jr nz,
+-- PrintDiploma's own print goes nowhere -- so `ldh a, [hPrinter] / and a / jr nz,
 -- .cancel` is
 -- hardwired to the nz arm below: the portrait shows, then the print always
 -- comes back as though the printer errored, which is the honest answer for
@@ -2369,10 +2459,136 @@ H.PhotoStudio = function(vm)
   vm:showRaw(Strings(PHOTO_STUDIO_TEXT.noPhoto))
 end
 
+-- ---- 21 the quick save -----------------------------------------------------
+--
+-- TryQuickSave (engine/link/link.asm:2356) is filed with the cable club but is
+-- not a link routine: it is `farcall Link_SaveGame`, TRUE on carry clear and
+-- FALSE on carry, then `ld c, 30 / call DelayFrames`.  Link_SaveGame
+-- (engine/menus/save.asm:63) is AskOverwriteSaveFile (:169) plus the ordinary
+-- write, so the FALSE arm is a refusal at the overwrite prompt -- which is
+-- what ../pokecrystal/maps/BattleTower1F.asm:84-85 backs a challenge out on,
+-- and what the four PokeCenter2F cable rows share.
+--
+-- Two differences from the cart, neither observable in the answer.
+-- AskOverwriteSaveFile's mismatched-ID arm runs ErasePreviousSave (:333) before
+-- saving; Save.save replaces the whole file anyway.  And SFX_SAVE rings at the
+-- write here, where src/ui/gen2/SaveMenu.lua:107 already puts it, rather than
+-- after the saved page has typed.
+
+-- data/text/common_2.asm:1279-1299.
+local SAVE_TEXT = {
+  already = Strings.source(
+    "There is already a\nsave file. Is it\vOK to overwrite?"),
+  another = Strings.source(
+    "There is another\nsave file. Is it\vOK to overwrite?"),
+  saving = Strings.source("SAVING… DON'T TURN\nOFF THE POWER."),
+  saved = Strings.source("%s saved\nthe game."),
+}
+
+-- engine/menus/save.asm:247 the 16 frames under SAVING and :251 the 32 the
+-- write is followed by; :269 the 30 after the saved page, and link.asm:2367 the
+-- 30 TryQuickSave adds on top.  Both pages are `hold`s rather than `wait`s
+-- because the world does not tick while a box owns the stack (Vm:showRaw).
+local SAVING_HOLD = 16 + 32
+local SAVED_HOLD = 30 + 30
+
+H.TryQuickSave = function(vm)
+  local h = hooks(vm)
+  -- `ld a, [wSaveFileExists] / and a / jr z, .erase`, then
+  -- CompareLoadedAndSavedPlayerID (:212) picking which question is asked.
+  local exists, sameId = false, false
+  if h.saveFileState then exists, sameId = h.saveFileState() end
+  if exists then
+    showRawHeld(vm, Strings(sameId and SAVE_TEXT.already or SAVE_TEXT.another))
+    if not coroutine.yield({ kind = "yesorno" }) then
+      return answer(vm, FALSE)
+    end
+  end
+  vm:showRaw(Strings(SAVE_TEXT.saving), true, SAVING_HOLD)
+  -- _SaveGameData (:273).  A veto from the save.write mod hook is the one way
+  -- this port can refuse a write the cart always completes, and a refusal is
+  -- the same FALSE the overwrite prompt's NO gives.
+  if not (h.writeSave and h.writeSave() ~= false) then
+    return answer(vm, FALSE)
+  end
+  if h.playSfxNamed then h.playSfxNamed("Sfx_Save") end
+  local record = save(vm)
+  local name = (record and record.player and record.player.name) or ""
+  vm:showRaw(Strings(SAVE_TEXT.saved, name), true, SAVED_HOLD)
+  answer(vm, TRUE)
+end
+
 -- ---- 111 the dummy --------------------------------------------------------
 -- UnusedDummySpecial is a bare `ret`.  Listed so the name resolves to a
 -- handler rather than to the unimplemented ledger.
 H.UnusedDummySpecial = function() end
+
+-- ---- 109-165 the Crystal rows ---------------------------------------------
+-- data/events/special_pointers.asm:124-181, the rows only Crystal has.
+
+-- ../pokecrystal/engine/pokemon/search_owned.asm:48 CheckOwnMonAnywhere: party then boxes,
+-- matching species, OT id and OT name; `ld a, [wPartyCount] / and a / ret z`.
+local function ownsMonAnywhere(vm, wanted)
+  local h = hooks(vm)
+  local list = party(vm)
+  if #list == 0 then return false end
+  local record = save(vm)
+  local player = record and record.player
+  local function owns(mon)
+    if not mon then return false end
+    if not (h.monIndex and h.monIndex(mon.species) == wanted) then return false end
+    if player and player.id and mon.otId and mon.otId ~= player.id then
+      return false
+    end
+    if player and player.name and mon.ot and mon.ot ~= player.name then
+      return false
+    end
+    return true
+  end
+  for _, mon in ipairs(list) do
+    if owns(mon) then return true end
+  end
+  for _, box in pairs((record and record.boxes) or {}) do
+    for _, mon in ipairs(box or {}) do
+      if owns(mon) then return true end
+    end
+  end
+  return false
+end
+
+-- ../pokecrystal/engine/pokemon/search_owned.asm:31
+H.MonCheck = function(vm)
+  answer(vm, ownsMonAnywhere(vm, vm.scriptVar) and TRUE or FALSE)
+end
+
+-- home/init.asm:1 falls into Init (home/init.asm:35) and on to the copyright
+-- splash, which is Game2:softReset rather than Game2:returnToTitle.
+H.Reset = function(vm)
+  local h = hooks(vm)
+  if h.softReset then h.softReset() end
+end
+
+-- ../pokecrystal/mobile/mobile_41.asm:320 is a bare `ret` with its SRAM counter left behind
+-- it as dead code, so a no-op is the whole routine.
+H.StubbedTrainerRankings_Healings = function() end
+
+-- ../pokecrystal/mobile/mobile_41.asm:792: the international ROM answers 0 outright, which
+-- is what sends every Pokecenter 2F mobile branch down its cable arm.
+H.CheckMobileAdapterStatusSpecial = function(vm)
+  answer(vm, FALSE)
+end
+
+-- ../pokecrystal/engine/events/battle_tower/battle_tower.asm:187 and :1580, both bare `ret`.
+H.UnusedBattleTowerDummySpecial1 = function() end
+H.UnusedBattleTowerDummySpecial2 = function() end
+
+-- ../pokecrystal/engine/overworld/time.asm:136 SampleKenjiBreakCountdown:
+-- `call Random / and %11 / add 3`, three to six days into wKenjiBreakTimer,
+-- which ../pokecrystal/maps/Route45.asm:50 reads back through VAR_KENJI_BREAK.
+H.SampleKenjiBreakCountdown = function(vm)
+  local h = hooks(vm)
+  if h.setKenjiBreak then h.setKenjiBreak(Specials.random(4) - 1 + 3) end
+end
 
 --------------------------------------------------------------------------
 -- The deliberate stubs
@@ -2393,7 +2609,6 @@ local STUB_ROWS = {
   { "SetBitsForLinkTradeRequest", nil, "link cable: no Gen 2 cable club" },
   { "WaitForLinkedFriend", 0, "link cable: nobody ever connects" },
   { "CheckLinkTimeout_Receptionist", 1, "link cable: always times out" },
-  { "TryQuickSave", 0, "link cable: the cable club's own save is not ported" },
   { "CheckBothSelectedSameRoom", 0, "link cable: no second player" },
   { "FailedLinkToPast", 1, "link cable: the Time Capsule is not ported" },
   { "CloseLink", nil, "link cable: nothing to close" },
@@ -2414,45 +2629,149 @@ local STUB_ROWS = {
   { "CheckMysteryGift", 0, "Mystery Gift: no infrared, so no gift is waiting" },
   { "GetMysteryGiftItem", 0, "Mystery Gift: nothing to hand over" },
   { "UnlockMysteryGift", nil, "Mystery Gift: nothing to unlock" },
-  -- The Game Boy Printer.  A second peripheral again, and two of the three
-  -- specials that want it are not in this table: PhotoStudio ports the
-  -- conversation and the portrait screen (H.PhotoStudio above) and
-  -- UnownPrinter ports the stamp viewer (H.UnownPrinter above), with only the
-  -- print itself stubbed inside each.  PrintDiploma is the one that is
-  -- nothing BUT the print -- the diploma's own page is `special Diploma`, a
-  -- separate row -- so it is all that is left here.
+  -- The Game Boy Printer.  A second peripheral again, and none of the three
+  -- specials that want it is stubbed any more: PhotoStudio ports the
+  -- conversation and the portrait screen (H.PhotoStudio above), UnownPrinter
+  -- ports the stamp viewer (H.UnownPrinter above) and PrintDiploma opens
+  -- PlaceDiplomaOnScreen (specials/crystal_extras.lua), with only the print
+  -- itself going nowhere inside each.  The row below is superseded by that
+  -- handler and survives only as the reason.
   { "PrintDiploma", nil, "printer: no Game Boy Printer" },
-  -- Screens the port has not built.  Each names what it needs; the value is
-  -- the arm a cancel takes, so the script backs out rather than proceeding
-  -- through a transaction that never happened.
+  -- OverworldTownMap's row is superseded by H.OverworldTownMap
+  -- (specials/crystal_extras.lua) and survives only as the reason.
+  -- ../pokecrystal/data/events/special_pointers.asm:58 and pokegold's :63 both
+  -- carry `add_special UnusedMemoryGame ; unused`, and no script names it.
   { "OverworldTownMap", nil, "needs the POKeGEAR map card in view mode" },
-  { "UnusedMemoryGame", nil, "unused in Gold; needs the memory game screen" },
+  { "UnusedMemoryGame", nil, "unused on both carts; no script reaches _MemoryGame" },
+  -- data/events/special_pointers.asm:124-181, the rows only Crystal has.
+  { "BattleTowerRoomMenu", 10, "Battle Tower: $a is the menu's back-out arm" },
+  { "BattleTowerBattle", nil, "Battle Tower: no tower battle to run" },
+  { "BattleTowerAction", 0, "Battle Tower: 0 is sGSBallFlag clear" },
+  { "CheckForBattleTowerRules", 0, "Battle Tower: no challenge in progress" },
+  { "Menu_ChallengeExplanationCancel", 0, "Battle Tower: 0 ends the talk" },
+  { "LoadOpponentTrainerAndPokemonWithOTSprite", 0, "Battle Tower: no roster" },
+  { "BattleTowerMobileError", nil, "Battle Tower: no mobile error to report" },
+  { "Function1700ba", nil, "Battle Tower: mobile challenge setup" },
+  { "Function170114", nil, "Battle Tower: mobile challenge setup" },
+  { "Function1704e1", nil, "Battle Tower: mobile challenge setup" },
+  { "AskMobileOrCable", 0, "Mobile System GB: 0 is a B press off the menu" },
+  { "Mobile_SelectThreeMons", 0, "Mobile System GB: no three mons picked" },
+  { "Function1011f1", nil, "Mobile System GB: enters LINK_MOBILE" },
+  { "Function101220", nil, "Mobile System GB: leaves LINK_MOBILE" },
+  { "Function101225", 0, "Mobile System GB: mobile trade room teardown" },
+  { "Function101231", 0, "Mobile System GB: mobile battle room teardown" },
+  { "Function102142", nil, "Mobile System GB: mobile news feed" },
+  { "Function103780", 0, "Mobile System GB: the mobile save never happens" },
+  { "Function1037c2", 0, "Mobile System GB: no rematch on same settings" },
+  { "Function1037eb", 0, "Mobile System GB: no battle time is left" },
+  { "Function10383c", 0, "Mobile System GB: the three-mon pick cancels" },
+  { "Function10387b", nil, "Mobile System GB: adapter status readback" },
+  { "TradeCornerHoldMon", nil, "Mobile System GB: no mobile trade corner" },
+  { "Function11ac3e", nil, "Mobile System GB: trade corner submenu" },
+  { "Function11b5e8", nil, "Mobile System GB: trade corner submenu" },
+  { "Function11b7e5", nil, "Mobile System GB: trade corner submenu" },
+  { "Function11b879", 0, "Mobile System GB: trade corner submenu" },
+  { "Function11b920", nil, "Mobile System GB: trade corner submenu" },
+  { "Function11b93b", nil, "Mobile System GB: trade corner submenu" },
+  { "Function11ba38", 0, "Mobile System GB: trade corner submenu" },
+  { "Function17d2b6", nil, "Mobile System GB: mobile menu chrome" },
+  { "Function17d2ce", 0, "Mobile System GB: mobile menu chrome" },
+  { "Function11c1ab", nil, "Mobile System GB: the fixed-word entry screen" },
+  { "UnusedFindItemInPCOrBag", 0, "Mobile System GB: unreferenced" },
+  { "GiveOddEgg", nil, "the Odd Egg roster is not ported; Route 34 is later" },
+  { "DisplayUnownWords", nil, "needs the Unown wall word box" },
+  { "HoOhChamber", nil, "the Ruins of Alph secret chambers are not ported" },
+  { "OmanyteChamber", nil, "the Ruins of Alph secret chambers are not ported" },
+  { "PokeSeer", nil, "needs the Seer's caught-data page" },
+  { "BeastsCheck", 0, "the three beasts cannot all be owned this early" },
+  { "BuenasPassword", 0, "Buena's show is not ported; 0 is a wrong guess" },
+  { "BuenaPrize", nil, "Buena's prize counter is not ported" },
+  { "AskRememberPassword", 0, "Buena's show is not ported; 0 declines" },
+  { "CelebiShrineEvent", nil, "the GS Ball event needs the mobile stadium" },
+  { "CheckCaughtCelebi", 0, "the GS Ball event never runs, so Celebi is free" },
+  { "GiveDratini", nil, "the Dragon Shrine moveset swap is past Phase 1" },
+  { "MoveTutor", 255, "the tutor is past Phase 1; -1 is its cancel arm" },
 }
 
 Specials.HANDLERS = H
+
+-- data/events/special_pointers.asm:124-181, the "; Crystal only" block: one
+-- module per owner under src/script/gen2/specials/, merged into HANDLERS here.
+Specials.MODULES = {
+  "crystal_story",
+  "battle_tower",
+  "crystal_extras",
+  "unown_words",
+}
+
+Specials.HANDLER_SOURCE = {}
+for name in pairs(H) do Specials.HANDLER_SOURCE[name] = "Specials.lua" end
+
 Specials.STUBS = {}
 Specials.STUB_REASONS = {}
-
-for _, row in ipairs(STUB_ROWS) do
-  local name, value, reason = row[1], row[2], row[3]
-  Specials.STUB_REASONS[name] = reason
-  Specials.STUBS[name] = function(vm)
-    if value ~= nil then vm.scriptVar = value end
-  end
-end
+Specials.SUPERSEDED_STUBS = {}
 
 -- The dispatch table Vm.SPECIALS is.  Built rather than written out so the two
 -- sets cannot drift, and so a name that ends up in both is a hard error here
 -- rather than a silent shadow at runtime.
 Specials.ALL = {}
-for name, fn in pairs(Specials.HANDLERS) do
-  Specials.ALL[name] = fn
+
+local function clear(t)
+  for key in pairs(t) do t[key] = nil end
 end
-for name, fn in pairs(Specials.STUBS) do
-  if Specials.ALL[name] then
-    error("gen2 special '" .. name .. "' is both implemented and stubbed", 0)
+
+local function rebuild()
+  clear(Specials.STUBS)
+  clear(Specials.STUB_REASONS)
+  clear(Specials.SUPERSEDED_STUBS)
+  clear(Specials.ALL)
+  for _, row in ipairs(STUB_ROWS) do
+    local name, value, reason = row[1], row[2], row[3]
+    if H[name] then
+      if Specials.HANDLER_SOURCE[name] == "Specials.lua" then
+        error("gen2 special '" .. name .. "' is both implemented and stubbed", 0)
+      end
+      Specials.SUPERSEDED_STUBS[name] = reason
+    else
+      Specials.STUB_REASONS[name] = reason
+      Specials.STUBS[name] = function(vm)
+        if value ~= nil then vm.scriptVar = value end
+      end
+    end
   end
-  Specials.ALL[name] = fn
+  for name, fn in pairs(H) do Specials.ALL[name] = fn end
+  for name, fn in pairs(Specials.STUBS) do Specials.ALL[name] = fn end
 end
+
+function Specials.merge(handlers, source)
+  if type(handlers) ~= "table" then
+    error("gen2 specials module '" .. tostring(source) .. "' returned "
+      .. type(handlers) .. ", expected a table of name -> function", 0)
+  end
+  for name, fn in pairs(handlers) do
+    if type(name) ~= "string" or type(fn) ~= "function" then
+      error("gen2 specials module '" .. tostring(source)
+        .. "' entry [" .. tostring(name) .. "] is not name -> function", 0)
+    end
+    local owner = Specials.HANDLER_SOURCE[name]
+    if owner then
+      error("gen2 special '" .. name .. "' is defined twice: "
+        .. owner .. " and " .. tostring(source), 0)
+    end
+    H[name] = fn
+    Specials.HANDLER_SOURCE[name] = source
+  end
+  rebuild()
+  return handlers
+end
+
+package.loaded["src.script.gen2.Specials"] = Specials
+
+for _, name in ipairs(Specials.MODULES) do
+  Specials.merge(require("src.script.gen2.specials." .. name),
+                 "specials/" .. name .. ".lua")
+end
+
+rebuild()
 
 return Specials

@@ -116,7 +116,7 @@ public:
 	 *             "required_import" -> picked_required_import.bin.
 	 * @return Whether the picker was shown.
 	 **/
-	virtual bool pickFile(const char *kind = nullptr) const;
+	virtual bool pickFile(const char *kind = nullptr, const char *destination = nullptr) const;
 	virtual const char *pickFileKinds() const;
 
 	/**
@@ -143,8 +143,12 @@ public:
 	 **/
 	virtual bool restartApp() const;
 
+	/** Starts Android's user-confirmed install flow for a verified APK. */
+	virtual bool installApk(const char *path) const;
+
 	virtual bool updateShortcuts(const std::vector<std::string> &versions) const;
 	virtual std::string getLaunchGame() const;
+	virtual std::string getLaunchURI() const;
 
 	/**
 	 * Blocking HTTPS GET into an absolute host path (Android only; false

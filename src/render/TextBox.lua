@@ -11,9 +11,28 @@ local UIVisibility = require("src.battle.UIVisibility")
 local Theme = require("src.ui.Theme")
 local Timing = require("src.core.Timing")
 
+local Chrome2
+do
+  local ok, v = pcall(require, "src.ui.gen2.Chrome")
+  Chrome2 = ok and v or nil
+end
+
 local TextBox = {}
 TextBox.__index = TextBox
 TextBox.isTextBox = true
+
+-- home/delay.asm:14
+local function sfxWaitFrames(src)
+  local Sound = require("src.core.Sound")
+  if not Sound.waitFrames then return 180 end
+  return Sound.waitFrames(src)
+end
+
+local function sfxWaitStep(game)
+  local speed = game and game.logicSpeed and game:logicSpeed() or 1
+  if type(speed) ~= "number" or speed ~= speed or speed < 1 then speed = 1 end
+  return 1 / speed
+end
 
 -- theme-free fallbacks; geometry resolves against Theme.textBox at
 -- construction time, so an unthemed boot stays byte-identical
@@ -21,6 +40,60 @@ local BOX_TX, BOX_TY, BOX_TW, BOX_TH = 0, 12, 20, 6
 local MAX_COLS = 18
 -- pokegold constants/ram_constants.asm: TEXT_DELAY_FAST/MED/SLOW = 1/3/5
 local NAME_DELAYS = { FAST = 1, MID = 3, SLOW = 5 }
+
+-- TextCommand_PAUSE (home/text.asm:492-504): a mid-string wait callers
+-- embed as TextBox.PAUSE, stripped here and re-anchored after pagination.
+TextBox.PAUSE = "\1"
+local PAUSE_FRAMES = 30
+
+local function glyphs(str)
+  return #Font.split((str:gsub("[\n\v\f]", "")))
+end
+
+local function stripPauses(text)
+  if not text:find(TextBox.PAUSE, 1, true) then return text, nil end
+  local out, marks, count, pos = {}, {}, 0, 1
+  while true do
+    local i = text:find(TextBox.PAUSE, pos, true)
+    if not i then
+      out[#out + 1] = text:sub(pos)
+      break
+    end
+    local chunk = text:sub(pos, i - 1)
+    out[#out + 1] = chunk
+    count = count + glyphs(chunk)
+    marks[#marks + 1] = count
+    pos = i + 1
+  end
+  return table.concat(out), marks
+end
+
+-- ../pokecrystal/home/text.asm:548 PromptText, :566 DoneText
+function TextBox.ending(text)
+  if type(text) ~= "string" then return nil end
+  if text:find("{PROMPT}%s*$") then return "prompt" end
+  if text:find("{DONE}%s*$") then return "done" end
+  return nil
+end
+
+-- glyph offsets into the whole text -> [page][line][char]
+local function mapPauses(pages, marks)
+  local at, acc, mi = {}, 0, 1
+  for pi, page in ipairs(pages) do
+    for li, line in ipairs(page) do
+      local n = #Font.split(line)
+      while mi <= #marks and marks[mi] <= acc + n do
+        local ci = marks[mi] - acc
+        at[pi] = at[pi] or {}
+        at[pi][li] = at[pi][li] or {}
+        at[pi][li][ci] = mi
+        mi = mi + 1
+      end
+      acc = acc + n
+    end
+  end
+  return at
+end
 
 -- opts.choice: when the last page has typed out, a YES/NO ChoiceBox pops
 -- up over the still-visible text (YesNoChoicePokeCenter and friends);
@@ -44,7 +117,8 @@ local NAME_DELAYS = { FAST = 1, MID = 3, SLOW = 5 }
 -- waits for nothing, shows no blinking arrow, and never pops itself --
 -- whoever pushed it owns the pop.  stay.onShown fires once, on the frame
 -- the last page finishes typing, which is where the caller pushes whatever
--- goes on top of it (#591).
+-- goes on top of it (#591).  stay.prompt waits out one arrowed A/B press
+-- first (TextCommand_PROMPT_BUTTON, home/text.asm:434-444) (#1511).
 function TextBox.new(game, text, onDone, opts)
   local self = setmetatable({}, TextBox)
   self.game = game
@@ -55,10 +129,22 @@ function TextBox.new(game, text, onDone, opts)
   self.choiceLabels = opts and opts.choiceLabels
   self.choiceBox = opts and opts.choiceBox
   self.money = opts and opts.money
+  -- scripts/MtMoonPokecenter.asm:30
+  self.moneyWithChoice = opts and opts.moneyWithChoice
   self.auto = opts and opts.auto
   self.stay = opts and opts.stay
   -- engine/events/hidden_events/cinnabar_gym_quiz.asm:119
   self.preSound = opts and opts.preSound
+  -- pokegold engine/overworld/scripting.asm:485 WaitSFX
+  self.sfxWait = opts and opts.sfxWait
+  -- ../pokecrystal/home/joypad.asm:302 WaitButton
+  self.waitButton = opts and opts.waitButton
+  local ending = TextBox.ending(text)
+  if ending == "prompt" then
+    self.waitButton = false
+  elseif ending == "done" and self.waitButton == nil then
+    self.waitButton = true
+  end
   -- opts.instant: put the LAST page up already typed, with no typewriter and
   -- no page waits.  A `yesorno` follows a `writetext` that has already been
   -- read, so re-typing the line under the YES/NO box would be wrong -- the
@@ -74,7 +160,13 @@ function TextBox.new(game, text, onDone, opts)
   self.line1Y = (self.boxTy + 2) * 8
   self.line2Y = (self.boxTy + 4) * 8
   text = TextBox.substitute(game, text)
+  local marks
+  text, marks = stripPauses(text)
   self.pages = TextBox.paginate(text, self.maxCols)
+  -- opts.pauseSounds[i] is the sfx the i-th marker fires once its wait is
+  -- over (text_asm SFX_SWAP, engine/pokemon/learn_move.asm:210-213)
+  self.pauseSounds = opts and opts.pauseSounds
+  self.pauseAt = marks and mapPauses(self.pages, marks) or nil
   self.pageIndex = 1
   self.lineIndex = 1
   self.charIndex = 0
@@ -162,6 +254,10 @@ TextBox.TOKENS = {
     if arg == "wBoxMonNicks" then return game.boxMonNicks end
     return nil
   end,
+  -- ../pokecrystal/home/text.asm:566 DoneText
+  DONE = function() return nil end,
+  -- ../pokecrystal/home/text.asm:548 PromptText
+  PROMPT = function() return nil end,
 }
 
 function TextBox.registerInto(registry, _, owner)
@@ -269,19 +365,48 @@ function TextBox:visibleText()
   return #out > 0 and out or nil
 end
 
+-- pokegold engine/overworld/scripting.asm:484-485 PlaySFX / WaitSFX
+function TextBox:sfxHeld()
+  if not self.sfxWait then return false end
+  if require("src.core.Sound").sfxBusy() then return true end
+  self.sfxWait = nil
+  return false
+end
+
+-- TextCommand_PROMPT_BUTTON's LoadBlinkingCursor (home/text.asm:749)
+function TextBox:arrowVisible()
+  if self.sfxWait then return false end
+  if self.waiting then return true end
+  -- ../pokecrystal/home/text.asm:566 DoneText
+  if self.waitButton then return false end
+  return not not (self.done and not self.choice
+    and (not self.auto
+         or (self.auto.promptFirst and not self.autoPrompted))
+    and (not self.stay
+         or (self.stay.prompt and not self.stayShown)))
+end
+
+-- scripts/MtMoonPokecenter.asm:30
+function TextBox:moneyVisible()
+  if not self.money then return false end
+  return not self.moneyWithChoice or not not self.choicePushed
+end
+
 function TextBox:update(dt)
   local input = self.game.input
-  self.blink = (self.blink + 1) % 60
+  self.blink = (self.blink + 1) % 480
   -- home/text.asm:506
   if self.preSound then
     if not self.preStarted then
       self.preStarted = true
       self.preSrc = self.preSound()
+      self.preSrcLeft = sfxWaitFrames(self.preSrc)
     end
-    if self.preSrc and self.preSrc.isPlaying and self.preSrc:isPlaying() then
-      return
-    end
-    self.preSound, self.preSrc = nil, nil
+    self.preSrcLeft = (self.preSrcLeft or 0) - sfxWaitStep(self.game)
+    local playing = self.preSrc and self.preSrc.isPlaying and self.preSrc:isPlaying()
+    if playing and self.preSrcLeft > 0 then return end
+    if playing then pcall(self.preSrc.stop, self.preSrc) end
+    self.preSound, self.preSrc, self.preSrcLeft = nil, nil, nil
   end
   -- A page or CONT advance blocks the whole box while the original's scroll
   -- and clear run (src/core/Timing.lua TEXT_SCROLL_PAIR / TEXT_PAGE_CLEAR).
@@ -290,21 +415,52 @@ function TextBox:update(dt)
     self.holdFrames = self.holdFrames - 1
     return
   end
+  -- home/text.asm:492
+  if self.pauseFrames then
+    if self.pauseFrames > 0 then
+      self.pauseFrames = self.pauseFrames - 1
+      return
+    end
+    self.pauseFrames = nil
+    local snd = self.pauseSounds and self.pauseSounds[self.pauseMark]
+    if type(snd) == "function" then
+      snd()
+    elseif snd then
+      require("src.core.Sound").play(self.game.data, snd)
+    end
+  end
   if self.done then
     -- opts.stay: the box is finished but stays up under whatever the caller
     -- pushed over it; StateStack updates the top state only, so this runs
     -- exactly once (#591)
     if self.stay then
       if not self.stayShown then
+        -- stay.prompt: arrowed A/B wait, then the box stays up
+        -- (TextCommand_PROMPT_BUTTON, home/text.asm:434-444)
+        if self.stay.prompt
+           and not (input:wasPressed("a") or input:wasPressed("b")) then
+          return
+        end
+        if self.stay.prompt then
+          require("src.core.Sound").play(self.game.data, "Press_AB")
+        end
         self.stayShown = true
         if self.stay.onShown then self.stay.onShown() end
       end
       return
     end
     if self.auto then
+      -- engine/items/item_effects.asm:1794 (#1880)
+      if self.auto.promptFirst and not self.autoPrompted then
+        if not (input:wasPressed("a") or input:wasPressed("b")) then return end
+        require("src.core.Sound").play(self.game.data, "Press_AB")
+        self.autoPrompted = true
+        return
+      end
       if not self.autoStarted then
         self.autoStarted = true
         self.autoSrc = self.auto.sound and self.auto.sound() or nil
+        self.autoSrcLeft = sfxWaitFrames(self.autoSrc)
         self.autoTimer = 0
       end
       -- auto.tick: one call per frame for as long as the box is held open,
@@ -314,8 +470,13 @@ function TextBox:update(dt)
       -- the overworld underneath is frozen (the Pewter JIGGLYPUFF spin,
       -- #249).
       if self.auto.tick then self.auto.tick() end
-      if self.autoSrc and self.autoSrc.isPlaying and self.autoSrc:isPlaying() then
-        return -- the cry is still sounding (WaitForSoundToFinish)
+      -- home/delay.asm:14
+      if self.autoSrc then
+        self.autoSrcLeft = (self.autoSrcLeft or 0) - sfxWaitStep(self.game)
+        if self.autoSrc.isPlaying and self.autoSrc:isPlaying() then
+          if self.autoSrcLeft > 0 then return end
+          pcall(self.autoSrc.stop, self.autoSrc)
+        end
       end
       -- auto.wait: the pet-NPC cries (PewterNidoranHouseNidoranText,
       -- ViridianNicknameHouseSpearowText) have nothing queued behind the
@@ -362,8 +523,12 @@ function TextBox:update(dt)
       end
       return
     end
+    if self:sfxHeld() then return end
     if input:wasPressed("a") or input:wasPressed("b") then
-      require("src.core.Sound").play(self.game.data, "Press_AB")
+      -- home/joypad.asm:292
+      if not self.waitButton then
+        require("src.core.Sound").playPress(self.game.data)
+      end
       self.game.stack:pop()
       if self.onDone then self.onDone() end
     end
@@ -377,6 +542,7 @@ function TextBox:update(dt)
       self.preWait = self.preWait - 1
       return
     end
+    if self:sfxHeld() then return end
     if input:wasPressed("a") or input:wasPressed("b") then
       require("src.core.Sound").play(self.game.data, "Press_AB")
       self.waiting = false
@@ -414,6 +580,15 @@ function TextBox:update(dt)
       self.charIndex = self.charIndex + 1
       local line = self.shown[#self.shown]
       line[#line + 1] = self.codes[self.charIndex]
+      local marks = self.pauseAt and self.pauseAt[self.pageIndex]
+      marks = marks and marks[self.lineIndex]
+      if marks and marks[self.charIndex] then
+        self.pauseMark = marks[self.charIndex]
+        -- TextCommand_PAUSE reads hJoyHeld, so a held A/B skips the wait
+        self.pauseFrames = (input:isDown("a") or input:isDown("b"))
+          and 0 or PAUSE_FRAMES
+        break
+      end
     else
       -- line finished
       local page = self.pages[self.pageIndex]
@@ -460,8 +635,21 @@ function TextBox:draw()
   -- (pokegold engine/pokegear/pokegear.asm TownMapPals sends every tile
   -- >= $60 to palette 0).  Gen 1's Game has no textboxPaper, so it stays nil.
   local paper = self.game and self.game.textboxPaper and self.game:textboxPaper()
-  Font.drawBox(self.boxTx, self.boxTy, self.boxTw, self.boxTh, paper)
-  love.graphics.setColor(0, 0, 0, 1)
+
+  local gold = self.game and self.game.save
+    and (self.game.save.generation == 2 or self.game.save.version == "gold")
+  local Chrome = gold and Chrome2 or nil
+  local drawGlyph, finishGlyph = Font.drawCode, nil
+  if Chrome then
+    local base = paper and { paper, paper, paper, { 0, 0, 0 } }
+      or Chrome.DEFAULT_BOX_PALETTE
+    Chrome.paletteBox(self.boxTx, self.boxTy, self.boxTw, self.boxTh, base)
+    local _, dg, fg = Chrome.paletteGlyphs(base)
+    drawGlyph, finishGlyph = dg, fg
+  else
+    Font.drawBox(self.boxTx, self.boxTy, self.boxTw, self.boxTh, paper)
+    love.graphics.setColor(0, 0, 0, 1)
+  end
   if self.scrollPx and self.scrollPx > 0 then
     self.scrollPx = self.scrollPx - 2
     if self.scrollPx <= 0 then self.scrollPx = nil end
@@ -481,27 +669,46 @@ function TextBox:draw()
     -- measured with; every fixed-width page still lands on the 8px grid
     local pen = self.textX
     for _, code in ipairs(line) do
-      Font.drawCode(code, pen, y)
+      drawGlyph(code, pen, y)
       pen = pen + Font.advanceOf(code)
     end
   end
-  if self.money then
+  if self:moneyVisible() then
     -- money box (engine/menus/text_box.asm:130): DisplayMoneyBox at
     -- hlcoord 11,0, the amount right-aligned on its middle row
-    Font.drawBox(11, 0, 9, 3)
-    love.graphics.setColor(0, 0, 0, 1)
+    if Chrome then
+      Chrome.paletteBox(11, 0, 9, 3, Chrome.DEFAULT_BOX_PALETTE)
+    else
+      Font.drawBox(11, 0, 9, 3)
+      -- data/text_boxes.asm:35
+      love.graphics.setColor(1, 1, 1, 1)
+      love.graphics.rectangle("fill", 13 * 8, 0, 5 * 8, 8)
+      love.graphics.setColor(0, 0, 0, 1)
+      local cap = 13 * 8
+      for _, code in ipairs(Font.encode("MONEY")) do
+        drawGlyph(code, cap, 0)
+        cap = cap + Font.advanceOf(code)
+      end
+    end
     local money = ("¥%d"):format(self.money() or 0)
-    Font.draw(money, 152 - Font.width(money), 8)
+    local pen = 152 - Font.width(money)
+    for _, code in ipairs(Font.encode(money)) do
+      drawGlyph(code, pen, 8)
+      pen = pen + Font.advanceOf(code)
+    end
   end
-  if (self.waiting or (self.done and not self.choice and not self.auto
-                       and not self.stay))
-     and self.blink < 30 then
+  -- pokegold home/joypad.asm:430
+  local arrowOn = self.blink % 60 < 30
+  if gold then arrowOn = self.blink % 32 < 16 end
+  if self:arrowVisible() and arrowOn then
     -- page-advance cursor: glyph $EE by default, the blinking down arrow
     -- the original prints via `ld a, "▼"` (home/text.asm)
-    Font.drawCode(Theme.moreArrow or 0xEE,
-                  (self.boxTx + self.boxTw - 2) * 8,
-                  (self.boxTy + self.boxTh - 1) * 8 - 4)
+    -- pokegold home/text.asm:549
+    drawGlyph(Theme.moreArrow or 0xEE,
+              (self.boxTx + self.boxTw - 2) * 8,
+              (self.boxTy + self.boxTh - 1) * 8 - (gold and 0 or 4))
   end
+  if finishGlyph then finishGlyph() end
   love.graphics.setColor(1, 1, 1, 1)
 end
 

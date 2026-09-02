@@ -51,15 +51,20 @@ local function countOwned(save)
   return n
 end
 
-local function oaksAide(threshold, itemId, repeatText)
+local function oaksAide(threshold, itemId, repeatText, flagName)
   return function(game, ow, npc, done)
     local t = text(game)
     local flags = game.save.flags
     local itemName = game.data.items[itemId].name
-    local flag = "EVENT_GOT_" .. itemId
-    if flags[flag] then
+    local flag = flagName or ("EVENT_GOT_" .. itemId)
+    local portFlag = "EVENT_GOT_" .. itemId
+    -- ../pokered/scripts/Route2Gate.asm:28-30
+    local function explain()
       push(game, t[repeatText] or
         fill("I already gave\nyou the {RAM:}!", { ram = itemName }), done)
+    end
+    if flags[flag] or flags[portFlag] then
+      explain()
       return
     end
     ask(game, fill(t._OaksAideHiText or
@@ -73,18 +78,23 @@ local function oaksAide(threshold, itemId, repeatText)
         end
         local owned = countOwned(game.save)
         if owned >= threshold then
-          if not require("src.inventory.Bag").add(game.save, itemId, 1) then
-            push(game, fill(t._OaksAideNoRoomText or
-              "No room for the\n{RAM:}!", { ram = itemName }), done)
-            return
-          end
-          flags[flag] = true
+          -- ../pokered/engine/events/oaks_aide.asm:18-29
           push(game, fill(t._OaksAideHereYouGoText or "Here you go!",
               { num = owned, ram = itemName }),
             function()
+              if not require("src.inventory.Bag").add(
+                  game.save, itemId, 1, game.data) then
+                push(game, fill(t._OaksAideNoRoomText or
+                  "No room for the\n{RAM:}!", { ram = itemName }), done)
+                return
+              end
+              flags[flag] = true
+              -- ../pokered/engine/events/oaks_aide.asm:64-67
               push(game, fill(t._OaksAideGotItemText or
-                "{PLAYER} got the\n{RAM:}!",
-                { ram = itemName, player = game.save.player.name }), done)
+                  "{PLAYER} got the\n{RAM:}!",
+                  { ram = itemName, player = game.save.player.name }),
+                explain,
+                require("src.render.TextBox").soundOpts(game, "Get_Item1"))
             end)
         else
           -- .notEnoughOwnedMons prints owned then requirement, two counts
@@ -100,7 +110,7 @@ end
 
 M.ROUTE_2_GATE = {
   talk = { TEXT_ROUTE2GATE_OAKS_AIDE = oaksAide(10, "HM_FLASH",
-    "_Route2GateOaksAideFlashExplanationText") },
+    "_Route2GateOaksAideFlashExplanationText", "EVENT_GOT_HM05") },
 }
 M.ROUTE_11_GATE_2F = {
   talk = { TEXT_ROUTE11GATE2F_OAKS_AIDE = oaksAide(30, "ITEMFINDER",
@@ -123,7 +133,7 @@ M.MT_MOON_POKECENTER = {
       { "check_flag", "EVENT_BOUGHT_MAGIKARP" },
       { "jump_if_true", "no_refunds" },
       -- MONEY_BOX goes up between the offer and YesNoChoice -- MtMoonPokecenter.asm:31
-      { "text_opts", { money = true } },
+      { "text_opts", { money = "choice" } },
       { "ask", "_MtMoonPokecenterMagikarpSalesmanIGotADealText" },
       { "jump_if_false", "declined" },
       { "check_money", 500 },
@@ -185,14 +195,20 @@ local function dojoBall(species, ownBall, otherBall, askKey)
     game.stack:push(DexEntryMenu.new(game, species, function()
       ask(game, t[askKey] or ("You want\n" .. species .. "?"), function(yes)
         if not yes then done() return end
-        flags["EVENT_GOT_" .. species] = true
-        flags.EVENT_DEFEATED_FIGHTING_DOJO = true
-        Commands.give_pokemon(ctx, species, 30)
-        -- Hide ONLY the chosen ball; the other stays (FightingDojo.asm hides
-        -- just the picked object's index) and routes to the greedy line above
-        -- when talked to (#197).
-        Commands.hide_object(ctx, "FIGHTING_DOJO", ownBall)
-        push(game, ("%s got\n%s!"):format(game.save.player.name, species), done)
+        -- ../pokered/scripts/FightingDojo.asm:238-252
+        ow.runner:run({
+          { "give_pokemon", species, 30, false, true },
+          { "jump_if_false", "boxfull" },
+          -- ../pokered/scripts/FightingDojo.asm:248-251
+          { "hide_object", "FIGHTING_DOJO", ownBall },
+          { "set_flag", "EVENT_GOT_" .. species },
+          { "set_flag", "EVENT_DEFEATED_FIGHTING_DOJO" },
+          { "jump", "out" },
+          { "label", "boxfull" },
+          -- ../pokered/engine/events/give_pokemon.asm:40-42
+          { "show_text", "_BoxIsFullText" },
+          { "label", "out" },
+        }, { onDone = done })
       end)
     end))
   end
@@ -216,7 +232,10 @@ local function dojoMasterGate(game, ow, x, y)
   if not master or ow:trainerDefeated(master) then return false end
   ow.player.facing = "right"
   master:facePlayer(ow.player)
-  ow:engageTrainer(master)
+  -- scripts/FightingDojo.asm:117-119 SaveEndBattleTextPointers (#1606)
+  ow:engageTrainer(master, nil,
+    ((game.data or {}).text or {})._FightingDojoKarateMasterDefeatedText,
+    nil, nil, false)
   return true
 end
 
@@ -329,19 +348,26 @@ M.MR_PSYCHICS_HOUSE = {
   talk = {
     TEXT_MRPSYCHICSHOUSE_MR_PSYCHIC = function(game, ow, npc, done)
       local t = text(game)
+      local tmName = (game.data.items.TM_PSYCHIC_M or {}).name or "TM29"
       if game.save.flags.EVENT_GOT_TM29 then
-        push(game, t._MrPsychicsHouseMrPsychicNoMoreText
-          or "...Hmm...", done)
+        push(game, t._MrPsychicsHouseMrPsychicTM29ExplanationText
+          or "TM29 is PSYCHIC!", done)
         return
       end
-      push(game, t._MrPsychicsHouseMrPsychicText
-        or "...Wait!\nDon't say a word!\fYou came to get\nTM29!", function()
-        if not require("src.inventory.Bag").add(game.save, "TM_PSYCHIC_M", 1) then
-          push(game, "You don't have\nroom for TM29!", done)
+      push(game, t._MrPsychicsHouseMrPsychicYouWantedThisText
+        or "...Wait! Don't\nsay a word!\fYou wanted this!", function()
+        if not require("src.inventory.Bag").add(
+            game.save, "TM_PSYCHIC_M", 1, game.data) then
+          push(game, t._MrPsychicsHouseMrPsychicTM29NoRoomText
+            or "Where do you plan\nto put this?", done)
           return
         end
         game.save.flags.EVENT_GOT_TM29 = true
-        push(game, ("%s got\nTM29!"):format(game.save.player.name), done)
+        -- ../pokered/scripts/MrPsychicsHouse.asm:35-38
+        push(game, fill(t._MrPsychicsHouseMrPsychicReceivedTM29Text
+            or "{PLAYER} received\n{RAM:}!",
+            { player = game.save.player.name, ram = tmName }),
+          done, require("src.render.TextBox").soundOpts(game, "Get_Item1"))
       end)
     end,
   },
@@ -356,18 +382,22 @@ M.ROUTE_16_FLY_HOUSE = {
     TEXT_ROUTE16FLYHOUSE_BRUNETTE_GIRL = function(game, ow, npc, done)
       local t = text(game)
       if game.save.flags.EVENT_GOT_HM02 then
-        push(game, t._Route16FlyHouseBrunetteGirlHm02ExplanationText
-          or "HM02 is FLY!\fIt will whisk you\nback to any town!", done)
+        push(game, t._Route16FlyHouseBrunetteGirlHM02ExplanationText
+          or "HM02 is FLY.\nIt will take you\vback to any town.\fPut it to good\nuse!", done)
         return
       end
       push(game, t._Route16FlyHouseBrunetteGirlText
-        or "Shh! It's a\nsecret!\fMy POKéMON's\nHM02, take it!", function()
+        or "Oh, you found my\nsecret retreat!", function()
         if not require("src.inventory.Bag").add(game.save, "HM_FLY", 1) then
-          push(game, "You don't have\nroom for HM02!", done)
+          push(game, t._Route16FlyHouseBrunetteGirlHM02NoRoomText
+            or "You don't have any\nroom for this.", done)
           return
         end
         game.save.flags.EVENT_GOT_HM02 = true
-        push(game, ("%s got\nHM02!"):format(game.save.player.name), done)
+        -- scripts/Route16FlyHouse.asm:32-35
+        push(game, fill(t._Route16FlyHouseBrunetteGirlReceivedHM02Text
+          or "{PLAYER} received\nHM02!", { player = game.save.player.name }),
+          done, require("src.render.TextBox").soundOpts(game, "Get_Key_Item"))
       end)
     end,
   },
@@ -384,30 +414,84 @@ local DRINK_PRICES = {
   { id = "LEMONADE", price = 350 },
 }
 
+-- engine/events/vending_machine.asm:56-65
+local function deliveryRumble(game, onDone)
+  local left, wait = 60, 2
+  return {
+    draw = function() end,
+    update = function(self)
+      wait = wait - 1
+      if wait > 0 then return end
+      wait = 2
+      require("src.core.Sound").play(game.data, "Push_Boulder")
+      left = left - 1
+      if left <= 0 then
+        game.stack:pop()
+        onDone()
+      end
+    end,
+  }
+end
+
+-- engine/events/vending_machine.asm
 local function vendingMachine(game, ow, npc, done)
-  local ListMenu = require("src.ui.ListMenu")
+  local t = text(game)
+  local Menu = require("src.ui.Menu")
+  local Font = require("src.render.Font")
+  local money = function() return game.save.money end
+  local function closeSession(msg, menuPopped)
+    if not menuPopped then game.stack:pop() end
+    game.stack:pop()
+    push(game, msg, done, { money = money })
+  end
+  local function notThirsty()
+    closeSession(t._VendingMachineText7 or "Not thirsty!", true)
+  end
+  local function buy(d)
+    if game.save.money < d.price then
+      closeSession(t._VendingMachineText4 or "Oops, not enough\nmoney!")
+      return
+    end
+    if not require("src.inventory.Bag").add(game.save, d.id, 1, game.data) then
+      closeSession(t._VendingMachineText6 or "There's no more\nroom for stuff!")
+      return
+    end
+    game.stack:push(deliveryRumble(game, function()
+      game.save.money = game.save.money - d.price
+      closeSession(fill(t._VendingMachineText5
+                        or "{RAM:wStringBuffer}\npopped out!",
+                        { ram = game.data.items[d.id].name }))
+    end))
+  end
   local items = {}
   for _, d in ipairs(DRINK_PRICES) do
-    table.insert(items, {
-      value = d, label = ("%s ¥%d"):format(game.data.items[d.id].name, d.price),
-    })
+    items[#items + 1] = {
+      label = game.data.items[d.id].name,
+      keepOpen = true,
+      onSelect = function() buy(d) end,
+    }
   end
-  game.stack:push(ListMenu.new(game, "VENDING MACHINE", items, {
-    onChoose = function(item, list)
-      local d = item.value
-      if game.save.money < d.price then
-        push(game, "Not enough\nmoney.")
-        return
-      end
-      if not require("src.inventory.Bag").add(game.save, d.id, 1) then
-        push(game, "You have no room\nfor it!")
-        return
-      end
-      game.save.money = game.save.money - d.price
-      push(game, ("%s\npopped out!"):format(game.data.items[d.id].name))
-    end,
-    onCancel = done,
-  }))
+  items[#items + 1] = { label = "CANCEL", onSelect = notThirsty }
+  push(game, t._VendingMachineText1 or "A vending machine!\nHere's the menu!",
+    nil, {
+      money = money,
+      stay = { prompt = true, onShown = function()
+        local menu = Menu.new(game, items, {
+          tx = 0, ty = 3, tw = 14, th = 10, itemY = 2,
+          noWrap = true,
+          onCancel = notThirsty,
+        })
+        menu.draw = function(self)
+          Menu.draw(self)
+          love.graphics.setColor(0, 0, 0, 1)
+          for i, d in ipairs(DRINK_PRICES) do
+            Font.draw(("¥%d"):format(d.price), 9 * 8, (6 + (i - 1) * 2) * 8)
+          end
+          love.graphics.setColor(1, 1, 1, 1)
+        end
+        game.stack:push(menu)
+      end },
+    })
 end
 
 -- drink -> TM (CeladonMartRoof.asm .gaveFreshWater/.gaveSodaPop/
@@ -452,51 +536,69 @@ M.CELADON_MART_ROOF = {
         or "I'm thirsty!\nI want something\nto drink!\fGive her a drink?",
         function(yes)
           if not yes then done() return end
-          push(game, t._CeladonMartRoofLittleGirlGiveHerWhichDrinkText
-            or "Give her which\ndrink?", function()
-            local items = {}
-            for _, g in ipairs(have) do
-              table.insert(items, {
-                label = game.data.items[g.drink].name, value = g,
-              })
+          local Menu = require("src.ui.Menu")
+          local TextBox = require("src.render.TextBox")
+          local whichBox, menu
+          -- scripts/CeladonMartRoof.asm:242
+          local function closeAll()
+            local st = game.stack
+            while st:top() == menu or st:top() == whichBox do st:pop() end
+            done()
+          end
+          local function give(g)
+            if game.save.flags[g.flag] then
+              push(game, t._CeladonMartRoofLittleGirlImNotThirstyText
+                or "No thank you!\nI'm not thirsty\nafter all!", closeAll)
+              return
             end
-            local ListMenu = require("src.ui.ListMenu")
-            game.stack:push(ListMenu.new(game, "DRINKS", items, {
-              onChoose = function(item, list)
-                list:close()
-                local g = item.value
-                if game.save.flags[g.flag] then
-                  push(game, t._CeladonMartRoofLittleGirlImNotThirstyText
-                    or "No thank you!\nI'm not thirsty\nafter all!", done)
-                  return
+            push(game, t[g.yay]
+              or "Yay!\fThank you!\fYou can have this\nfrom me!", function()
+              local Bag = require("src.inventory.Bag")
+              Bag.remove(game.save, g.drink, 1)
+              if not Bag.add(game.save, g.tm, 1) then
+                push(game, t._CeladonMartRoofLittleGirlNoRoomText
+                  or "You don't have\nspace for this!", closeAll)
+                return
+              end
+              game.save.flags[g.flag] = true
+              local subs = { player = game.save.player.name,
+                             ram = game.data.items[g.tm].name }
+              local explain = fill(t[g.explain] or "", subs)
+                :gsub("^\f", "")
+              push(game, fill(t[g.received]
+                or "{PLAYER} received\n{RAM:}!", subs), function()
+                if #explain > 0 then
+                  push(game, explain, closeAll)
+                else
+                  closeAll()
                 end
-                push(game, t[g.yay]
-                  or "Yay!\fThank you!\fYou can have this\nfrom me!", function()
-                  local Bag = require("src.inventory.Bag")
-                  Bag.remove(game.save, g.drink, 1)
-                  if not Bag.add(game.save, g.tm, 1) then
-                    push(game, t._CeladonMartRoofLittleGirlNoRoomText
-                      or "You don't have\nspace for this!", done)
-                    return
-                  end
-                  game.save.flags[g.flag] = true
-                  local subs = { player = game.save.player.name,
-                                 ram = game.data.items[g.tm].name }
-                  local explain = fill(t[g.explain] or "", subs)
-                    :gsub("^\f", "")
-                  push(game, fill(t[g.received]
-                    or "{PLAYER} received\n{RAM:}!", subs), function()
-                    if #explain > 0 then
-                      push(game, explain, done)
-                    else
-                      done()
-                    end
-                  end, require("src.render.TextBox").soundOpts(game, "Get_Item1"))
-                end)
-              end,
-              onCancel = done,
-            }))
-          end)
+              end, require("src.render.TextBox").soundOpts(game, "Get_Item1"))
+            end)
+          end
+          local items = {}
+          for _, g in ipairs(have) do
+            table.insert(items, {
+              label = game.data.items[g.drink].name,
+              keepOpen = true,
+              onSelect = function() give(g) end,
+            })
+          end
+          -- scripts/CeladonMartRoof.asm:45
+          whichBox = TextBox.new(game,
+            t._CeladonMartRoofLittleGirlGiveHerWhichDrinkText
+            or "Give her which\ndrink?", nil, {
+            instant = true,
+            stay = { onShown = function()
+              -- scripts/CeladonMartRoof.asm:56
+              menu = Menu.new(game, items, {
+                tx = 0, ty = 0, tw = 14, th = #have * 2 + 2, itemY = 2,
+                noWrap = true,
+                onCancel = closeAll,
+              })
+              game.stack:push(menu)
+            end },
+          })
+          game.stack:push(whichBox)
         end)
     end,
   },
@@ -637,9 +739,11 @@ M.NAME_RATERS_HOUSE = {
                   push(game, t._NameRatersHouseNameRaterWhatShouldWeNameItText
                     or "Fine! What should\nwe name it?", function()
                     local NamingScreen = require("src.ui.NamingScreen")
+                    -- engine/menus/naming_screen.asm:56
                     game.stack:push(NamingScreen.new(game, {
-                      title = (def.name or mon.species) .. "'s name?",
+                      title = require("src.core.Strings")("NICKNAME?"),
                       maxLen = 10,
+                      mon = mon,
                       default = mon.nickname,
                       onDone = function(name)
                         if name and #name > 0 and name ~= def.name then
@@ -731,7 +835,7 @@ local function e4ExitSeal(flag, closedBlock, openBlock, dontRunText, autoFlag)
       local TextBox = require("src.render.TextBox")
       game.stack:push(TextBox.new(game,
         game.data.text[dontRunText] or "Don't run away!", function()
-        ow:scriptMove(ow.player, "up", 1)
+        ow:scriptMove(ow.player, "up", 1, nil, { collide = true })
       end))
       return true
     end,

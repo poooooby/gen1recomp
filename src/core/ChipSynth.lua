@@ -14,7 +14,15 @@ local bit = require("bit")
 
 local ChipSynth = {}
 
-local SAMPLE_RATE = 44100
+-- Handheld tunable: the sbc/portmaster launcher exports POKEPORT_AUDIO_RATE
+-- (22050) because synthesis cost scales linearly with the rate and the GB's
+-- DAC content sits well below 11 kHz.  Module-level so ChipAudio and the
+-- chip worker thread pick it up on load; unset/invalid falls back to 44100.
+local SAMPLE_RATE = (function()
+  local rate = tonumber(os.getenv("POKEPORT_AUDIO_RATE"))
+  if rate and rate >= 8000 and rate <= 48000 then return math.floor(rate) end
+  return 44100
+end)()
 local TICKS_PER_SECOND = 15360
 local FRAME_TICKS = 256
 local GB_CLOCK = 4194304
@@ -39,6 +47,12 @@ end
 
 function ChipSynth.getStereo()
   return stereoEnabled
+end
+
+local monoFastPath = true
+
+function ChipSynth._setMonoFastPathForTest(enabled)
+  monoFastPath = not not enabled
 end
 
 -- Runtime mix per hardware channel (1 pulse, 2 pulse, 3 wave, 4 noise).
@@ -138,7 +152,25 @@ local LPF_ALPHA = 0.8
 local MIX_SCALE = 0.5
 
 local function snapTicks(ticks)
-  return math.floor((ticks * 1470 + 256) / 512)
+  -- ticks -> samples at the configured rate.  The original baked 44100/15360
+  -- in as the integer rational 1470/512; this form is identical at 44100
+  -- ((ticks*44100 + 7680)/15360 == (ticks*1470 + 256)/512) but follows
+  -- POKEPORT_AUDIO_RATE when the handheld build lowers the synth rate.
+  return math.floor((ticks * SAMPLE_RATE + TICKS_PER_SECOND / 2) / TICKS_PER_SECOND)
+end
+
+function ChipSynth.setSampleRate(rate)
+  rate = tonumber(rate)
+  if rate then
+    rate = math.floor(rate)
+    if rate < 8000 then rate = 8000 elseif rate > 48000 then rate = 48000 end
+    if rate ~= SAMPLE_RATE then
+      SAMPLE_RATE = rate
+      HPF_CHARGE = 0.999958 ^ (GB_CLOCK / SAMPLE_RATE)
+      ChipSynth.SAMPLE_RATE = SAMPLE_RATE
+    end
+  end
+  return SAMPLE_RATE
 end
 
 local cachedProgramFile
@@ -385,7 +417,9 @@ function Channel:durationTicksGen2(length)
   local low = bit.band((length + 1) * (self.noteLength or 1), 0xFF)
   local product = bit.band(tempo * low + (self.durationModifier or 0), 0xFFFF)
   self.durationModifier = bit.band(product, 0xFF)
+  -- ../pokecrystal/audio/engine.asm:105
   local frames = math.floor(product / 256)
+  if frames < 1 then frames = 1 end
   return frames * FRAME_TICKS
 end
 
@@ -775,6 +809,7 @@ function Channel:nextEventGen2()
       local default = bit.bor(bit.lshift(mask, 4), mask)
       self.tracks = bit.band(packed, default)
       self.forcePanning = true
+      self.engine:refreshMonoMix()
     elseif command == 0xE5 then -- volume (global master; ignored for mix)
       self:byte()
     elseif command == 0xE6 then -- pitch_offset (big-endian)
@@ -1147,6 +1182,7 @@ function Engine:drumInstrumentGen2(kit, pitch)
       ticks = ticks + duration
     end
   end
+  extendDrumEnvelope(segments)
   self.noiseInstruments[key] = segments
   return segments
 end
@@ -1291,7 +1327,24 @@ function Engine.new(data, header, options)
       plainFrames = options.plainFrames,
     })
   end
+  engine:refreshMonoMix()
   return engine
+end
+
+function Engine:refreshMonoMix()
+  if self.generation ~= 2 or stereoEnabled then
+    self.monoMix = false
+    return
+  end
+  for _, channel in ipairs(self.channels) do
+    local mask = bit.lshift(1, channel.hardware - 1)
+    if channel.tracks ~= nil
+       and channel.tracks ~= bit.bor(bit.lshift(mask, 4), mask) then
+      self.monoMix = false
+      return
+    end
+  end
+  self.monoMix = true
 end
 
 function Engine:finished()
@@ -1318,6 +1371,14 @@ function Engine:sample()
 end
 
 function Engine:sampleStereo()
+  if monoFastPath and self.monoMix and not stereoEnabled then
+    local value = 0
+    local channels = self.channels
+    for index = 1, #channels do value = value + channels[index]:sample() end
+    local out = analogOut(self, value, "hpfCapLeft", "lpfLeft")
+    self.hpfCapRight, self.lpfRight = self.hpfCapLeft, self.lpfLeft
+    return out, out
+  end
   local left, right = 0, 0
   for _, channel in ipairs(self.channels) do
     local value = channel:sample()
@@ -1343,6 +1404,7 @@ function Engine:applyStereo()
   for _, channel in ipairs(self.channels) do
     channel:applyStereoMix()
   end
+  self:refreshMonoMix()
 end
 
 function Engine:sampleChannel(number)
@@ -1378,7 +1440,8 @@ local function renderEffectData(data, header, options)
   options.sfx = true
   options.allowLoops = false
   local engine = Engine.new(data, header, options)
-  local maximum = SAMPLE_RATE * 5
+  -- audio/sfx/pokeflute.asm:20
+  local maximum = SAMPLE_RATE * (options.maxSeconds or 12)
   local values = {}
   local count = 0
   while count < maximum and not engine:finished() do

@@ -22,21 +22,113 @@ local PlatformHooks = require("src.core.PlatformHooks")
 local HostDisplay = require("src.core.HostDisplay")
 local GameViewport = require("src.render.GameViewport")
 
+local function applySavedOrientation()
+  local ok, savedOptions = pcall(function()
+    return require("src.core.SaveData").loadOptions()
+  end)
+  if not ok or type(savedOptions) ~= "table" then savedOptions = {} end
+  pcall(function()
+    require("src.core.Orientation").applyOptions(savedOptions)
+  end)
+end
+
+-- Global emergency quit: holding Start + Select for 5 seconds forcefully terminates LOVE.
+local emergencyQuitTimer = 0
+-- getJoysticks() allocates a fresh table every call; this runs once (twice)
+-- per frame, so cache the list and refresh it once a second instead.  The 5s
+-- hold requirement makes a 1s hotplug delay irrelevant.
+local cachedJoysticks = nil
+local joystickCacheAge = 1
+
+local function checkEmergencyQuit(dt)
+  local held = false
+  joystickCacheAge = joystickCacheAge + (dt or 0.016)
+  if love.joystick and love.joystick.getJoysticks then
+    if not cachedJoysticks or joystickCacheAge >= 1 then
+      cachedJoysticks = love.joystick.getJoysticks()
+      joystickCacheAge = 0
+    end
+    for _, j in ipairs(cachedJoysticks) do
+      if j:isGamepad() then
+        local start = j:isGamepadDown("start")
+        local selectBtn = j:isGamepadDown("back") or j:isGamepadDown("guide")
+        if start and selectBtn then
+          held = true
+          break
+        end
+      else
+        local bCount = j:getButtonCount()
+        local s1 = (bCount >= 7 and j:isDown(7)) or (bCount >= 9 and j:isDown(9))
+        local s2 = (bCount >= 8 and j:isDown(8)) or (bCount >= 10 and j:isDown(10))
+        if s1 and s2 then
+          held = true
+          break
+        end
+      end
+    end
+  end
+
+  if love.keyboard and love.keyboard.isDown then
+    if (love.keyboard.isDown("escape") and love.keyboard.isDown("return"))
+        or (love.keyboard.isDown("lalt") and love.keyboard.isDown("f4")) then
+      held = true
+    end
+  end
+
+  if held then
+    emergencyQuitTimer = emergencyQuitTimer + (dt or 0.016)
+    if emergencyQuitTimer >= 5.0 then
+      print("[FORCE QUIT] Start + Select held for 5 seconds. Exiting forcefully.")
+      pcall(function()
+        if love.audio and love.audio.stop then love.audio.stop() end
+        if love.window and love.window.close then love.window.close() end
+      end)
+      local exitFn = os["exit"]
+      exitFn(0)
+    end
+  else
+    emergencyQuitTimer = 0
+  end
+end
+
 -- Lua errors: persist a redacted trace in the save dir and surface a hint.
 do
-  local defaultErrorHandler = love.errorhandler
+  local defaultErrorHandler = love.errorhandler or love.errhand
   function love.errorhandler(msg)
-    local hint = SwitchDiagnostics.logLuaError(msg)
-    if hint and type(msg) == "string" then
+    local ok, hint = pcall(SwitchDiagnostics.logLuaError, msg)
+    if ok and hint and type(msg) == "string" then
       msg = msg .. "\n\n" .. hint
     end
+
+    if love.window and love.window.isOpen and love.window.isOpen() and love.graphics and love.graphics.isActive() then
+      local fullMsg = tostring(msg) .. "\n\n" .. tostring(debug.traceback()) .. "\n\n[Hold START + SELECT for 5s to Force Quit]"
+      return function()
+        love.event.pump()
+        for e, a in love.event.poll() do
+          if e == "quit" or (e == "keypressed" and a == "escape") then
+            return 1
+          elseif e == "gamepadpressed" and (a == "start" or a == "back") then
+            return 1
+          end
+        end
+        checkEmergencyQuit(0.016)
+        love.graphics.origin()
+        love.graphics.clear(0.10, 0.10, 0.12)
+        love.graphics.setColor(1, 0.4, 0.4, 1)
+        love.graphics.printf(fullMsg, 20, 20, love.graphics.getWidth() - 40)
+        love.graphics.present()
+        love.timer.sleep(0.016)
+      end
+    end
+
     if defaultErrorHandler then
       return defaultErrorHandler(msg)
     end
   end
+  love.errhand = love.errorhandler
 end
 
-local Game, EditorApp, Importer, TouchEditor, Studio
+local Game, EditorApp, Importer, TouchEditor, Studio, Prelaunch
 
 -- #887: quit-to-launcher state, shared by love.load and love.quit (both need
 -- it, so it is declared here rather than next to love.quit).
@@ -52,6 +144,18 @@ local Game, EditorApp, Importer, TouchEditor, Studio
 --     launcher, whatever put the game on screen this time.
 local launchedIntoGame = false
 local RELAUNCH_MARKER = "relaunch_to_launcher.txt"
+local launchOptionsSuppressed = false
+
+local onlineClient, onlineClientResolved
+local function onlineClientModule()
+  if onlineClientResolved then return onlineClient end
+  onlineClientResolved = true
+  local ok, mod = pcall(require, "src.online.Client")
+  if ok and type(mod) == "table" and type(mod.update) == "function" then
+    onlineClient = mod
+  end
+  return onlineClient
+end
 
 local autopilot -- optional scripted-input dev tool (tests/autopilot.lua)
 local driverCo  -- optional frame-driver (POKEPORT_DRIVER=file.lua): a
@@ -81,6 +185,11 @@ end
 -- cache the editor mounted (so closing can put the read path back).
 local editorHost, editorVersion, editorWindow
 local closeEditor  -- forward declaration: openEditor hands it to the editor
+
+-- Drop CacheFs / Data / mod Runtime / Assets / LegacyCompat for one mounted
+-- version session (save editor or game).  closeEditor and returnToLauncher
+-- both go through SessionLifecycle so neither path forgets a singleton.
+local SessionLifecycle = require("src.core.SessionLifecycle")
 
 -- The editor's modules use flat names (require("Kit"), require("Party")), so
 -- their directories have to be on the require path.  It must be
@@ -157,9 +266,7 @@ local function openEditor(version, slotId)
   local okReq, appOrErr = pcall(require, "App")
   if not okReq then
     editorMode = false
-    if version then
-      require("src.import.CacheFs").unmountVersion(version)
-    end
+    SessionLifecycle.endEditorSession({ version = version, app = nil })
     restoreWindow()
     Importer = editorHost
     editorHost = nil
@@ -179,10 +286,7 @@ local function openEditor(version, slotId)
     editorMode = false
     if EditorApp.unload then pcall(EditorApp.unload) end
     EditorApp = nil
-    if version then
-      require("src.import.CacheFs").unmountVersion(version)
-      require("src.core.Data"):unloadGenerated()
-    end
+    SessionLifecycle.endEditorSession({ version = version, app = nil })
     restoreWindow()
     Importer = editorHost
     editorHost = nil
@@ -197,21 +301,14 @@ end
 -- Back to the launcher.  Everything the editor mounted or cached has to come
 -- back out: the version overlay (CacheFs) and the generated modules require
 -- cached behind it (Data), or pressing Play on the OTHER game would boot it
--- with this one's data.
+-- with this one's data.  Also reset Runtime / Assets / LegacyCompat so the
+-- next Edit or Play does not inherit the editor's dead mod loader.
 function closeEditor()
   local version = editorVersion
+  local app = EditorApp
   editorMode = false
-  if EditorApp and EditorApp.unload then EditorApp.unload() end
   EditorApp = nil
-  if version then
-    require("src.import.CacheFs").unmountVersion(version)
-    require("src.core.Data"):unloadGenerated()
-  end
-  for k in pairs(package.loaded) do
-    if type(k) == "string" and (k:find("save%-editor") or k == "App" or k == "Kit" or k == "State" or k == "Catalog" or k == "SaveIO" or k == "Ops" or k == "MonOps" or k == "ItemOps" or k == "PadInput" or k == "Gen" or k == "Theme") then
-      package.loaded[k] = nil
-    end
-  end
+  SessionLifecycle.endEditorSession({ version = version, app = app })
   editorVersion = nil
   restoreWindow()
   Importer = editorHost
@@ -291,66 +388,52 @@ function closeSkinStudio()
   end
 end
 
-local function makeLauncher()
+local function makeLauncher(launcherOpts)
   local RomImporter = require("src.import.RomImporter")
   local forceImport = os.getenv("POKEPORT_FORCE_IMPORT") == "1"
-  return RomImporter.new(function(version)
+  return RomImporter.new(function(version, cartId, opts)
     Importer = nil
-    bootGame(version)
+    bootGame(version, cartId, opts)
   end, {
     launcher = true,
     forceImport = forceImport,
+    initialTab = launcherOpts and launcherOpts.initialTab or nil,
     onEditSave = openEditor,
     onEditTouchControls = openTouchControlsEditor,
+    -- Skin Studio owns a touch-first layout as well as the desktop workspace.
+    -- Keep the compatibility predicate so external hosts using it still work.
     onOpenSkinStudio = require("src.ui.SkinStudio").available_desktop()
       and openSkinStudio or nil,
   })
 end
 
-local function returnToLauncher()
+local function returnToLauncher(opts)
   if not Game then return end
 
-  pcall(function() require("src.core.Music").stop() end)
-  pcall(function() require("src.core.Sound").stop() end)
-  if package.loaded["src.core.ChipAudio"] then
-    pcall(package.loaded["src.core.ChipAudio"].shutdown)
-  end
-  if package.loaded["src.core.DiscordPresence"] then
-    pcall(package.loaded["src.core.DiscordPresence"].shutdown)
-  end
-  if package.loaded["src.core.gen2.Clock"] then
-    pcall(package.loaded["src.core.gen2.Clock"].shutdown)
-  end
-  if package.loaded["src.net.Gen1Tls"] then
-    pcall(package.loaded["src.net.Gen1Tls"].shutdown)
-  end
-  if love.audio and love.audio.stop then
-    pcall(love.audio.stop)
+  if require("src.core.RequireGuard").repair() then
+    print("boot: restored love.filesystem searcher (see #2001)")
   end
 
   local GameVersion = require("src.core.GameVersion")
   local currentVersion = GameVersion.get()
-  if currentVersion then
-    require("src.import.CacheFs").unmountVersion(currentVersion)
-  end
-  require("src.core.Data"):unloadGenerated()
-
-  local Runtime = require("src.mods.Runtime")
-  if Runtime.reset then
-    Runtime.reset()
-  end
-
+  SessionLifecycle.endGameSession(Game)
   Game = nil
+  pcall(function() require("src.online.Trade").hostIsLive = nil end)
+  local syncEngine = package.loaded["src.sync.SyncEngine"]
+  if type(syncEngine) == "table" and type(syncEngine._shared) == "table" then
+    pcall(syncEngine._shared.protectPlaythrough, syncEngine._shared, nil, nil)
+  end
   autopilot = nil
   driverCo = nil
+  -- Leave the cart's scope behind: the launcher's own settings and slots are
+  -- the base game's, not the cart's.  The speed ladder is cart state too, so
+  -- a 1x/2x cart must not pin the launcher or the next game.
+  require("src.core.SaveData").setCart(nil)
+  require("src.core.GameSpeed").setAllowed(nil)
 
-  local Input = require("src.core.Input")
-  local TouchControls = require("src.core.TouchControls")
-  Input:reset()
-  TouchControls:reset()
+  SessionLifecycle.endMountedSession(currentVersion)
 
-  require("src.core.Orientation").applyOptions(
-    require("src.core.SaveData").loadOptions())
+  applySavedOrientation()
 
   local preload = require("src.mods.LauncherMods").translationStrings()
   if preload then require("src.core.Strings").load({ strings = preload }) end
@@ -360,10 +443,19 @@ local function returnToLauncher()
     love.window.setTitle(Version.title("Gen 1 Recompilation Project"))
   end
 
-  Importer = makeLauncher()
+  Importer = makeLauncher({ initialTab = opts and opts.tab or nil })
 end
 
-function bootGame(version)
+local pendingLauncherReturn
+
+function bootGame(version, cartId, opts)
+  opts = opts or {}
+  if require("src.core.RequireGuard").repair() then
+    print("boot: restored love.filesystem searcher (see #2001)")
+  end
+  pcall(function()
+    require("src.online.Trade").hostIsLive = function() return true end
+  end)
   -- The launcher hands us the chosen game (Red / Blue / Yellow / Gold);
   -- scripted and headless runs fall back to POKEPORT_VERSION, then Red.
   -- Set the active version and overlay its extracted cache BEFORE anything
@@ -376,6 +468,25 @@ function bootGame(version)
   -- (Blue/Yellow/Gold caches live under blue/ / yellow/ / gold/).
   CacheFs.prefix = GameVersion.cachePrefix()
   CacheFs.mountVersion(GameVersion.get())
+  local cartHash, cartSpeeds, cartOptions
+  if cartId then
+    local ok, cart, hash = pcall(function()
+      return require("src.carts.CartStore").get(cartId)
+    end)
+    if ok and cart then
+      cartHash, cartSpeeds, cartOptions = hash, cart.speeds, cart.options
+    else
+      cartId = nil
+    end
+  end
+  local SaveData = require("src.core.SaveData")
+  SaveData.setCart(cartId, cartHash)
+  -- The author's settings land in the cart's own scope the first time only;
+  -- after that the player owns them.
+  if cartOptions then SaveData.seedCartOptions(cartOptions) end
+  -- A cart may narrow or pin the speed ladder; nil restores the full one.
+  require("src.core.GameSpeed").setAllowed(cartSpeeds)
+  if cartId then SaveData.adoptCartSeal(cartId) end
   -- NX: always write nx-asset-probe.log so Yellow/Blue art failures are
   -- diagnosable from the SD without enabling switch-debug.txt.
   pcall(function()
@@ -391,12 +502,29 @@ function bootGame(version)
   -- own service owner, which mounts src/world/gen2 (walk / warps /
   -- connections) and the Gen 2 screens instead of src/core/Game.lua's Gen 1
   -- wiring.
+  local arena = opts.arena
+  local loadOpts = { arena = arena, cartId = cartId }
   if GameVersion.generation() == 2 then
     Game = require("src.core.Game2").new()
-    Game:load()
+    if arena then
+      Game.returnToLauncher = function(o) pendingLauncherReturn = o or {} end
+    end
+    Game:load(loadOpts)
   else
-    Game = require("src.core.Game")
-    Game:load()
+    -- Gen1 Game is a module singleton.  Always re-require after in-process
+    -- EXIT GAME so a prior session cannot leave a table whose rawget(load)
+    -- is nil (release Android: bootGame then dies with load-a-nil-value).
+    -- rawget: type(mod.load) can lie via __index and skip a rebuild.
+    package.loaded["src.core.Game"] = nil
+    local gameMod = require("src.core.Game")
+    if type(rawget(gameMod, "load")) ~= "function" then
+      error("src.core.Game missing load after reload")
+    end
+    Game = gameMod
+    if arena then
+      Game.returnToLauncher = function(o) pendingLauncherReturn = o or {} end
+    end
+    Game:load(loadOpts)
     if os.getenv("POKEPORT_AUTOPILOT") then
       autopilot = require("tests.autopilot")
     end
@@ -412,11 +540,78 @@ function bootGame(version)
   Game.speedOverride = (autopilot or driverCo) and 1 or speedOverride
 end
 
+local function showLauncher(version)
+  LaunchOptions.pendingTab = version
+  if not Importer then
+    Importer = makeLauncher({ initialTab = version })
+  end
+end
+
+local function startLaunchRequest(request)
+  if type(request) ~= "table" then return false end
+
+  local version = request.game
+  if request.launcher or not version then
+    if Game then
+      returnToLauncher({ tab = version })
+    else
+      showLauncher(version)
+    end
+    return true
+  end
+
+  local RomImporter = require("src.import.RomImporter")
+  if Game then returnToLauncher() end
+  Importer = nil
+  if Prelaunch then return true end
+
+  local cartId
+  if request.cartSpecified then
+    local ok, cart = pcall(function()
+      return require("src.carts.CartStore").get(request.cart)
+    end)
+    if not ok or type(cart) ~= "table" or cart.base ~= version then
+      showLauncher(version)
+      return true
+    end
+    cartId = request.cart
+  end
+
+  if not RomImporter.isReady(version) then
+    showLauncher(version)
+    return true
+  end
+
+  local function bootShortcut()
+    if request.slot then LaunchOptions.selectSlot(version, request.slot) end
+    launchedIntoGame = true
+    bootGame(version, cartId)
+  end
+
+  Prelaunch = require("src.core.Prelaunch").new({
+    version = version,
+    tasks = request.tasks or {},
+    done = function(outcome)
+      if outcome == "restart" then return end
+      Prelaunch = nil
+      if outcome == "launcher" then
+        showLauncher(version)
+        return
+      end
+      bootShortcut()
+    end,
+  })
+  if not Prelaunch then bootShortcut() end
+  return true
+end
+
 function love.load(args)
   -- Before anything can shell out (update check, mod index, ROM picker),
   -- claim one hidden console on Windows so those children inherit it instead
   -- of each flashing their own cmd.exe window (#606).  No-op elsewhere.
   require("src.core.HostShell").hideHostConsole()
+
+  require("src.core.RequireGuard").capture()
 
   -- Hang gen1tls on love.system before mods boot.  Android already has tls*
   -- from JNI; this is the desktop half.  No DLL / no FFI is fine -- ws://
@@ -457,8 +652,7 @@ function love.load(args)
   -- shows: SDL created the window with no orientation hint, so without this
   -- the launcher would rotate freely until options are applied at boot.
   -- No-op on desktop / iOS / when options.lua does not exist yet.
-  require("src.core.Orientation").applyOptions(
-    require("src.core.SaveData").loadOptions())
+  applySavedOrientation()
 
   -- Standalone editor.  A bare `--editor` run has no launcher behind it, so
   -- Close quits; --save points it at a specific file, otherwise it opens the
@@ -475,13 +669,14 @@ function love.load(args)
   end
 
   local RomImporter = require("src.import.RomImporter")
+  local resolvedLaunch = LaunchOptions.resolveRequest(arg, args)
   local forceImport = os.getenv("POKEPORT_FORCE_IMPORT") == "1"
   local importPath = os.getenv("POKEPORT_IMPORT_ROM")
   -- Scripted / headless runs pick their game from POKEPORT_VERSION, then
   -- POKEPORT_GAME / --game= (LaunchOptions), then Red.  Drivers for Gold
   -- must honor POKEPORT_GAME=gold the same way a desktop shortcut does.
   local scriptedVersion = os.getenv("POKEPORT_VERSION")
-    or LaunchOptions.resolve(arg)
+    or resolvedLaunch.game
     or "red"
   local ready = RomImporter.isReady(scriptedVersion)
   -- Scripted / headless runs have to reach the game with no human pressing
@@ -490,6 +685,18 @@ function love.load(args)
   -- import-then-boot (or boot-straight-in) behavior.
   local scripted = os.getenv("POKEPORT_AUTOPILOT") or os.getenv("POKEPORT_DRIVER")
     or os.getenv("POKEPORT_IMPORT_ONLY") == "1" or importPath ~= nil
+
+  local scriptedOpts = nil
+  local specPath = os.getenv("POKEPORT_ARENA_SPEC")
+  if specPath and os.getenv("POKEPORT_DRIVER") then
+    local chunk, chunkErr = loadfile(specPath)
+    if not chunk then error("POKEPORT_ARENA_SPEC: " .. tostring(chunkErr)) end
+    local spec = chunk()
+    if type(spec) ~= "table" then
+      error("POKEPORT_ARENA_SPEC must return an ArenaSpec table")
+    end
+    scriptedOpts = { arena = spec }
+  end
 
   if scripted then
     if forceImport or not ready then
@@ -501,12 +708,12 @@ function love.load(args)
           return
         end
         Importer = nil
-        bootGame(version or scriptedVersion)
+        bootGame(version or scriptedVersion, nil, scriptedOpts)
       end)
       if importPath then Importer:startPath(importPath) end
       return
     end
-    bootGame(scriptedVersion)
+    bootGame(scriptedVersion, nil, scriptedOpts)
     return
   end
 
@@ -535,20 +742,17 @@ function love.load(args)
   -- would boot the same game again and that close would restart again,
   -- forever (#887).  Consumed on read, so the very next launch is normal.
   local relaunched = love.filesystem.getInfo(RELAUNCH_MARKER) ~= nil
-  if relaunched then pcall(love.filesystem.remove, RELAUNCH_MARKER) end
+  if relaunched then
+    launchOptionsSuppressed = true
+    pcall(love.filesystem.remove, RELAUNCH_MARKER)
+  end
 
-  local launchGame, launchSlot = LaunchOptions.resolve(arg)
-  if launchGame and not relaunched and not LaunchOptions.forceLauncher(arg) then
-    if RomImporter.isReady(launchGame) then
-      if launchSlot then LaunchOptions.selectSlot(launchGame, launchSlot) end
-      -- No launcher behind this session: love.quit must exit, not restart.
-      launchedIntoGame = true
-      bootGame(launchGame)
-      return
-    end
-    -- Not importable yet: open the launcher already showing that game, so the
-    -- shortcut still lands the player where they meant to go.
-    LaunchOptions.pendingTab = launchGame
+  if not relaunched and resolvedLaunch.game and not resolvedLaunch.launcher
+      and startLaunchRequest(resolvedLaunch) then
+    return
+  end
+  if not relaunched and resolvedLaunch.launcher and resolvedLaunch.game then
+    LaunchOptions.pendingTab = resolvedLaunch.game
   end
 
   -- Interactive: the launcher always runs.  Red, Blue, Yellow, and Gold are
@@ -561,6 +765,7 @@ function love.load(args)
 end
 
 function love.update(dt)
+  checkEmergencyQuit(dt)
   HostDisplay.update(dt)
   SwitchDiagnostics.maybeFlush(false)
   -- NX only (no-op elsewhere): follow dock/undock without waiting for SDL.
@@ -568,6 +773,17 @@ function love.update(dt)
   if editorMode then return EditorApp.update(dt) end
   if TouchEditor then return TouchEditor.update(dt) end
   if Studio then return Studio.update(dt) end
+  local launchURI = LaunchOptions.pollURI()
+  if launchURI then love.handlers.intent_uri(launchURI) end
+  if Prelaunch then return Prelaunch:update(dt) end
+  local client = onlineClientModule()
+  if client then pcall(client.update, dt) end
+  if pendingLauncherReturn then
+    local opts = pendingLauncherReturn
+    pendingLauncherReturn = nil
+    returnToLauncher(opts)
+    return
+  end
   if Importer then return Importer:update(dt) end
   if not Game then return end
 
@@ -631,6 +847,10 @@ function love.draw()
     HostDisplay.endFrame("skin_studio", Studio)
     return result
   end
+  if Prelaunch then
+    GameViewport.reset()
+    return Prelaunch:draw()
+  end
   if Importer then
     GameViewport.reset()
     HostDisplay.beginFrame("launcher", Importer)
@@ -665,6 +885,7 @@ function love.keypressed(key, scancode, isrepeat)
   if editorMode then return EditorApp.keypressed(key) end
   if TouchEditor then return TouchEditor.keypressed(key) end
   if Studio then return Studio.keypressed(key) end
+  if Prelaunch then return Prelaunch:cancel() end
   if Importer then return Importer:keypressed(key) end
   if not Game then return end
   Game:keypressed(key)
@@ -691,7 +912,8 @@ function love.gamepadpressed(joystick, button)
     end
     return
   end
-  if Studio then return end
+  if Studio then return Studio.gamepadpressed(joystick, button) end
+  if Prelaunch then return Prelaunch:cancel() end
   if Importer then return Importer:gamepadpressed(joystick, button) end
   if not Game then return end
   Game:gamepadpressed(joystick, button)
@@ -711,7 +933,7 @@ function love.gamepadreleased(joystick, button)
     end
     return
   end
-  if Studio then return end
+  if Studio then return Studio.gamepadreleased(joystick, button) end
   if Importer then return Importer:gamepadreleased(joystick, button) end
   if not Game then return end
   Game:gamepadreleased(joystick, button)
@@ -731,7 +953,7 @@ function love.gamepadaxis(joystick, axis, value)
     end
     return
   end
-  if Studio then return end
+  if Studio then return Studio.gamepadaxis(joystick, axis, value) end
   if Importer then return Importer:gamepadaxis(joystick, axis, value) end
   if not Game then return end
   Game:gamepadaxis(joystick, axis, value)
@@ -751,7 +973,7 @@ function love.joystickpressed(joystick, button)
     end
     return
   end
-  if Studio then return end
+  if Studio then return Studio.joystickpressed(joystick, button) end
   if Importer then return Importer:joystickpressed(joystick, button) end
   if not Game then return end
   Game:joystickpressed(joystick, button)
@@ -771,7 +993,7 @@ function love.joystickreleased(joystick, button)
     end
     return
   end
-  if Studio then return end
+  if Studio then return Studio.joystickreleased(joystick, button) end
   if Importer then return Importer:joystickreleased(joystick, button) end
   if not Game then return end
   Game:joystickreleased(joystick, button)
@@ -791,7 +1013,7 @@ function love.joystickaxis(joystick, axis, value)
     end
     return
   end
-  if Studio then return end
+  if Studio then return Studio.joystickaxis(joystick, axis, value) end
   if Importer then return Importer:joystickaxis(joystick, axis, value) end
   if not Game then return end
   Game:joystickaxis(joystick, axis, value)
@@ -811,7 +1033,7 @@ function love.joystickhat(joystick, hat, direction)
     end
     return
   end
-  if Studio then return end
+  if Studio then return Studio.joystickhat(joystick, hat, direction) end
   if Importer then return Importer:joystickhat(joystick, hat, direction) end
   if not Game then return end
   Game:joystickhat(joystick, hat, direction)
@@ -876,6 +1098,8 @@ love.handlers = love.handlers or {}
 function love.handlers.audiosuspend()
   local ChipAudio = package.loaded["src.core.ChipAudio"]
   if ChipAudio then pcall(ChipAudio.setSuspended, true) end
+  local Sound = package.loaded["src.core.Sound"]
+  if Sound then pcall(Sound.onDeviceReset) end
 end
 
 function love.handlers.audioreset()
@@ -891,24 +1115,17 @@ function love.handlers.audioreset()
 end
 
 function love.handlers.intent_game(version)
-  if type(version) ~= "string" or version == "" then return end
-  version = version:lower():gsub("^%s+", ""):gsub("%s+$", "")
-  local GameVersion = require("src.core.GameVersion")
-  if GameVersion.VERSIONS and not GameVersion.VERSIONS[version] then return end
+  local request = LaunchOptions.fromGame(version)
+  if request then startLaunchRequest(request) end
+end
 
-  local RomImporter = require("src.import.RomImporter")
-  if not RomImporter.isReady(version) then return end
-
-  local currentVersion = GameVersion.get()
-  if Game and currentVersion == version then
-    return
+function love.handlers.intent_uri(uri)
+  local request = LaunchOptions.parseURI(uri)
+  if request then
+    startLaunchRequest(request)
+  elseif LaunchOptions.isLaunchURI(uri) then
+    startLaunchRequest({})
   end
-
-  if Game then
-    returnToLauncher()
-  end
-  Importer = nil
-  bootGame(version)
 end
 
 function love.touchpressed(id, x, y, dx, dy, pressure)
@@ -928,7 +1145,8 @@ function love.touchpressed(id, x, y, dx, dy, pressure)
     if love.system.getOS() == "iOS" then return end
     return TouchEditor.touchpressed(id, x, y)
   end
-  if Studio then return end
+  if Studio then return Studio.touchpressed(id, x, y) end
+  if Prelaunch then return Prelaunch:cancel() end
   if Importer then
     -- Both mobiles: FlexLove scroll needs the real touch stream. Clicks are
     -- polled inside the view; the istouch filter on mousepressed still drops
@@ -945,7 +1163,7 @@ function love.touchmoved(id, x, y, dx, dy, pressure)
     if love.system.getOS() == "iOS" then return end
     return TouchEditor.touchmoved(id, x, y)
   end
-  if Studio then return end
+  if Studio then return Studio.touchmoved(id, x, y) end
   if Importer then
     return Importer:touchmoved(id, x, y, dx, dy, pressure)
   end
@@ -959,7 +1177,7 @@ function love.touchreleased(id, x, y, dx, dy, pressure)
     if love.system.getOS() == "iOS" then return end
     return TouchEditor.touchreleased(id, x, y)
   end
-  if Studio then return end
+  if Studio then return Studio.touchreleased(id, x, y) end
   if Importer then
     return Importer:touchreleased(id, x, y, dx, dy, pressure)
   end
@@ -1012,7 +1230,16 @@ function love.mousepressed(x, y, button, istouch)
     if love.system.getOS() == "Android" then return end
     return TouchEditor.mousepressed(x, y, button)
   end
-  if Studio then return Studio.mousepressed(x, y, button) end
+  if Studio then
+    -- Mobile LÖVE sends both a touch event and an `istouch` mouse twin.
+    -- Studio consumes the real finger stream above, so discard the twin.
+    if istouch and (love.system.getOS() == "Android" or love.system.getOS() == "iOS") then return end
+    return Studio.mousepressed(x, y, button)
+  end
+  if Prelaunch then
+    if istouch then return end
+    return Prelaunch:cancel()
+  end
   if Importer then
     -- love.touchpressed already forwards the primary touch into FlexLove for
     -- scroll. LÖVE ALSO synthesizes a mouse press for that same touch; if both
@@ -1047,7 +1274,10 @@ function love.mousereleased(x, y, button, istouch)
     if love.system.getOS() == "Android" then return end
     return TouchEditor.mousereleased(x, y, button)
   end
-  if Studio then return Studio.mousereleased(x, y, button) end
+  if Studio then
+    if istouch and (love.system.getOS() == "Android" or love.system.getOS() == "iOS") then return end
+    return Studio.mousereleased(x, y, button)
+  end
   if Importer then return end
   if editorMode and EditorApp.mousereleased then
     return EditorApp.mousereleased(x, y, button)
@@ -1065,7 +1295,10 @@ function love.mousemoved(x, y, dx, dy, istouch)
     if love.system.getOS() == "Android" then return end
     return TouchEditor.mousemoved(x, y)
   end
-  if Studio then return Studio.mousemoved(x, y) end
+  if Studio then
+    if istouch and (love.system.getOS() == "Android" or love.system.getOS() == "iOS") then return end
+    return Studio.mousemoved(x, y)
+  end
   if editorMode or Importer then return end
   if mouseTouch then
     if Game and love.mouse.isDown(1) then Game:touchmoved("mouse", x, y) end
@@ -1116,15 +1349,23 @@ function love.quit()
   -- docs/modding.md's core.quit_to_launcher entry) may veto returning to
   -- this Lua launcher via that hook. Vanilla behavior (used when no mod
   -- claims the hook) is exactly the condition below.
-  local isAndroid = (love.system and love.system.getOS and love.system.getOS() == "Android")
+  --
+  -- Android and iOS both tear down LOVE in-process rather than
+  -- love.event.quit("restart"): Android's vendored love.cpp PHYSFS-crashes
+  -- on a second init (#575), and iOS's love.cpp forces DONE_RESTART for
+  -- every quit while warning that leftover threads make that unreliable.
+  -- SessionLifecycle workers (ChipAudio / Fetch / Check) make that warning
+  -- real -- endProcess joins them, then the native restart still blows up.
+  local osName = love.system and love.system.getOS and love.system.getOS()
+  local inProcessReturn = (osName == "Android" or osName == "iOS")
   local wouldReturnToLauncher = PlatformHooks.quitToLauncher(function()
     return Game and not Importer and not quitToLauncher and not scripted
-      and (isAndroid or not launchedIntoGame)
+      and (inProcessReturn or not launchedIntoGame)
   end)
   if wouldReturnToLauncher then
-    if isAndroid then
+    if inProcessReturn then
       returnToLauncher()
-      return true -- abort this quit; the restart lands back in the launcher
+      return true -- abort this quit; stay in the same LOVE run
     end
     quitToLauncher = true
     -- Tell the fresh boot to ignore any boot-straight-into-a-game option this
@@ -1137,25 +1378,17 @@ function love.quit()
   pcall(function()
     require("src.core.DiscordPresence").shutdown()
   end)
-  -- LOVE waits for every live love.thread before the process exits, and both
-  -- background workers idle in a loop that only a "quit" command breaks, so
-  -- without this the process outlived the window and the next launch re-entered
-  -- the dead one instead of starting fresh (#339)
-  if package.loaded["src.core.ChipAudio"] then
-    pcall(package.loaded["src.core.ChipAudio"].shutdown)
-  end
-  if package.loaded["src.update.Check"] then
-    pcall(package.loaded["src.update.Check"].shutdown)
-  end
-  -- The launcher's fetch pool is the same story: its workers idle in
-  -- Channel:demand(), which never returns on its own, so a launcher that ever
-  -- touched the network would hang the process on exit (#339's shape again).
-  if package.loaded["src.net.Fetch"] then
-    pcall(package.loaded["src.net.Fetch"].shutdown)
-  end
+  SessionLifecycle.endProcess()
 end
 
 function love.filedropped(file)
+  local filename = file and file.getFilename and file:getFilename()
+  if LaunchOptions.isLaunchURI(filename) then
+    local request = LaunchOptions.parseURI(filename)
+    if launchOptionsSuppressed then return end
+    startLaunchRequest(request or {})
+    return
+  end
   if editorMode and EditorApp and EditorApp.filedropped then
     return EditorApp.filedropped(file)
   end
@@ -1170,6 +1403,17 @@ local function pacingEnabled()
   return true
 end
 
+-- Shane #1830 idle render governor (POKEPORT_IDLE_*): drop presentation rate
+-- on static in-game screens; game logic and audio stay at full speed.
+local function idlePresentationCap(idleFor)
+  local after = tonumber(os.getenv("POKEPORT_IDLE_AFTER"))
+  local fps = tonumber(os.getenv("POKEPORT_IDLE_FPS"))
+  if not after or after <= 0 or not fps or fps <= 0 then return nil end
+  if idleFor < after then return nil end
+  if Importer or Prelaunch or editorMode or not Game then return nil end
+  return fps
+end
+
 function love.run()
   if love.load then love.load(love.arg.parseGameArguments(arg), arg) end
 
@@ -1177,12 +1421,41 @@ function love.run()
   if love.timer then love.timer.step() end
 
   local FrameCap = require("src.core.FrameCap")
+  _G.POKEPORT_LOOP_PANEL_SYNC = true
+  FrameCap.bootPanelSync()
+  local RefreshRate = require("src.core.RefreshRate")
+  local FixedStep = require("src.core.FixedStep")
+  local VSync = require("src.core.VSync")
+  local PresentSync = require("src.core.PresentSync")
   local paced = pacingEnabled()
   -- The deadline the next present() should not beat.  Carried forward one
   -- budget per frame so pacing stays even instead of drifting with the
   -- per-frame sleep-granularity jitter.
   local nextFrame = love.timer and love.timer.getTime() or 0
   local dt = 0
+  local idleFor = 0
+  local SLEEP_FLOOR = 0.001
+  -- Sleep until deadline with one or two kernel waits, not 1 ms polling.
+  local function sleepUntilFrame(deadline)
+    while true do
+      local remaining = deadline - love.timer.getTime()
+      if remaining <= SLEEP_FLOOR then break end
+      if remaining > 0.004 then
+        love.timer.sleep(remaining - 0.002)
+      else
+        love.timer.sleep(remaining)
+      end
+    end
+  end
+  local WAKE = {
+    keypressed = true, keyreleased = true, textinput = true,
+    mousepressed = true, mousereleased = true, mousemoved = true,
+    wheelmoved = true, touchpressed = true, touchreleased = true,
+    touchmoved = true, joystickpressed = true, joystickreleased = true,
+    joystickhat = true, gamepadpressed = true, gamepadreleased = true,
+    joystickadded = true, joystickremoved = true, filedropped = true,
+    directorydropped = true, focus = true, visible = true, resize = true,
+  }
 
   return function()
     -- process events
@@ -1201,30 +1474,71 @@ function love.run()
             return a or 0
           end
         end
+        if WAKE[name] then
+          idleFor = 0
+        elseif name == "joystickaxis" and type(c) == "number" and math.abs(c) > 0.5 then
+          idleFor = 0
+        end
+        if name == "focus" and a then
+          PresentSync.onDisplayChange()
+        elseif name == "resize" then
+          PresentSync.onDisplayChange()
+        end
         love.handlers[name](a, b, c, d, e, f)
       end
     end
 
     -- update dt
     if love.timer then dt = love.timer.step() end
+    idleFor = idleFor + dt
+    RefreshRate.sample(dt)
+
+    checkEmergencyQuit(dt)
 
     -- call update and draw
     if love.update then love.update(dt) end
 
-    if love.graphics and love.graphics.isActive() then
+    local visible = not (love.window and love.window.isVisible)
+      or love.window.isVisible()
+    local focused = not (love.window and love.window.hasFocus)
+      or love.window.hasFocus()
+    local cap = FrameCap.current
+    if not visible then
+      cap = 10
+    elseif Importer and (not focused or idleFor > 30) then
+      cap = 15
+    else
+      local idleCap = idlePresentationCap(idleFor)
+      if idleCap then cap = idleCap end
+    end
+    if cap == FrameCap.DISPLAY and not VSync.isOn() then
+      cap = FrameCap.DEFAULT
+    elseif cap == FrameCap.DISPLAY and PresentSync.needsSoftwareCap() then
+      -- Fallback cascade: probe failed / wait abandoned / sync non-
+      -- deterministic → FrameCap is the live pacing path on every OS.
+      -- (During an active probe we intentionally leave DISPLAY uncapped so
+      -- calibration is not grading our own limiter.)
+      cap = FrameCap.DEFAULT
+    end
+
+    if visible and love.graphics and love.graphics.isActive() then
       love.graphics.origin()
       love.graphics.clear(love.graphics.getBackgroundColor())
       if love.draw then love.draw() end
+      PresentSync.waitBeforePresent()
       love.graphics.present()
+      PresentSync.notePresent()
     end
 
+    PresentSync.applyFixedStepPeriod()
+
     if love.timer then
-      if paced then
+      if paced and cap ~= FrameCap.DISPLAY and not PresentSync.hardwarePacesCap(cap) then
         -- Sleep out the remainder of the frame budget, measured from the
-        -- carried deadline, in small chunks so the OS timer stays
-        -- responsive.  vsync is untouched: when it already paces slower
-        -- than the cap the remainder is <= 0 and this rounds to a no-op.
-        local budget = 1 / FrameCap.current
+        -- carried deadline.  When vsync already gates at or above the cap,
+        -- hardwarePacesCap skips this entirely.  Otherwise one kernel sleep
+        -- covers the bulk; only the last couple ms re-check for overshoot.
+        local budget = 1 / cap
         nextFrame = nextFrame + budget
         local now = love.timer.getTime()
         -- A stall (alt-tab, a GC pause, a blocked import) can leave the
@@ -1233,11 +1547,7 @@ function love.run()
         if now - nextFrame > budget then
           nextFrame = now
         end
-        while true do
-          local remaining = nextFrame - love.timer.getTime()
-          if remaining <= 0 then break end
-          love.timer.sleep(remaining < 0.001 and remaining or 0.001)
-        end
+        sleepUntilFrame(nextFrame)
       else
         love.timer.sleep(0.001)
       end

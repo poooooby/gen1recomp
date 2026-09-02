@@ -91,6 +91,12 @@ bool syncHealthSteps();
 bool restartApp();
 
 /**
+ * Stages a checksum-verified APK from the current save directory and starts
+ * Android's user-confirmed Package Installer flow. Android-only.
+ **/
+bool installApk(const char *path);
+
+/**
  * Dynamic App Shortcuts: updates Android ShortcutManager with ready game versions.
  **/
 bool updateAppShortcuts(const std::vector<std::string> &versions);
@@ -99,6 +105,7 @@ bool updateAppShortcuts(const std::vector<std::string> &versions);
  * Returns the game version requested via initial launch Intent (if any).
  **/
 std::string getLaunchGame();
+std::string getLaunchURI();
 
 /**
  * Blocking HTTPS GET into destPath (GameActivity.httpDownload). Android has

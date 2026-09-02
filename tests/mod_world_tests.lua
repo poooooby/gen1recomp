@@ -971,21 +971,34 @@ do
   check(battle ~= nil, "the transition hands off to the battle")
 
   battle.participants = { [caterpie] = true }
+  local preAward = {}
+  for _, row in ipairs(battle.queue) do preAward[row] = true end
   battle:awardExp()
+  -- experience.asm:158-200: the level write rides a queued row, so run the
+  local awarded = {}
+  for _, row in ipairs(battle.queue) do
+    if row.fn and not preAward[row] then awarded[#awarded + 1] = row.fn end
+  end
+  for _, fn in ipairs(awarded) do battle.nextInsert = 0 fn() end
   check(caterpie.level >= 7, "the mon levels past its evolution threshold")
   check(battle.leveledUp and battle.leveledUp[caterpie],
     "awardExp records the level-up for EvolveAfterBattle")
 
-  game.stack:pop()
-  battle.onFinish("win")
-  for _ = 1, 12 do
+  -- EndOfBattle evolves on the battle screen (end_of_battle.asm:42-45),
+  -- so drive finish() rather than calling onFinish by hand
+  battle.result = "win"
+  battle:finish()
+  -- the "is evolving!" box types out and holds DelayFrames 50 before the
+  -- movie (evos_moves.asm:120-134) (#1596), so drive frames to reach it
+  game.input.wasPressed = function() return false end
+  local evoTop
+  for _ = 1, 900 do
     local t = game.stack:top()
-    if not t or t.screenId == "EvolutionState" then break end
-    game.stack:pop()
-    if t.onDone then t.onDone() end
+    if not t then break end
+    if t.screenId == "EvolutionState" then evoTop = t break end
+    if t.update then t:update(1 / 60) else break end
   end
-  check(game.stack:top() and game.stack:top().screenId == "EvolutionState",
-    "the win reaches the evolution screen")
+  check(evoTop ~= nil, "the win reaches the evolution screen")
 end
 
 do
