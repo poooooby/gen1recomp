@@ -281,11 +281,7 @@ local function buildGame()
   function translate.zoomStep()
     return function(delta)
       local g = live()
-      if not (g and g.world and g.world.map) then return end
-      g.world:zoomStep(delta)
-      g.options = g.options or {}
-      g.options.zoom = rawRequire("src.render.Zoom").offset
-      if g.persistOptions then g:persistOptions() end
+      if g and g.zoomStep then g:zoomStep(delta) end
     end
   end
 
@@ -1856,7 +1852,7 @@ local function buildBattleState()
     "syncSides", "playerHasPP", "lockedAction", "computeMusicKind",
     "throwBall", "ballChain", "tossAnimFor", "ballFlicker", "ballMissMessage",
     "storeCaughtMon", "safariAction", "safariEnemyTurn", "drawBallRow",
-    "drawClassic", "isWideBattleLayout", "wideLayout", "uiSize",
+    "drawClassic", "uiSize",
     "sgbPalettes", "trainerPalette", "trainerPicPath", "trainerTrueColor",
     "trainerSprite", "invalidate",
     "imageBattleScale", "resolveBattleScale", "backPlacement",
@@ -1940,11 +1936,13 @@ COVERAGE["src.battle.BattleState"] = {
   backed = "update draw __index isOpaque openParty swapMoves "
     .. "lowHealthAlarmActive playVictoryMusic say sayAuto openItems "
     .. "openReplacementMenu finish askNicknameUI playEntranceCry stampOT "
-    .. "tryRun wantsFillScale bgMode BG_WORLD_DIM",
+    .. "tryRun wantsFillScale bgMode BG_WORLD_DIM "
+    .. "isWideBattleLayout wideLayout "
+    .. "extendedHUD extendedWorldHUD extendedBlackHUD",
   warned = "tryRun askNicknameUI",
   absent = "newWild newTrainer makeSafari makeGhost makeBattler resolveTurn "
     .. "computeDamage catchAttempt runRoll enter exit sgbPalettes "
-    .. "isWideBattleLayout wideLayout uiSize letterboxWhite "
+    .. "uiSize letterboxWhite "
     .. "holdsUIAnchors trainerPalette trainerPicPath "
     .. "trainerTrueColor trainerSprite invalidate "
     .. "backPlacement frontPlacement StatBox drawClassic drawBallRow "

@@ -477,6 +477,23 @@ function RomExtractor:extractFont()
   return data
 end
 
+-- engine/overworld/map_sprites.asm:181
+function RomExtractor.spriteSheetLength(constName, width, height, firstHalf)
+  local byteLength = width * height / 4
+  local frames = height / 16
+  local expected = firstHalf * (frames >= 6 and 2 or 1)
+  if byteLength < expected then
+    byteLength = expected
+    assert(byteLength * 4 % width == 0,
+      constName .. ": ROM sprite length not tile-aligned")
+    height = byteLength * 4 / width
+    frames = height / 16
+    expected = firstHalf * (frames >= 6 and 2 or 1)
+    assert(byteLength == expected, constName .. ": sprite length mismatch")
+  end
+  return byteLength, height, frames
+end
+
 function RomExtractor:extractSprites()
   self:beginStage("Overworld sprites")
   local order = self.manifest.constants.spriteOrder
@@ -492,21 +509,8 @@ function RomExtractor:extractSprites()
     local firstHalf = self.rom:byte(pointerTable.bank, address + 2)
     local bank = self.rom:byte(pointerTable.bank, address + 3)
     local width = spec.imageWidth
-    local height = spec.imageHeight
-    local byteLength = width * height / 4
-    local frames = height / 16
-    local expected = firstHalf * (frames >= 6 and 2 or 1)
-    if byteLength ~= expected then
-      -- Commercial ROM sheet length wins over pret PNG atlases (Yellow nurse
-      -- PNG is taller than the 12-tile SpriteSheetPointerTable entry).
-      byteLength = expected
-      assert(byteLength * 4 % width == 0,
-        constName .. ": ROM sprite length not tile-aligned")
-      height = byteLength * 4 / width
-      frames = height / 16
-      expected = firstHalf * (frames >= 6 and 2 or 1)
-      assert(byteLength == expected, constName .. ": sprite length mismatch")
-    end
+    local byteLength, height, frames = RomExtractor.spriteSheetLength(
+      constName, width, spec.imageHeight, firstHalf)
     local base = spec.imageBase
     if not written[base] then
       self:write2bpp(self.rom:bytes(bank, pointer, byteLength),
@@ -1448,7 +1452,8 @@ function RomExtractor:textGlyph(value)
   if TEXT_GLYPH_OVERRIDES[value] then return TEXT_GLYPH_OVERRIDES[value] end
   local glyph = self.manifest.charmap[tostring(value)]
     or ("{BYTE:%02X}"):format(value)
-  if glyph:sub(1, 1) == "<" and glyph:sub(-1) == ">" then
+  -- home/text.asm:186
+  if glyph:match("^<[^<>]*>$") then
     return "{" .. glyph:sub(2, -2) .. "}"
   end
   return glyph
@@ -1464,6 +1469,8 @@ function RomExtractor:decodeTextCommands(symbol, substitutions)
     if command == 0x50 then
       assert(pending > #substitutions,
         symbol.name .. ": unused dynamic text substitutions")
+      -- home/text.asm:221
+      if #out > 0 then out[#out + 1] = "{DONE}" end
       return table.concat(out)
     elseif command == 0 then
       while true do
@@ -1473,6 +1480,10 @@ function RomExtractor:decodeTextCommands(symbol, substitutions)
         if value == 0x57 or value == 0x58 or value == 0x5F then
           assert(pending > #substitutions,
             symbol.name .. ": unused dynamic text substitutions")
+          -- constants/charmap.asm:19-20
+          if value ~= 0x5F and #out > 0 then
+            out[#out + 1] = (value == 0x58) and "{PROMPT}" or "{DONE}"
+          end
           return table.concat(out)
         end
         out[#out + 1] = self:textGlyph(value)

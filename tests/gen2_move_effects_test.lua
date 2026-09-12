@@ -74,15 +74,24 @@ local MOVES = {
     type = "NORMAL", accuracy = 0, pp = 10, effect = "EFFECT_TRANSFORM" },
   SWORDS_DANCE = { id = "SWORDS_DANCE", name = "SWORDS DANCE", power = 0,
     type = "NORMAL", accuracy = 0, pp = 30, effect = "EFFECT_ATTACK_UP_2" },
+  RECOVER = { id = "RECOVER", name = "RECOVER", power = 0, type = "NORMAL",
+    accuracy = 0, pp = 20, effect = "EFFECT_HEAL" },
+  SAFEGUARD = { id = "SAFEGUARD", name = "SAFEGUARD", power = 0,
+    type = "NORMAL", accuracy = 0, pp = 25, effect = "EFFECT_SAFEGUARD" },
+  EARTHQUAKE = { id = "EARTHQUAKE", name = "EARTHQUAKE", power = 100,
+    type = "GROUND", accuracy = 100, pp = 10, effect = "EFFECT_EARTHQUAKE" },
   -- STRUGGLE is in the move table like any other move and in nobody's move
   -- list, which is the whole of what makes Battle.STRUGGLE work.
   STRUGGLE = { id = "STRUGGLE", name = "STRUGGLE", power = 50, type = "NORMAL",
     accuracy = 100, pp = 1, effect = "EFFECT_RECOIL_HIT" },
 }
 
+-- pokecrystal/data/growth_rates.asm
 local GROWTH = {
   GROWTH_MEDIUM_FAST = { numerator = 1, denominator = 1, squared = 0,
     linear = 0, constant = 0 },
+  GROWTH_MEDIUM_SLOW = { numerator = 6, denominator = 5, squared = -15,
+    linear = 100, constant = 140 },
 }
 
 local POKEMON = {
@@ -110,6 +119,26 @@ local POKEMON = {
     types = { "GRASS", "GRASS" }, catchRate = 45, baseExp = 166,
     growthRate = "GROWTH_MEDIUM_FAST", genderRatio = 127,
     levelMoves = { { level = 1, move = "TACKLE" } }, evolutions = {},
+  },
+  -- pokecrystal/data/pokemon/base_stats/ditto.asm
+  DITTO = {
+    id = "DITTO", index = 132, name = "DITTO",
+    baseStats = { hp = 48, attack = 48, defense = 48, speed = 48,
+      specialAttack = 48, specialDefense = 48 },
+    types = { "NORMAL", "NORMAL" }, catchRate = 35, baseExp = 61,
+    growthRate = "GROWTH_MEDIUM_FAST", genderRatio = 255,
+    levelMoves = { { level = 1, move = "TRANSFORM" },
+      { level = 10, move = "SWORDS_DANCE" } }, evolutions = {},
+  },
+  -- pokecrystal/data/pokemon/base_stats/pidgey.asm
+  PIDGEY = {
+    id = "PIDGEY", index = 16, name = "PIDGEY",
+    baseStats = { hp = 40, attack = 45, defense = 40, speed = 56,
+      specialAttack = 35, specialDefense = 35 },
+    types = { "NORMAL", "NORMAL" }, catchRate = 255, baseExp = 55,
+    growthRate = "GROWTH_MEDIUM_SLOW", genderRatio = 127,
+    levelMoves = { { level = 1, move = "TACKLE" },
+      { level = 11, move = "EMBER" } }, evolutions = {},
   },
 }
 
@@ -286,6 +315,135 @@ do
     "AttackUp2 has no checkhit and reaches its stat change")
   check(not findText(battle:takeEvents(), "MACHOP's attack missed!"),
     "no invented miss against a dug-in target")
+end
+
+-- ../pokecrystal/data/moves/effects.asm:1011-1016 LightScreen
+do
+  local battle, player, wild = newBattle({
+    playerMoves = { { id = "REFLECT", pp = 20, maxPp = 20 } },
+    random = rolls({}, 0) })
+  battle:volatile(wild).vanished = true
+  battle:volatile(wild).chargeMove = "DIG"
+  battle:useMove(player, wild, "REFLECT")
+  eq(battle.screens.player.reflect, Battle.SCREEN_TURNS,
+    "Reflect goes up against a dug-in target")
+  check(not findText(battle:takeEvents(), "MACHOP's attack missed!"),
+    "Reflect has no checkhit: no invented miss")
+end
+
+do
+  local battle, player, wild = newBattle({
+    playerMoves = { { id = "LIGHT_SCREEN", pp = 30, maxPp = 30 } },
+    random = rolls({}, 0) })
+  battle:volatile(wild).vanished = true
+  battle:volatile(wild).chargeMove = "DIG"
+  battle:useMove(player, wild, "LIGHT_SCREEN")
+  eq(battle.screens.player.lightScreen, Battle.SCREEN_TURNS,
+    "Light Screen goes up against a dug-in target")
+  check(not findText(battle:takeEvents(), "MACHOP's attack missed!"),
+    "Light Screen has no checkhit: no invented miss")
+end
+
+-- ../pokecrystal/data/moves/effects.asm Heal
+do
+  local battle, player, wild = newBattle({
+    playerMoves = { { id = "RECOVER", pp = 20, maxPp = 20 } },
+    random = rolls({}, 0) })
+  battle:volatile(wild).vanished = true
+  battle:volatile(wild).chargeMove = "DIG"
+  player.hp = 1
+  battle:useMove(player, wild, "RECOVER")
+  check(player.hp > 1, "Recover heals while the target is underground")
+  check(not findText(battle:takeEvents(), "MACHOP's attack missed!"),
+    "Heal has no checkhit: no invented miss")
+end
+
+-- ../pokecrystal/data/moves/effects.asm Safeguard
+do
+  local battle, player, wild = newBattle({
+    playerMoves = { { id = "SAFEGUARD", pp = 25, maxPp = 25 } },
+    random = rolls({}, 0) })
+  battle:volatile(wild).vanished = true
+  battle:volatile(wild).chargeMove = "DIG"
+  battle:useMove(player, wild, "SAFEGUARD")
+  eq(battle.screens.player.safeguard, Battle.SCREEN_TURNS,
+    "Safeguard goes up against a dug-in target")
+  check(not findText(battle:takeEvents(), "MACHOP's attack missed!"),
+    "Safeguard has no checkhit: no invented miss")
+end
+
+-- ../pokecrystal/engine/battle/effect_commands.asm:1713-1746
+do
+  local battle, player, wild = newBattle({ random = rolls({}, 0) })
+  battle:volatile(wild).vanished = true
+  battle:volatile(wild).chargeMove = "DIG"
+  local before = wild.hp
+  battle:useMove(player, wild, "TACKLE")
+  eq(wild.hp, before, "Tackle still cannot reach a dug-in target")
+  check(findText(battle:takeEvents(), "MACHOP's attack missed!"),
+    ".DigMoves: a checkhit chain misses")
+end
+
+do
+  local battle, player, wild = newBattle({
+    playerMoves = { { id = "EARTHQUAKE", pp = 10, maxPp = 10 } },
+    random = rolls({}, 0) })
+  battle:volatile(wild).vanished = true
+  battle:volatile(wild).chargeMove = "DIG"
+  local before = wild.hp
+  battle:useMove(player, wild, "EARTHQUAKE")
+  check(wild.hp < before, "Earthquake reaches a dug-in target")
+  check(not findText(battle:takeEvents(), "MACHOP's attack missed!"),
+    ".DigMoves lets EARTHQUAKE through")
+end
+
+-- ../pokecrystal/engine/battle/move_effects/transform.asm:7
+do
+  local battle, player, wild = newBattle({
+    playerMoves = { { id = "TRANSFORM", pp = 10, maxPp = 10 } },
+    random = rolls({}, 0) })
+  battle:volatile(wild).vanished = true
+  battle:volatile(wild).chargeMove = "DIG"
+  battle:useMove(player, wild, "TRANSFORM")
+  local events = battle:takeEvents()
+  check(findText(events, "But it failed!"),
+    "CheckHiddenOpponent fails Transform with the fail line")
+  check(not findText(events, "MACHOP's attack missed!"),
+    "and never with the miss line")
+  eq(battle:volatile(player).transformed, nil, "no copy lands")
+end
+
+-- ../pokecrystal/data/moves/effects.asm
+-- ../pokecrystal/engine/battle/effect_commands.asm:5448
+do
+  local Effects = require("src.battle.gen2.Effects")
+  local expected = {
+    "EFFECT_MIRROR_MOVE", "EFFECT_ATTACK_UP", "EFFECT_DEFENSE_UP",
+    "EFFECT_SPEED_UP", "EFFECT_SP_ATK_UP", "EFFECT_SP_DEF_UP",
+    "EFFECT_ACCURACY_UP", "EFFECT_EVASION_UP", "EFFECT_RESET_STATS",
+    "EFFECT_CONVERSION", "EFFECT_HEAL", "EFFECT_LIGHT_SCREEN", "EFFECT_MIST",
+    "EFFECT_FOCUS_ENERGY", "EFFECT_ATTACK_UP_2", "EFFECT_DEFENSE_UP_2",
+    "EFFECT_SPEED_UP_2", "EFFECT_SP_ATK_UP_2", "EFFECT_SP_DEF_UP_2",
+    "EFFECT_ACCURACY_UP_2", "EFFECT_EVASION_UP_2", "EFFECT_TRANSFORM",
+    "EFFECT_REFLECT", "EFFECT_SUBSTITUTE", "EFFECT_METRONOME",
+    "EFFECT_SPLASH", "EFFECT_COUNTER", "EFFECT_SKETCH",
+    "EFFECT_DEFROST_OPPONENT", "EFFECT_SLEEP_TALK", "EFFECT_DESTINY_BOND",
+    "EFFECT_HEAL_BELL", "EFFECT_MEAN_LOOK", "EFFECT_NIGHTMARE",
+    "EFFECT_CURSE", "EFFECT_PROTECT", "EFFECT_SPIKES", "EFFECT_PERISH_SONG",
+    "EFFECT_SANDSTORM", "EFFECT_ENDURE", "EFFECT_SAFEGUARD",
+    "EFFECT_BATON_PASS", "EFFECT_MORNING_SUN", "EFFECT_SYNTHESIS",
+    "EFFECT_MOONLIGHT", "EFFECT_RAIN_DANCE", "EFFECT_SUNNY_DAY",
+    "EFFECT_BELLY_DRUM", "EFFECT_PSYCH_UP", "EFFECT_MIRROR_COAT",
+    "EFFECT_TELEPORT", "EFFECT_DEFENSE_CURL",
+  }
+  local count = 0
+  for _ in pairs(Effects.NO_CHECKHIT) do count = count + 1 end
+  eq(count, #expected, "NO_CHECKHIT lists the 52 chains without checkhit")
+  for _, effect in ipairs(expected) do
+    eq(Effects.NO_CHECKHIT[effect], true, effect .. " has no checkhit")
+  end
+  eq(Effects.NO_CHECKHIT.EFFECT_OHKO, nil, "OHKO stays behind CheckHit")
+  eq(Effects.NO_CHECKHIT.EFFECT_MIMIC, nil, "Mimic carries checkhit")
 end
 
 -- ---- Reflect and Light Screen ---------------------------------------------
@@ -612,6 +770,83 @@ do
   eq(player.moves[1].id, "TRANSFORM", "with its own moves")
   eq(player.stats.attack, ownAttack, "and its own stats")
   eq(player.volatile, nil, "and no volatile left on a save table")
+end
+
+do
+  -- pokecrystal/engine/battle/core.asm:6983
+  local battle, player, wild = newBattle({
+    playerSpecies = "DITTO", playerLevel = 9,
+    playerMoves = { { id = "TRANSFORM", pp = 10, maxPp = 10 } },
+    wildSpecies = "PIDGEY", wildLevel = 3,
+    random = rolls({}, 0) })
+  player.experience = 729
+  local ownMaxHp = Mon.stats(POKEMON.DITTO.baseStats, player.dvs, 9,
+    player.statExp).hp
+  battle:useMove(player, wild, "TRANSFORM")
+  eq(player.species, "PIDGEY", "the copy is live while the battle runs")
+  wild.hp = 0
+  battle:resolveFaints()
+  eq(player.experience, 752, "23 EXP from a level 3 PIDGEY, banked on 729")
+  eq(player.level, 9, "DITTO's own MEDIUM_FAST curve does not reach 10 yet")
+  eq(player.maxHp, ownMaxHp, "and maxHP is still DITTO's base 48, not PIDGEY's")
+  eq(player.species, "DITTO", "the battle ends with the party slot itself")
+
+  -- pokecrystal/engine/battle/core.asm:8294
+  local pinned = false
+  for _, event in ipairs(battle:takeEvents()) do
+    if event.kind == "identity" then
+      pinned = true
+      eq(event.side, "player", "the side whose pic must not change")
+      eq(event.species, "PIDGEY", "stays the copy for the rest of the screen")
+      eq(event.partySpecies, "DITTO", "over the mon that is really there")
+    end
+  end
+  check(pinned, "endBattle emits the identity the screen keeps drawing")
+end
+
+do
+  local battle, player, wild = newBattle({
+    playerSpecies = "DITTO", playerLevel = 9,
+    playerMoves = { { id = "TRANSFORM", pp = 10, maxPp = 10 } },
+    wildSpecies = "PIDGEY", wildLevel = 3,
+    random = rolls({}, 0) })
+  player.experience = 729
+  battle:useMove(player, wild, "TRANSFORM")
+  local copiedAttack = player.stats.attack
+  Mon.gainExperience(player, 271, DATA)
+  eq(player.level, 10, "1000 EXP is level 10 on MEDIUM_FAST, 12 on MEDIUM_SLOW")
+  eq(player.maxHp, Mon.stats(POKEMON.DITTO.baseStats, player.dvs, 10,
+    player.statExp).hp, "recomputed off DITTO's base stats")
+  eq(player.stats.attack, copiedAttack,
+    "the copied battle stats stay in play while transformed")
+
+  -- pokecrystal/engine/pokemon/learn.asm:88
+  eq(battle:learnPartyMove(player, "SWORDS_DANCE"), true, "the party learns it")
+  eq(#player.moves, 1, "the copied moveset is untouched")
+  eq(player.moves[1].id, "TACKLE", "and still the target's move")
+
+  battle:untransform(player)
+  eq(player.level, 10, "the level survives the unwind")
+  eq(player.stats.attack, Mon.stats(POKEMON.DITTO.baseStats, player.dvs, 10,
+    player.statExp).attack, "and the restored stats are the new ones")
+  eq(player.moves[2].id, "SWORDS_DANCE", "with the move it learned mid-copy")
+end
+
+do
+  local ItemEffects = require("src.core.gen2.ItemEffects")
+  local battle, player, wild = newBattle({
+    playerSpecies = "DITTO", playerLevel = 9,
+    playerMoves = { { id = "TRANSFORM", pp = 10, maxPp = 10 } },
+    wildSpecies = "PIDGEY", wildLevel = 3,
+    random = rolls({}, 0) })
+  player.experience = 729
+  battle:useMove(player, wild, "TRANSFORM")
+  local result = ItemEffects.useOnMon("RARE_CANDY", player, DATA)
+  eq(result.used, true, "the candy is spent")
+  eq(player.level, 10, "one level, as always")
+  eq(player.experience, 1000, "DITTO's MEDIUM_FAST threshold, not PIDGEY's 742")
+  eq(player.maxHp, Mon.stats(POKEMON.DITTO.baseStats, player.dvs, 10,
+    player.statExp).hp, "and DITTO's base stats behind the new maxHP")
 end
 
 -- ---- a DITTO caught while transformed is caught as a DITTO -----------------

@@ -8,6 +8,7 @@ Features intentionally added beyond the original Pokémon Red, Blue, and Yellow 
 * **Optional GBC screen effects**, including pixel grids, shadows, glare, and transparency
 * **Performance presets** and configurable FPS limits
 * **V-SYNC row and a DISPLAY frame cap**, for panels whose refresh is not a multiple of 60Hz
+* **LOGIC CLOCK option** (60HZ or the cart's 59.73HZ vblank rate) on every game's options screen
 * **Peer-to-peer LAN link play** for trades and battles between Red, Blue, and Yellow
 * **Online lobby** in the launcher for battles, spectating and tournaments
 * **Persistent custom options** stored separately from game saves
@@ -16,6 +17,7 @@ Features intentionally added beyond the original Pokémon Red, Blue, and Yellow 
 * **Screen position setting** (center, upper, top) shared across all games, for clamp-on controllers that cover the lower screen
 * **Touch skins** in RetroArch overlay format and Delta `.deltaskin` (including PDF-wrapped bezel art), with per-button press states and Super Game Boy borders
 * **Pokédex diploma and printer image exports**
+* **Deleting a synced save deletes it everywhere**, a slot removed in the launcher is dropped from the server and from every other linked device on its next sync
 * **Shareable mod lists** over save sync, optionally carrying the options set for those mods, which the receiving device is asked about before anything is changed
 * **Custom carts**, a named mod set saved from the mods tab and picked from a game's page, with its own shell colour, label art, save slots and export file
 * **Install required mods**, one press on a cart that will not start, fetching every pinned mod at the pinned version and refusing any archive whose hash is not the one the cart recorded
@@ -34,3 +36,5 @@ Features intentionally added beyond the original Pokémon Red, Blue, and Yellow 
 * **Mod manager** with Gen 1 mod adapters, per-game targeting, and `modkit gen2check`
 * **Followers** for mods, plus Gen 2-only registries and hooks
 * **Battle screen options** on Gold, Silver and Crystal: BATTLE SIZE (fixed or window-filling) and BATTLE BG (white, black or the dimmed map as the surround)
+* **Widescreen battle layout** on Gold, Silver and Crystal: BATTLE LAYOUT -> WIDE spreads the HUDs and bottom windows across a 304-wide screen
+* **Extended battle HUD** on Gold, Silver and Crystal: BATTLE HUD -> EXTENDED docks the WIDE layout's foe panel to the top of the window and the text area and player panel to the bottom

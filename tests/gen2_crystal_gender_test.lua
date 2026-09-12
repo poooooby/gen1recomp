@@ -16,6 +16,7 @@ love = require("tests.love_stub")
 local FieldMoves = require("src.world.gen2.FieldMoves")
 local GameVersion = require("src.core.GameVersion")
 local GenderSelect = require("src.ui.gen2.GenderSelect")
+local InitClock = require("src.ui.gen2.InitClock")
 local NamePick = require("src.ui.gen2.NamePick")
 local NamingScreen = require("src.ui.gen2.NamingScreen")
 local OakSpeech = require("src.ui.gen2.OakSpeech")
@@ -135,11 +136,23 @@ local function screenGame(save, button)
   return { save = save, data = {}, input = fakeInput(button) }
 end
 
+-- pokecrystal/engine/menus/init_gender.asm:29-34
+local function openMenu(screen)
+  for _ = 1, 600 do
+    if screen:menuOpen() then break end
+    screen:update(0)
+  end
+  return screen
+end
+
 local save = Save.newGame({})
 local answered
 local game = screenGame(save, "a")
 local screen = GenderSelect.new(game, { onDone = function(g) answered = g end })
 eq(screen.cursor, 1, "`db 1 ; default option` opens on Boy")
+screen:update(0)
+eq(screen.chosen, nil, "A while the prompt types answers nothing")
+openMenu(screen)
 screen:update(0)
 eq(save.player.gender, "male", "A on Boy writes PLAYERGENDER_MALE")
 eq(answered, nil, "and the DelayFrames 10 has not run out yet")
@@ -149,6 +162,7 @@ eq(answered, "male", "onDone fires once the ten frames are gone")
 save = Save.newGame({})
 game = screenGame(save, "down")
 screen = GenderSelect.new(game, { onDone = function() end })
+openMenu(screen)
 screen:update(0)
 eq(screen.cursor, 2, "down walks to Girl")
 game.input = fakeInput("down")
@@ -181,6 +195,7 @@ do
   eq(translated.text, "ROM prompt stays intact",
     "the extracted RomText prompt is not replaced by a catalog fallback")
   translated.text = ""
+  openMenu(translated)
   translated:drawPanel()
   check(table.concat(printed, "|"):find("Garçon", 1, true) ~= nil,
     "Boy is translated when drawn")
@@ -193,23 +208,52 @@ end
 -- home/text.asm:566
 do
   local Chrome = require("src.ui.gen2.Chrome")
-  local priorPrint, priorWrapped = Chrome.print, Chrome.printWrapped
-  local printed = {}
-  Chrome.print = function(text) printed[#printed + 1] = text end
-  Chrome.printWrapped = function(text) printed[#printed + 1] = text end
+  local priorPrint = Chrome.print
+  local printed, rows = {}, {}
+  Chrome.print = function(text, _tx, ty)
+    printed[#printed + 1] = text
+    rows[text] = ty
+  end
   local done = GenderSelect.new({ data = { text = {
     _AreYouABoyOrAreYouAGirlText = "Are you a boy?\nOr are you a girl?{DONE}",
   } } })
   eq(done.text, "Are you a boy?\nOr are you a girl?",
     "the {DONE} terminator is stripped from the prompt")
+  for _ = 1, 300 do
+    if done.typer:done() then break end
+    done:update(0)
+  end
   done:drawPanel()
   check(not table.concat(printed, "|"):find("DONE", 1, true),
     "and never reaches the tile grid")
+  -- ../pokecrystal/home/text.asm:473
+  eq(rows["Are you a boy?"], 14, "the prompt's first line sits on row 14")
+  eq(rows["Or are you a girl?"], 16, "and `line` drops the second to row 16")
   local prompt = GenderSelect.new({ data = { text = {
     _AreYouABoyOrAreYouAGirlText = "Are you a boy?{PROMPT}",
   } } })
   eq(prompt.text, "Are you a boy?", "nor is {PROMPT}")
-  Chrome.print, Chrome.printWrapped = priorPrint, priorWrapped
+  -- ../pokecrystal/home/print_text.asm:5
+  local slow = GenderSelect.new({
+    save = { options = { textSpeed = "SLOW" } },
+    data = { text = { _AreYouABoyOrAreYouAGirlText = "Are you a boy?" } },
+  })
+  check(slow.typer ~= nil and not slow.typer:done(),
+    "the prompt opens with nothing shown")
+  for _ = 1, 15 do slow:update(0) end
+  eq(slow.typer.shown, 3, "SLOW is one character every five frames")
+  printed = {}
+  slow:drawPanel()
+  check(table.concat(printed, "|"):find("Are", 1, true) ~= nil
+    and not table.concat(printed, "|"):find("boy", 1, true),
+    "and only the typed part reaches the tile grid")
+  local fast = GenderSelect.new({
+    save = { options = { textSpeed = "FAST" } },
+    data = { text = { _AreYouABoyOrAreYouAGirlText = "Are you a boy?" } },
+  })
+  for _ = 1, 15 do fast:update(0) end
+  eq(fast.typer.shown, 14, "FAST is one a frame, and the line is 14 long")
+  Chrome.print = priorPrint
 end
 
 -- ------------------------------------------------- the beat in Oak's speech
@@ -232,6 +276,27 @@ end
 eq(OakSpeech.defaultSteps()[1].id, "init_clock",
   "a bare call (no speech) is the Gold list")
 eq(#goldSteps + 1, #crystalSteps, "the Crystal list is the Gold list plus one")
+
+-- ../pokecrystal/engine/menus/intro_menu.asm:875
+do
+  local G = love.graphics
+  local priorScissor, clips = G.setScissor, {}
+  G.setScissor = function(x, y, w, h) clips[#clips + 1] = { x, y, w, h } end
+  for _, screen in ipairs({
+    setmetatable({}, OakSpeech),
+    GenderSelect.new({ data = {} }),
+    InitClock.new({}, { save = {} }),
+  }) do
+    clips = {}
+    screen:draw()
+    eq(#clips, 1, "draw scissors once")
+    eq(clips[1][1], 0, "at the panel origin")
+    eq(clips[1][2], 0, "at the panel origin")
+    eq(clips[1][3], 160, "over the LCD's own width")
+    eq(clips[1][4], 144, "and its height")
+  end
+  G.setScissor = priorScissor
+end
 
 -- ------------------------------------------------- the trainer card
 

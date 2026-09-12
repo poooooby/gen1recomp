@@ -436,6 +436,8 @@ function Game2:openStartMenu()
   if self.world and self.world.cancelMapNameSign then
     self.world:cancelMapNameSign()
   end
+  -- ../pokecrystal/engine/overworld/events.asm:494-510
+  if self.world and self.world.player then self.world.player:stopForEvent() end
   Screens.push(self, "Gen2StartMenu", {
     save = self.save,
     onClose = function() self.stack:pop() end,
@@ -550,7 +552,7 @@ function Game2:learnMoveOn(mon, moveId, onDone)
   end
   if ok then
     -- data/text/common_3.asm:119
-    return self:say(("%s learned\n%s!"):format(name, moveName),
+    return self:say(Strings("%s learned\n%s!", name, moveName),
       function() finish(true) end,
       TextBox.soundOpts(self, "Sfx_DexFanfare5079"))
   end
@@ -558,15 +560,14 @@ function Game2:learnMoveOn(mon, moveId, onDone)
   local askForget, pickMove, askStop
   -- DidNotLearnMoveText, then `ld b, 0` (learn.asm:110-113).
   local function decline()
-    self:say(("%s\ndid not learn\v%s."):format(name, moveName),
+    self:say(Strings("%s\ndid not learn\v%s.", name, moveName),
       function() finish(false) end)
   end
   -- ForgetMove's AskForgetMoveText + YesNoBox (learn.asm:123-127).
   askForget = function()
     self.stack:push(TextBox.new(self,
-      ("%s is\ntrying to learn\v%s.\fBut %s\ncan't learn more\vthan four moves."
-       .. "\fDelete an older\nmove to make room\vfor %s?")
-        :format(name, moveName, name, moveName),
+      Strings("%s is\ntrying to learn\v%s.\fBut %s\ncan't learn more\vthan four moves.\fDelete an older\nmove to make room\vfor %s?",
+        name, moveName, name, moveName),
       nil, { choice = function(yes)
         if yes then return pickMove() end
         return askStop()
@@ -575,7 +576,7 @@ function Game2:learnMoveOn(mon, moveId, onDone)
   -- StopLearningMoveText, whose NO is `jp c, .loop` (learn.asm:104-108).
   askStop = function()
     self.stack:push(TextBox.new(self,
-      ("Stop learning\n%s?"):format(moveName), nil,
+      Strings("Stop learning\n%s?", moveName), nil,
       { choice = function(yes)
         if yes then return decline() end
         return askForget()
@@ -598,7 +599,7 @@ function Game2:learnMoveOn(mon, moveId, onDone)
         -- MoveCantForgetHMText, then `jr .loop` (learn.asm:183-197): the
         -- question stays up and the list comes back over it.
         if old and HM_MOVES[old.id] then
-          return self:say("HM moves can't be\nforgotten now.", pushList)
+          return self:say(Strings("HM moves can't be\nforgotten now."), pushList)
         end
         self.stack:pop() -- the question the list stood on
         local oldDef = (self.data.moves or {})[old and old.id]
@@ -608,9 +609,8 @@ function Game2:learnMoveOn(mon, moveId, onDone)
         -- pokemon.move_learned is raised here too.
         ModRuntime.emit("pokemon.move_learned", { mon = mon, moveId = moveId })
         -- engine/pokemon/learn.asm:225-229, data/text/common_3.asm:165-173
-        self:say(("1, 2 and…" .. TextBox.PAUSE .. " Poof!" .. TextBox.PAUSE
-            .. "\f%s forgot\n%s.\fAnd…\f%s learned\n%s!")
-          :format(name, oldName, name, moveName),
+        self:say(Strings("1, 2 and…\1 Poof!\1\f%s forgot\n%s.\fAnd…\f%s learned\n%s!",
+            name, oldName, name, moveName),
           function() finish(true) end,
           TextBox.soundOpts(self, "Sfx_DexFanfare5079",
             { pauseSounds = { "Sfx_SwitchPokemon" } }))
@@ -620,7 +620,7 @@ function Game2:learnMoveOn(mon, moveId, onDone)
   -- MoveAskForgetText, a `done` text: the box stays while the list stands on
   -- it (learn.asm:136-137).
   pickMove = function()
-    self.stack:push(TextBox.new(self, "Which move should\nbe forgotten?", nil,
+    self.stack:push(TextBox.new(self, Strings("Which move should\nbe forgotten?"), nil,
       { stay = { onShown = pushList } }))
   end
   askForget()
@@ -655,13 +655,13 @@ function Game2:useFieldItem(itemId)
         if id == moveId then allowed = true end
       end
       if not allowed then
-        self:say(("%s can't learn %s!"):format(
+        self:say(Strings("%s can't learn %s!",
           require("src.battle.gen2.Mon").displayName(mon), moveName))
         return
       end
       for _, move in ipairs(mon.moves or {}) do
         if move.id == moveId then
-          self:say(("%s already knows %s!"):format(
+          self:say(Strings("%s already knows %s!",
             require("src.battle.gen2.Mon").displayName(mon), moveName))
           return
         end
@@ -856,6 +856,8 @@ end
 -- the cart's fixed messages to print, the same way the START handler above
 -- is the whole of .MenuReturns for its own button.
 function Game2:useSelectItem()
+  -- ../pokecrystal/engine/overworld/events.asm:494-510
+  if self.world.player then self.world.player:stopForEvent() end
   local outcome, itemId = self.world:useSelectItem()
   if outcome == "not_registered" then
     -- MayRegisterItemText.
@@ -973,6 +975,15 @@ function Game2:writeSave()
     if eng then pcall(eng.noteSaveWritten, eng) end
   end
   return written, err
+end
+
+-- engine/overworld/events.asm:241-244
+function Game2:quickSaveAllowed()
+  local w = self.world
+  if not w then return true end
+  if not (w.map and w.player) then return true end
+  if not w.acceptsMenuInput then return true end
+  return w:acceptsMenuInput() == true
 end
 
 function Game2:syncEngine()
@@ -1205,7 +1216,7 @@ function Game2:load(opts)
     -- to be visible to THIS logic tick, not the next one, and the cart's own
     -- canned stream must be able to overwrite it the way GetJoypad's arm
     -- overwrites the mirrors.  Payload is Gen 1's exactly: (game, fixed dt).
-    ModRuntime.call("input.step", noop, self, dt or 1 / 60)
+    ModRuntime.call("input.step", noop, self, dt or FixedStep.STEP)
     -- GetJoypad's AUTO_INPUT arm runs ahead of everything that reads the pad,
     -- and it overwrites the mirrors outright, so a stream frame has to land
     -- before Input:step promotes this tick's edges -- otherwise the canned
@@ -1226,7 +1237,7 @@ function Game2:load(opts)
     -- (audio/engine.asm:84, home/vblank.asm:141-143), never off the logic clock.
     local top = self.stack:top()
     if top and top.update then
-      top:update(1 / 60)
+      top:update(FixedStep.STEP)
       return
     end
     if self.phase ~= "play" or not self.world then return end
@@ -1576,8 +1587,18 @@ function Game2:drawViewportFrame()
   G.origin()
   G.setCanvas(scene)
   G.clear(0, 0, 0, 1)
+  -- A zoomed live overworld gets shaded at its own scale, so the stack that
+  -- sits over it is drawn onto a transparent layer and shaded at FIT instead.
+  self.fxUiLayer = nil
+  self.fxUiDrawn = false
+  if shaderfx and self.world and self.world.map
+     and self.world:zoomScale() ~= self.world:fitScale() then
+    self.fxUiLayer = self:presentCanvas(3, w, h)
+  end
   self:drawContained(w, h)
   G.setCanvas(previous)
+  local uiLayer = self.fxUiDrawn and self.fxUiLayer or nil
+  self.fxUiLayer = nil
 
   if composing and self:compose(scene, zones, w, h) then
     -- the mod owns the window this frame; the HUD still draws over it, as it
@@ -1600,6 +1621,15 @@ function Game2:drawViewportFrame()
       G.setCanvas(tinted)
       G.clear(0, 0, 0, 1)
       self:blitZones(scene, zones, w, h)
+      if uiLayer then
+        local tintedUi = self:presentCanvas(4, w, h)
+        if tintedUi then
+          G.setCanvas(tintedUi)
+          G.clear(0, 0, 0, 0)
+          self:blitZones(uiLayer, zones, w, h)
+          uiLayer = tintedUi
+        end
+      end
       G.setCanvas(previous)
       source = tinted
     end
@@ -1628,35 +1658,25 @@ function Game2:drawViewportFrame()
       local cx, cy, cw, ch = Playfield.cutout(w, h)
       if cx then G.setScissor(cx, cy, cw, ch) end
       if shaderfx then
-        -- rect is physical framebuffer pixels and source is the un-scaled
-        -- size, matching Renderer.lua's fxRectPx / fxSrc contract.
-        -- A live overworld draws edge to edge at World:zoomScale, so the
-        -- faithful 160*scale box would leave the rest of the map unshaded.
-        local rect, srcW, srcH
-        if self.frameWorldActive and self.world then
-          local s = self.world:zoomScale() * dpi
-          srcW = self.world.viewW or 160
-          srcH = self.world.viewH or 144
-          local rw, rh = srcW * s, srcH * s
-          rect = {
-            x = math.floor((pw - rw) / 2), y = math.floor((ph - rh) / 2),
-            w = rw, h = rh, scale = s,
-          }
-        else
-          srcW, srcH = 160, 144
-          rect = {
-            x = ox * dpi, y = oy * dpi,
-            w = 160 * scale * dpi, h = 144 * scale * dpi,
-            scale = scale * dpi,
-          }
+        -- Whole window, matching Renderer.lua: the world at its zoom scale
+        -- when the UI was split off, otherwise everything at FIT.
+        local s = scale * dpi
+        local ws = uiLayer and self.world:zoomScale() * dpi or s
+        ShaderFX.render(source, { x = 0, y = 0, w = pw, h = ph, scale = ws },
+          { w = pw / ws, h = ph / ws }, dpi, dpi)
+        if uiLayer then
+          ShaderFX.render(uiLayer, { x = 0, y = 0, w = pw, h = ph, scale = s },
+            { w = pw / s, h = ph / s }, dpi, dpi, { layer = "ui", mask = true })
         end
-        ShaderFX.render(source, rect, { w = srcW, h = srcH }, dpi, dpi)
       else
         G.setColor(1, 1, 1, 1)
         G.draw(source, 0, 0)
         G.setShader()
       end
       if cx then G.setScissor() end
+    elseif uiLayer then
+      G.setColor(1, 1, 1, 1)
+      G.draw(uiLayer, 0, 0)
     end
   end
   G.pop()
@@ -1716,19 +1736,41 @@ local function battleSurround(stack)
   for i = #states, 1, -1 do
     local state = states[i]
     if state and state.bgMode then
-      return state:bgMode(), state.BG_WORLD_DIM or 0.55
+      return state:bgMode(), state.BG_WORLD_DIM or 0.55, state, i
     end
   end
 end
 
 function Game2:paintBattleSurround(w, h)
-  local mode, dim = battleSurround(self.stack)
+  local mode, dim, owner, at = battleSurround(self.stack)
   if mode ~= "black" and mode ~= "world" then return end
   local alpha = mode == "world" and dim or 1
   if not alpha or alpha <= 0 then return end
   local G = love.graphics
   local scale, ox, oy = panelBlit(self.stack, w, h)
-  local pw, ph = 160 * scale, 144 * scale
+  local stack = self.stack
+  if at and stack and stack.visibleBase then
+    local base = stack:visibleBase()
+    if base and base > at then owner = stack.states[base] end
+  end
+  local sw, sh = 160, 144
+  if owner and owner.panelSize then sw, sh = owner:panelSize() end
+  if sw ~= 160 then
+    if owner.battlePanelScale then
+      scale = owner:battlePanelScale(w, h) or scale
+    end
+    ox, oy = Chrome.fitOriginFor(w, h, scale, sw / 8, sh / 8)
+  end
+  local pw, ph = sw * scale, sh * scale
+  if owner and owner.extendedHUD and owner:extendedHUD()
+     and stack and stack.top and stack:top() == owner then
+    if mode == "world" then return end
+    G.setColor(0, 0, 0, 1)
+    if ox > 0 then G.rectangle("fill", 0, 0, ox, h) end
+    if ox + pw < w then G.rectangle("fill", ox + pw, 0, w - ox - pw, h) end
+    G.setColor(1, 1, 1, 1)
+    return
+  end
   G.setColor(0, 0, 0, alpha)
   if oy > 0 then G.rectangle("fill", 0, 0, w, oy) end
   if oy + ph < h then G.rectangle("fill", 0, oy + ph, w, h - oy - ph) end
@@ -1875,6 +1917,15 @@ function Game2:drawScene(w, h)
     -- frames apart.
     self.frameWorldActive = true
     self:letterbox(w, h, true)
+    local layer = self.fxUiLayer
+    local sceneCanvas
+    if layer then
+      sceneCanvas = G.getCanvas()
+      G.setCanvas(layer)
+      G.clear(0, 0, 0, 0)
+      G.setCanvas(sceneCanvas)
+      self.fxUiDrawn = true
+    end
     self.world:draw()
     if self.stack:top() then
       -- ZOOM RESIZES THE MAP, NOT THE UI.  The world fills the window at
@@ -1890,11 +1941,13 @@ function Game2:drawScene(w, h)
       -- here.
       local s = self.world:fitScale()
       local ox, oy = Chrome.fitOrigin(w, h, s)
+      if layer then G.setCanvas(layer) end
       G.push()
       G.translate(ox, oy)
       G.scale(s, s)
       self.stack:draw()
       G.pop()
+      if layer then G.setCanvas(sceneCanvas) end
     end
     return
   end
@@ -1928,9 +1981,11 @@ function Game2:hotkey(key)
     self:persistOptions()
   end
   if key == "f1" then
+    if not self:quickSaveAllowed() then return true end
     self:writeSave()
     return true
   elseif key == "f2" then
+    if not self:quickSaveAllowed() then return true end
     local loaded = Save.load()
     if loaded then self:continueGame(loaded) end
     return true
@@ -1956,22 +2011,31 @@ function Game2:hotkey(key)
     return self:pipelineHotkey(key, options, persist)
   end
   if key == "-" or key == "kp-" then
-    self.world:zoomStep(-1)
-    options.zoom = require("src.render.Zoom").offset
-    persist()
+    self:zoomStep(-1)
     return true
   elseif key == "=" or key == "kp+" then
-    self.world:zoomStep(1)
-    options.zoom = require("src.render.Zoom").offset
-    persist()
+    self:zoomStep(1)
     return true
   elseif key == "4" then
     self.world:zoomCycle()
-    options.zoom = require("src.render.Zoom").offset
-    persist()
+    self:storeZoom()
     return true
   end
   return self:pipelineHotkey(key, options, persist)
+end
+
+function Game2:storeZoom()
+  local options = self.options or {}
+  self.options = options
+  options.zoom = require("src.render.Zoom").offset
+  if self.save then self.save.options = options end
+  self:persistOptions()
+end
+
+function Game2:zoomStep(delta)
+  if not (self.world and self.world.map) then return end
+  self.world:zoomStep(delta)
+  self:storeZoom()
 end
 
 -- The (top, overworld) pair src/render/Pipelines.lua's free-roam gate reads.
@@ -2006,32 +2070,48 @@ function Game2:pipelineHotkey(key, options, persist)
   return true
 end
 
+-- RFC 0020: see Game:keypressed's own comment (src/core/Game.lua) for the
+-- full precedent this restores -- fires before self:hotkey,
+-- before Input:keypressed, before anything else in this method.
 function Game2:keypressed(key)
-  -- Escape is NOT a quit key: src/core/Input.lua binds it to START, which is
-  -- how the start menu opens on a desktop keyboard.  Quitting is the start
-  -- menu's QUIT row and the intro menu's EXIT GAME.
-  -- A screen that is open owns the keyboard, the same way Game hands the top
-  -- state first refusal -- except for the display ladder, which is a host
-  -- control rather than a game button.  It runs during the boot cinema too:
-  -- the title screen and the intro menu are exactly where someone tries the
-  -- COLOR key, and the ladder's world-only rungs already refuse themselves
-  -- when there is no map.
-  if self:hotkey(key) then return end
-  Input:keypressed(key)
+  local function vanilla()
+    -- Escape is NOT a quit key: src/core/Input.lua binds it to START, which is
+    -- how the start menu opens on a desktop keyboard.  Quitting is the start
+    -- menu's QUIT row and the intro menu's EXIT GAME.
+    -- A screen that is open owns the keyboard, the same way Game hands the top
+    -- state first refusal -- except for the display ladder, which is a host
+    -- control rather than a game button.  It runs during the boot cinema too:
+    -- the title screen and the intro menu are exactly where someone tries the
+    -- COLOR key, and the ladder's world-only rungs already refuse themselves
+    -- when there is no map.
+    if self:hotkey(key) then return end
+    Input:keypressed(key)
+  end
+  if not ModRuntime.wantsHook("input.key") then return vanilla() end
+  return ModRuntime.call("input.key", vanilla, self, { phase = "pressed", key = key })
 end
 
 function Game2:keyreleased(key)
-  Input:keyreleased(key)
+  local function vanilla()
+    Input:keyreleased(key)
+  end
+  if not ModRuntime.wantsHook("input.key") then return vanilla() end
+  return ModRuntime.call("input.key", vanilla, self, { phase = "released", key = key })
 end
 
+-- RFC 0020: input.wheel is a plain observer -- see Game:wheelmoved's own
+-- comment (src/core/Game.lua).
 function Game2:wheelmoved(_x, dy)
-  if self.phase == "boot" or self.stack:top() then return end
-  if not (self.world and self.world.map) then return end
-  if dy > 0 then
-    self.world:zoomStep(1)
-  elseif dy < 0 then
-    self.world:zoomStep(-1)
+  local function vanilla()
+    if self.phase == "boot" or self.stack:top() then return end
+    if dy > 0 then
+      self:zoomStep(1)
+    elseif dy < 0 then
+      self:zoomStep(-1)
+    end
   end
+  if not ModRuntime.wantsHook("input.wheel") then return vanilla() end
+  return ModRuntime.call("input.wheel", vanilla, self, dy)
 end
 
 -- ---- the gameplay pointer seam (#807) --------------------------------------
@@ -2215,6 +2295,7 @@ function Game2:applyOptions()
   require("src.core.ScreenPosition").applyOptions(options)
   require("src.core.VSync").applyOptions(options)
   require("src.core.FrameCap").applyOptions(options)
+  require("src.core.LogicClock").applyOptions(options)
   require("src.core.PresentSync").applyFixedStepPeriod()
   require("src.world.gen2.BorderFill").applyOptions(options)
   -- returns true when a persisted preset name no longer resolves (deleted
@@ -2257,55 +2338,73 @@ end
 -- the PACK's move-item, the party menu's reorder and half the soft-reset chord
 -- (A+B+SELECT+START) were all unreachable from a pad, and pressing the button
 -- to find out killed the process.  It reaches Input like every other button now.
+-- RFC 0020: input.gamepad covers press/release/axis, see Game:gamepadpressed's
+-- own comment (src/core/Game.lua) for why, and for the precedent this
+-- restores.
 function Game2:gamepadpressed(joystick, button)
-  -- a controller is being used: the touch overlay steps aside until the next
-  -- screen touch (mobile only; a no-op elsewhere)
-  TouchControls:noteGamepad()
-  local selectHeld = Input:isDown("select")
-  if not selectHeld and joystick and joystick.isGamepadDown then
-    local ok, down = pcall(function()
-      return joystick:isGamepadDown("back")
-    end)
-    selectHeld = ok and down == true
-  end
-  local top = self.stack and self.stack:top()
-  if top and top.onGamepadPressed then
-    top:onGamepadPressed(button)
-    return
-  end
-  if not selectHeld then
-    local action = Input:padAction(button)
-    if action == "speedUp" then
-      self:_cycleSpeed(1)
-      return
-    elseif action == "speedDown" then
-      self:_cycleSpeed(-1)
+  local function vanilla()
+    -- a controller is being used: the touch overlay steps aside until the next
+    -- screen touch (mobile only; a no-op elsewhere)
+    TouchControls:noteGamepad()
+    local selectHeld = Input:isDown("select")
+    if not selectHeld and joystick and joystick.isGamepadDown then
+      local ok, down = pcall(function()
+        return joystick:isGamepadDown("back")
+      end)
+      selectHeld = ok and down == true
+    end
+    local top = self.stack and self.stack:top()
+    if top and top.onGamepadPressed then
+      top:onGamepadPressed(button)
       return
     end
-  end
-  if selectHeld then
-    local digit = GamepadMap.displayChordDigit(button)
-    if digit then
-      self:keypressed(digit)
-      return
+    if not selectHeld then
+      local action = Input:padAction(button)
+      if action == "speedUp" then
+        self:_cycleSpeed(1)
+        return
+      elseif action == "speedDown" then
+        self:_cycleSpeed(-1)
+        return
+      end
     end
-  end
-  -- START opens the start menu in the overworld; it used to quit, from before
-  -- there was a menu to open.
+    if selectHeld then
+      local digit = GamepadMap.displayChordDigit(button)
+      if digit then
+        self:keypressed(digit)
+        return
+      end
+    end
+    -- START opens the start menu in the overworld; it used to quit, from before
+    -- there was a menu to open.
 
-  Input:gamepadpressed(joystick, button)
+    Input:gamepadpressed(joystick, button)
+  end
+  if not ModRuntime.wantsHook("input.gamepad") then return vanilla() end
+  return ModRuntime.call("input.gamepad", vanilla, self,
+    { phase = "pressed", joystick = joystick, button = button })
 end
 
 function Game2:gamepadreleased(joystick, button)
-  Input:gamepadreleased(joystick, button)
-  local top = self.stack and self.stack:top()
-  if top and top.onGamepadReleased then top:onGamepadReleased(button) end
+  local function vanilla()
+    Input:gamepadreleased(joystick, button)
+    local top = self.stack and self.stack:top()
+    if top and top.onGamepadReleased then top:onGamepadReleased(button) end
+  end
+  if not ModRuntime.wantsHook("input.gamepad") then return vanilla() end
+  return ModRuntime.call("input.gamepad", vanilla, self,
+    { phase = "released", joystick = joystick, button = button })
 end
 
 function Game2:gamepadaxis(joystick, axis, value)
-  -- past-deadzone only, so resting-stick drift cannot hide the overlay
-  if math.abs(value) > 0.5 then TouchControls:noteGamepad() end
-  Input:gamepadaxis(joystick, axis, value)
+  local function vanilla()
+    -- past-deadzone only, so resting-stick drift cannot hide the overlay
+    if math.abs(value) > 0.5 then TouchControls:noteGamepad() end
+    Input:gamepadaxis(joystick, axis, value)
+  end
+  if not ModRuntime.wantsHook("input.gamepad") then return vanilla() end
+  return ModRuntime.call("input.gamepad", vanilla, self,
+    { phase = "axis", joystick = joystick, axis = axis, value = value })
 end
 
 -- The raw joystick road, same bodies as src/core/Game.lua:935 (#620, #632, #1570).

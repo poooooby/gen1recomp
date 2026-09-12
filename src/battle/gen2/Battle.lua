@@ -461,6 +461,8 @@ function Battle:endBattle(outcome)
   -- reaches the same restore through Battle:clearAllVolatiles, but a caller
   -- that ends a battle without a screen (every headless test, and the scripted
   -- exits) has to leave the party clean too -- Battle.party IS save.party.
+  self:pinIdentity(self.player)
+  self:pinIdentity(self.enemy)
   self:untransform(self.player)
   self:untransform(self.enemy)
   if self.endedEmitted then return end
@@ -499,6 +501,11 @@ end
 function Battle:monName(mon)
   if not mon then return "?" end
   return mon.nickname or mon.name or mon.species or "?"
+end
+
+-- ../pokecrystal/data/text/battle.asm:240-246
+function Battle.sentOutText(trainerName, monName)
+  return Strings("%s\nsent out\v%s!", trainerName, monName)
 end
 
 function Battle:moveDef(moveId)
@@ -1548,6 +1555,7 @@ function Battle:useMove(attacker, defender, moveId)
   -- move that missed or failed burns the delay and plays nothing at all.
   self.moveEvent = self:emit({ kind = "move", side = self:sideOf(attacker),
     move = moveId, wasVanished = wasVanished,
+    afterAnim = Effects.AFTER_ANIM[def.effect],
     text = Strings("%s\nused %s!", name, def.name or moveId) })
 
   -- battle.move_used, where BattleState:executeMove raises it on Gen 1: after
@@ -1663,7 +1671,7 @@ function Battle:useMove(attacker, defender, moveId)
     -- engine/battle/effect_commands.asm:5456-5458
     if self.moveEvent then
       self.moveEvent.animParam = 1
-      self.moveEvent.noAfterAnim = true
+      self.moveEvent.afterAnim = nil
     end
     -- BattleCommand_Charge picks the line off the MOVE, not the shared
     -- EFFECT_FLY (`cp DIG`, effect_commands.asm:5464).
@@ -2379,7 +2387,9 @@ end
 -- and stats, keeping its own HP and level.  Every copied move gets 5 PP.
 Battle.MOVE_EFFECTS.EFFECT_TRANSFORM = function(self, attacker, defender)
   local state = self:volatile(attacker)
-  if state.transformed or self:volatile(defender).substitute then
+  -- engine/battle/move_effects/transform.asm:7
+  if state.transformed or self:volatile(defender).substitute
+      or self:volatile(defender).vanished then
     return fail(self)
   end
   state.transformed = true
@@ -2459,6 +2469,15 @@ function Battle:untransform(mon)
   end
   state.preTransform = nil
   state.transformed = nil
+  return true
+end
+
+-- pokecrystal/engine/battle/core.asm:8294
+function Battle:pinIdentity(mon)
+  local state = mon and mon.volatile and mon.volatile.preTransform
+  if not state then return false end
+  self:emit({ kind = "identity", side = self:sideOf(mon), mon = mon,
+    species = mon.species, partySpecies = state.species })
   return true
 end
 
@@ -3554,8 +3573,7 @@ function Battle:resolveFaints()
       replacement = true,
       hp = self.enemy.hp or 0, status = self.enemy.status or false,
       level = self.enemy.level, experience = self.enemy.experience,
-      text = Strings("%s sent out %s!",
-        self.trainer and self.trainer.name or "Foe",
+      text = Battle.sentOutText(self.trainer and self.trainer.name or "Foe",
         self:monName(self.enemy)) })
     Runtime.emit("battle.battler_switched", {
       battle = self, side = self:sideRecord(self.enemy), battler = self.enemy,
@@ -3775,7 +3793,7 @@ function Battle:giveExperiencePass(loser, def, recipients, count, halved,
           text = Strings("%s grew to level %d!", self:monName(mon), mon.level),
           sfx = "Sfx_DexFanfare5079", waitSfx = true })
         for _, moveId in ipairs(result.learned) do
-          local ok, reason, entry = Mon.learnMove(mon, moveId, self.data)
+          local ok, reason, entry = self:learnPartyMove(mon, moveId)
           local moveDef = self:moveDef(moveId)
           local moveName = (moveDef and moveDef.name) or moveId
           if ok then
@@ -3910,20 +3928,43 @@ function Battle:awardExperience(loser)
   self:resetParticipants()
 end
 
+-- pokecrystal/engine/pokemon/learn.asm:88
+function Battle:partyMoves(mon)
+  local state = mon and mon.volatile and mon.volatile.preTransform
+  if state then
+    state.moves = state.moves or {}
+    return state.moves
+  end
+  return mon and mon.moves
+end
+
+function Battle:learnPartyMove(mon, moveId)
+  local state = mon and mon.volatile and mon.volatile.preTransform
+  if not state then return Mon.learnMove(mon, moveId, self.data) end
+  local copied = mon.moves
+  mon.moves = self:partyMoves(mon)
+  local ok, reason, entry = Mon.learnMove(mon, moveId, self.data)
+  state.moves = mon.moves
+  mon.moves = copied
+  return ok, reason, entry
+end
+
 -- The answer to a `choose-forget`: drop the move in `slot` and put the
 -- pending one there, then queue the cart's "forgot X / learned Y" lines.  The
 -- battle slot aliases the party slot the same way Mimic does, so a mon in play
 -- picks up the new move immediately.
 function Battle:resolveForget(index, slot, entry, moveName)
   local mon = self.party[index]
-  if not (mon and mon.moves and mon.moves[slot] and entry) then return false end
-  local old = mon.moves[slot]
+  local moves = self:partyMoves(mon)
+  if not (mon and moves and moves[slot] and entry) then return false end
+  local old = moves[slot]
   local oldDef = self:moveDef(old.id)
   local oldName = (oldDef and oldDef.name) or old.id
-  mon.moves[slot] = entry
+  moves[slot] = entry
   -- Keep the in-play battler's move list pointing at the same table, so a mon
   -- that levelled mid-battle fights the rest of it with the new move.
-  if self.player == mon and self.player.moves ~= mon.moves then
+  if self.player == mon and moves == mon.moves
+      and self.player.moves ~= mon.moves then
     self.player.moves = mon.moves
   end
   -- ../pokecrystal/home/text.asm:887-896
@@ -4546,8 +4587,7 @@ function Battle:switchEnemy(index)
   self:emit({ kind = "send", side = "enemy", mon = self.enemy,
     hp = self.enemy.hp or 0, status = self.enemy.status or false,
     level = self.enemy.level, experience = self.enemy.experience,
-    text = Strings("%s sent out %s!", trainerName,
-      self:monName(self.enemy)) })
+    text = Battle.sentOutText(trainerName, self:monName(self.enemy)) })
   Runtime.emit("battle.battler_switched", {
     battle = self, side = self:sideRecord(self.enemy), battler = self.enemy,
     previous = outgoing,
@@ -5313,8 +5353,8 @@ function Battle:forcedReplacement(side, index)
     self:emit({ kind = "send", side = "enemy", mon = mon, replacement = true,
       hp = mon.hp or 0, status = mon.status or false,
       level = mon.level, experience = mon.experience,
-      text = Strings("%s sent out %s!",
-        (self.trainer and self.trainer.name) or "Foe", self:monName(mon)) })
+      text = Battle.sentOutText((self.trainer and self.trainer.name) or "Foe",
+        self:monName(mon)) })
     Runtime.emit("battle.battler_switched", {
       battle = self, side = self:sideRecord(mon), battler = mon,
       previous = previous,

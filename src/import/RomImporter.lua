@@ -1351,6 +1351,7 @@ function RomImporter.new(onComplete, opts)
   local self = setmetatable({
     onComplete = onComplete,
     launcher = opts.launcher or false,
+    cartShape = os.getenv("POKEPORT_CART_SHAPE") == "gba" and "gba" or nil,
     forceImport = opts.forceImport or false,
     onEditSave = opts.onEditSave,
     onEditTouchControls = opts.onEditTouchControls,
@@ -2670,6 +2671,12 @@ function RomImporter:_deleteSlot(scope, id)
   if self.workState == "working" then return end
   local SaveData = require("src.core.SaveData")
   local cart = cartOfScope(scope)
+  local eng = self:_syncEngine()
+  local syncKey
+  if eng and eng.saves and type(eng.saves.keyForSlot) == "function" then
+    local okKey, key = pcall(eng.saves.keyForSlot, scope, id)
+    syncKey = okKey and key or nil
+  end
   local ok, err
   if cart then
     ok, err = SaveData.deleteCartSlot(cart, id)
@@ -2677,6 +2684,7 @@ function RomImporter:_deleteSlot(scope, id)
     ok, err = SaveData.deleteSlot(scope, id)
   end
   if ok then
+    if eng and syncKey then pcall(eng.noteSaveDeleted, eng, syncKey) end
     self:_refreshSlots(scope)
     self.saveNotice[scope] = { ok = true, text = "Deleted " .. tostring(id) .. "." }
   else
@@ -3176,10 +3184,48 @@ function RomImporter:prepareOverlayHandoff()
   end
 end
 
+-- EXIT GAME / Close editor leave the confirming finger still down, often
+-- sitting where Import Save is drawn.  The launcher must not treat that
+-- leftover hold as a new press once a short suppress window expires
+-- (#2079): update() would then arm on the still-down pointer and the
+-- later lift would open the system file picker.  Swallow this gesture
+-- (held mouse, already-down touches) and debounce clicks briefly.
+local RETURN_POINTER_HOLD = 0.5
+
+function RomImporter:ignoreReturningPointer()
+  local now = 0
+  if love.timer and love.timer.getTime then
+    now = love.timer.getTime()
+  end
+  self._suppressClickUntil = now + RETURN_POINTER_HOLD
+  self._suppressMouseUntil = now + RETURN_POINTER_HOLD
+  self._clickPt = nil
+  self._mouseAt = nil
+  self._touchAt = nil
+  -- Already-down is not a rising edge.  Always mark the poll as held so
+  -- the first frame after remount cannot mint a press from a leftover.
+  self._prevMouseDown = true
+  local ignore = {}
+  if love.touch and love.touch.getTouches then
+    local ok, ids = pcall(love.touch.getTouches)
+    if ok and type(ids) == "table" then
+      for i = 1, #ids do
+        ignore[tostring(ids[i])] = true
+      end
+    end
+  end
+  self._ignoreTouch = ignore
+  if package.loaded["src.ui.kit.Kit"] then
+    local Kit = require("src.ui.kit.Kit")
+    if Kit.dragEnd then pcall(Kit.dragEnd) end
+  end
+end
+
 -- After an overlay closes: re-arm the pad cursor when a stick is already
 -- connected so NX / handhelds are not stranded without a pointer until the
 -- next stick bump (same class of bug as opening Touch Controls).
 function RomImporter:resumeAfterOverlay()
+  self:ignoreReturningPointer()
   if not self.launcher then return end
   if not (love.joystick and love.joystick.getJoystickCount) then return end
   if love.joystick.getJoystickCount() <= 0 then return end
@@ -4222,6 +4268,12 @@ function RomImporter:_syncNoteDownload(row)
     local ok, found = pcall(self._cartById, self, version, cart)
     what = (ok and type(found) == "table" and found.title) or cart
   end
+  if row.removed then
+    self.saveNotice[scope] = { ok = true,
+      text = ("Removed %s, deleted%s."):format(tostring(row.slot),
+        row.device and (" on " .. tostring(row.device)) or " on another device") }
+    return
+  end
   self.saveNotice[scope] = { ok = true,
     text = what
       and ("Downloaded a %s save%s into %s."):format(
@@ -4300,6 +4352,12 @@ function RomImporter:_syncNow()
   local eng = self:_syncEngine()
   if not eng then return false end
   return eng:syncNow()
+end
+
+function RomImporter:_syncCodes()
+  local eng = self:_syncEngine()
+  if not eng then return false end
+  return eng:reissueCodes()
 end
 
 function RomImporter:_syncUnlink()
@@ -6345,6 +6403,7 @@ function RomImporter:_pumpCartInstall()
   self:_refreshCarts(cart.base)
   self._cartPlan = nil
   self._cartridgeLabels = nil
+  self._gbaLabels = nil
   if not job.quiet then
     self.findNotice = { ok = true,
       text = Strings("Installed %s v%s. It is in this game's cart list now.",

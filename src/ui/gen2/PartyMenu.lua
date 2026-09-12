@@ -30,6 +30,7 @@ local Screens = require("src.ui.Screens")
 local Sound = require("src.core.Sound")
 local Status = require("src.battle.Status")
 local Strings = require("src.core.Strings")
+local WaitPlaySFX = require("src.ui.gen2.WaitPlaySFX")
 
 local PartyMenu = {}
 PartyMenu.__index = PartyMenu
@@ -166,6 +167,7 @@ function PartyMenu.new(game, opts)
   self.submenu = nil
   -- The held slot while SwitchPartyMons' second pick is open; nil otherwise.
   self.switchFrom = nil
+  self.repeatSfx = nil
   -- ../pokecrystal/engine/items/item_effects.asm:2016
   self.softboiledFrom = nil
   self.softboiledCost = nil
@@ -344,14 +346,8 @@ function PartyMenu:finishSwitch()
   if self.save and self.save.party == party then
     Mail.swapSlots(self.save, from, to)
   end
-  -- engine/pokemon/switchpartymons.asm:38
-  local data = self.game and self.game.data
-  local ok, Sound = pcall(require, "src.core.Sound")
-  if not (ok and data and Sound and Sound.play) then return end
-  local sfx = data.audio and data.audio.sfx
-  if sfx and sfx[Sound.resolve(data, "Sfx_SwitchPokemon")] then
-    pcall(Sound.play, data, "Sfx_SwitchPokemon")
-  end
+  -- engine/pokemon/switchpartymons.asm:13
+  self:playSfxTwice("Sfx_SwitchPokemon")
 end
 
 -- The reopened list: InitPartyMenuNoCancel caps the cursor at the last mon,
@@ -400,7 +396,7 @@ function PartyMenu:finishSoftboiled()
   local before, after =
     FieldMoves.softboiledTransfer(user, target, self.softboiledCost or 0)
   if not before then
-    self:showItemResult(slot, { text = ItemEffects.TEXT_CANT_USE_ON_MON })
+    self:showItemResult(slot, { text = Strings(ItemEffects.TEXT_CANT_USE_ON_MON) })
     return
   end
   self.softboiledFrom, self.softboiledCost = nil, nil
@@ -579,8 +575,12 @@ function PartyMenu:updateSubmenu(input)
   elseif input:wasPressed("down") then
     menu.index = menu.index < total and menu.index + 1 or 1
   elseif input:wasPressed("b") then
+    -- engine/pokemon/mon_submenu.asm:50
+    self:playSfx("Sfx_ReadText2")
     self:closeSubmenu()
   elseif input:wasPressed("a") then
+    -- engine/pokemon/mon_submenu.asm:50
+    self:playSfx("Sfx_ReadText2")
     local item = menu.items[menu.index]
     local mon = menu.mon
     local slot = menu.slot or self.index
@@ -624,6 +624,26 @@ function PartyMenu:playSfx(name)
   if sfx and sfx[Sound.resolve(data, name)] then Sound.play(data, name) end
 end
 
+-- engine/pokemon/switchpartymons.asm:13
+function PartyMenu:playSfxTwice(name)
+  local data = self.game and self.game.data
+  local sfx = data and data.audio and data.audio.sfx
+  if not (sfx and Sound.resolve and Sound.play) then return end
+  if not sfx[Sound.resolve(data, name)] then return end
+  self:playSfx(name)
+  self.repeatSfx = WaitPlaySFX.arm(name)
+end
+
+-- home/audio.asm:225
+function PartyMenu:tickRepeatSfx()
+  local pending = self.repeatSfx
+  if not pending then return false end
+  if WaitPlaySFX.waiting(pending) then return true end
+  self.repeatSfx = nil
+  self:playSfx(pending.name)
+  return false
+end
+
 -- engine/items/item_effects.asm:1671
 function PartyMenu:showItemResult(slot, opts)
   opts = opts or {}
@@ -632,13 +652,22 @@ function PartyMenu:showItemResult(slot, opts)
     shown = opts.fromHp,
     target = opts.toHp,
     text = opts.text,
-    delay = PartyMenu.ACTION_TEXT_DELAY,
+    delay = opts.delay or PartyMenu.ACTION_TEXT_DELAY,
     onDone = opts.onDone,
     auto = opts.auto,
     holdSlot = opts.holdSlot,
     holdHp = opts.holdHp,
   }
   if opts.sfx then self:playSfx(opts.sfx) end
+end
+
+-- ../pokecrystal/engine/battle/core.asm:5156
+-- ../pokecrystal/home/text.asm:124
+function PartyMenu:refuse(text)
+  self:closeSubmenu()
+  local lines = Chrome.wrap(text, 18)
+  for i = #lines, 3, -1 do lines[i] = nil end
+  self:showItemResult(nil, { text = table.concat(lines, "\n"), delay = 0 })
 end
 
 function PartyMenu:itemResultClimbing()
@@ -683,6 +712,8 @@ function PartyMenu:update(_dt)
   self.clock = self.clock + 1
   local input = self.game and self.game.input
   if not input then return end
+  -- home/audio.asm:225
+  if self:tickRepeatSfx() then return end
   if self.itemResult then
     self:updateItemResult(input)
     return
@@ -716,6 +747,8 @@ function PartyMenu:update(_dt)
   elseif input:wasPressed("down") then
     self.index = self.index < total and self.index + 1 or 1
   elseif input:wasPressed("a") then
+    -- engine/pokemon/party_menu.asm:694
+    self:playSfx("Sfx_ReadText2")
     self:storeCursor()
     if self:isCancel() then
       if self.onCancel then self.onCancel() end
@@ -732,6 +765,8 @@ function PartyMenu:update(_dt)
       self.onChoose(self.index, mon)
     end
   elseif input:wasPressed("b") then
+    -- engine/pokemon/party_menu.asm:701
+    self:playSfx("Sfx_ReadText2")
     self:storeCursor()
     if self.onCancel then self.onCancel() end
   end

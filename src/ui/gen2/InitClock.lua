@@ -25,7 +25,10 @@
 
 local Chrome = require("src.ui.gen2.Chrome")
 local Clock = require("src.core.gen2.Clock")
+local GbcPalette = require("src.render.GbcPalette")
+local IntroFade = require("src.ui.gen2.IntroFade")
 local Strings = require("src.core.Strings")
+local Typer = require("src.ui.gen2.Typer")
 
 local InitClock = {}
 InitClock.__index = InitClock
@@ -60,6 +63,20 @@ InitClock.TEXT = TEXT
 -- same three and has always had them right.
 local MORN_HOUR, DAY_HOUR, NITE_HOUR = 4, 10, 18
 
+-- ../pokecrystal/engine/rtc/timeset.asm:24
+InitClock.GROUND = { 0, 0, 0 }
+
+-- pokecrystal/engine/gfx/cgb_layouts.asm:517
+InitClock.PALETTE = {
+  { 255, 255, 255 }, { 247, 181, 140 }, { 132, 115, 156 }, { 0, 0, 0 },
+}
+
+-- ../pokecrystal/home/text.asm:108
+function InitClock:palette()
+  if self.mode == "day" then return Chrome.DEFAULT_BOX_PALETTE end
+  return InitClock.PALETTE
+end
+
 -- Clock.DAY_NAMES / Clock.weekdayName is the single translated home for this
 -- table: MainMenu's clock box and the Pokegear's clock card read the same
 -- weekday off the same save and must never disagree about what it is
@@ -67,8 +84,9 @@ local MORN_HOUR, DAY_HOUR, NITE_HOUR = 4, 10, 18
 local DAYS = Clock.DAY_NAMES
 InitClock.DAYS = DAYS
 
-function InitClock:wantsFillScale() return true end
-function InitClock:drawsWidescreen() return true end
+-- ../pokecrystal/engine/rtc/timeset.asm:385
+function InitClock:wantsFillScale() return self.mode ~= "day" end
+function InitClock:drawsWidescreen() return self.mode ~= "day" end
 
 -- PrintHour (engine/rtc/timeset.asm:672) is GetTimeOfDayString + PlaceString,
 -- then AdjustHourForAMorPM as a left-aligned two-digit number.  So the cart
@@ -123,6 +141,8 @@ function InitClock.new(game, opts)
   local self = setmetatable({}, InitClock)
   self.game = game
   self.mode = opts.mode == "day" and "day" or "clock"
+  -- ../pokecrystal/engine/rtc/timeset.asm:385
+  self.isOpaque = self.mode ~= "day"
   self.save = opts.save or (game and game.save)
   self.onDone = opts.onDone
   self.autoConfirm = opts.autoConfirm or false
@@ -139,16 +159,52 @@ function InitClock.new(game, opts)
   -- (a \f here) on a button press like any other text box, and Oak's opening
   -- is three lines long over two of them.
   self.page = 1
+  -- ../pokecrystal/home/print_text.asm:5
+  self.typer = Typer.new(game, {
+    instant = self.autoConfirm or self.mode == "day",
+  })
+  self:startText()
+  self.fades = opts.fades and self.mode ~= "day" and not self.autoConfirm
+  if self.fades then
+    -- ../pokecrystal/engine/rtc/timeset.asm:22, :42
+    if opts.faded then
+      IntroFade.run(self, { "inBlack" })
+    else
+      -- ../pokecrystal/engine/menus/intro_menu.asm:42-49, :65
+      self.blank = true
+      IntroFade.run(self, { "outBlack" }, function()
+        self.blank = false
+        IntroFade.run(self, { "inBlack" })
+      end)
+    end
+  end
   return self
+end
+
+function InitClock:startText()
+  if self.typer then self.typer:start(self:pageText()) end
 end
 
 -- The current question, split into its pages.
 function InitClock:pages()
+  local question = self:question()
+  if self.pagesText == question and self.pagesCache then
+    return self.pagesCache
+  end
   local out = {}
-  for page in (self:question() .. "\f"):gmatch("(.-)\f") do
-    if page ~= "" then out[#out + 1] = page end
+  for page in (question .. "\f"):gmatch("(.-)\f") do
+    if page ~= "" then
+      local lines = {}
+      for line in (page .. "\n"):gmatch("(.-)\n") do lines[#lines + 1] = line end
+      -- ../pokecrystal/home/text.asm:502
+      out[#out + 1] = table.concat({ lines[1], lines[2] }, "\n")
+      for i = 3, #lines do
+        out[#out + 1] = table.concat({ lines[i - 1], lines[i] }, "\n")
+      end
+    end
   end
   if #out == 0 then out[1] = "" end
+  self.pagesText, self.pagesCache = question, out
   return out
 end
 
@@ -224,7 +280,12 @@ function InitClock:finish()
     return
   end
   Clock.setTime(self.save, self.hour, self.minute)
-  if self.onDone then self.onDone(self.hour, self.minute) end
+  local function done()
+    if self.onDone then self.onDone(self.hour, self.minute) end
+  end
+  -- ../pokecrystal/engine/menus/intro_menu.asm:628
+  if self.fades then return IntroFade.run(self, { "outBlack" }, done) end
+  done()
 end
 
 -- A on a picker confirms it, YES on a confirmation takes it, NO drops back to
@@ -233,6 +294,7 @@ function InitClock:accept()
   -- A on a page that has more behind it turns the page, the way `para` does.
   if self:morePages() then
     self.page = self.page + 1
+    self:startText()
     return
   end
   self.page = 1
@@ -247,12 +309,14 @@ function InitClock:accept()
   elseif self.phase == "confirm-minute" then
     self.phase = "response"
   elseif self.phase == "response" then
-    self:finish()
+    -- ../pokecrystal/engine/menus/intro_menu.asm:628
+    return self:finish()
   elseif self.phase == "day" then
     self.phase = "confirm-day"
   elseif self.phase == "confirm-day" then
-    self:finish()
+    return self:finish()
   end
+  self:startText()
 end
 
 function InitClock:decline()
@@ -263,9 +327,12 @@ function InitClock:decline()
   elseif self.phase == "confirm-day" then
     self.phase = "day"
   end
+  self:startText()
 end
 
 function InitClock:update(_dt)
+  -- ../pokecrystal/home/fade.asm:22-101
+  if IntroFade.advance(self) then return end
   -- The driver path: no screen this new may be allowed to stall a scripted
   -- run, so it walks itself to the end taking every default.
   if self.autoConfirm then
@@ -273,6 +340,13 @@ function InitClock:update(_dt)
     return
   end
   local input = self.game and self.game.input
+  -- ../pokecrystal/home/print_text.asm:5, ../pokecrystal/home/text.asm:473
+  if self.typer and not self.typer:tick() then
+    if input and (input:wasPressed("a") or input:wasPressed("b")) then
+      self.typer.shown = self.typer.total
+    end
+    return
+  end
   if not input then return end
   if self:confirming() and not self:morePages() then
     -- YesNoBox: the cursor walks two rows and B is NO.
@@ -313,14 +387,16 @@ end
 -- Four pixel rows, widest at the base, which is what the two 1bpp tiles are.
 local ARROW_ROWS = { 1, 3, 5, 7 }
 
-local function arrow(tx, ty, up)
+local function arrow(tx, ty, up, pal)
   local G = love.graphics
   local x, y = tx * 8, ty * 8
+  local paper = GbcPalette.color(pal, 1) or pal[1]
+  local ink = GbcPalette.color(pal, 4) or pal[4]
   -- The arrow tile REPLACES the border tile it lands on (hlcoord 11, 7 is the
   -- box's own top row), so the cell is cleared before it is drawn.
-  G.setColor(1, 1, 1, 1)
+  G.setColor(paper[1] / 255, paper[2] / 255, paper[3] / 255, 1)
   G.rectangle("fill", x, y, 8, 8)
-  G.setColor(0, 0, 0, 1)
+  G.setColor(ink[1] / 255, ink[2] / 255, ink[3] / 255, 1)
   for i, width in ipairs(ARROW_ROWS) do
     local row = up and (i - 1) or (#ARROW_ROWS - i)
     G.rectangle("fill", x + math.floor((8 - width) / 2), y + 2 + row, width, 1)
@@ -329,43 +405,62 @@ local function arrow(tx, ty, up)
 end
 
 function InitClock:drawPanel()
-  Chrome.clear()
+  -- ../pokecrystal/engine/menus/intro_menu.asm:42-49
+  local palette = self:palette()
+  if self.blank then
+    Chrome.paletteFill(0, 0, Chrome.SCREEN_W * 8, Chrome.SCREEN_H * 8, palette)
+    love.graphics.setColor(1, 1, 1, 1)
+    return
+  end
+  -- ../pokecrystal/engine/rtc/timeset.asm:22-32
+  if self.mode ~= "day" then
+    local G = love.graphics
+    local ground = GbcPalette.color(palette, 4) or InitClock.GROUND
+    G.setColor(ground[1] / 255, ground[2] / 255, ground[3] / 255, 1)
+    G.rectangle("fill", 0, 0, Chrome.SCREEN_W * 8, Chrome.SCREEN_H * 8)
+    G.setColor(1, 1, 1, 1)
+  end
   local value = self:display()
   if value then
     local bx, by, bw, bh, arrowX, tx, ty = self:pickerBox()
-    Chrome.textbox(bx, by, bw, bh)
+    Chrome.paletteBox(bx, by, bw + 2, bh + 2, palette)
     -- The two arrows sit ON the border rows, which is why they are placed
     -- after the box rather than inside it.
-    arrow(arrowX, by, true)
-    arrow(arrowX, by + bh + 1, false)
-    Chrome.print(value, tx, ty)
+    arrow(arrowX, by, true, palette)
+    arrow(arrowX, by + bh + 1, false, palette)
+    Chrome.printThrough(value, tx, ty, palette)
   end
   -- The question (and the confirmations) share the bottom textbox every other
   -- Gold prompt uses.
-  Chrome.textbox(0, 12, 18, 4)
-  Chrome.printWrapped(self:pageText(), 1, 14, 18, 3)
+  Chrome.paletteBox(0, 12, 20, 6, palette)
+  -- ../pokecrystal/home/text.asm:473
+  Chrome.printWrapped(table.concat(Typer.text(self, {}), "\n"), 1, 14, 18, 2, 2,
+    palette)
   if self:confirming() then
-    Chrome.box(14, 6, 6, 5)
-    Chrome.print(Strings("YES"), 16, 7)
-    Chrome.print(Strings("NO"), 16, 9)
-    Chrome.cursor(15, self.yesNo == 1 and 7 or 9)
+    -- ../pokecrystal/home/menu.asm:418
+    Chrome.paletteBox(14, 7, 6, 5, palette)
+    Chrome.printThrough(Strings("YES"), 16, 8, palette)
+    Chrome.printThrough(Strings("NO"), 16, 10, palette)
+    Chrome.cursorThrough(15, self.yesNo == 1 and 8 or 10, palette)
   end
 end
 
+function InitClock:drawBody()
+  IntroFade.paint(self, Chrome.SCREEN_W * 8, Chrome.SCREEN_H * 8,
+    function() self:drawPanel() end)
+end
+
 function InitClock:draw()
-  self:drawPanel()
+  Chrome.withClip(function() self:drawBody() end)
 end
 
 function InitClock:drawWidescreen(winW, winH)
-  local G = love.graphics
-  Chrome.letterbox(winW, winH, 1, 1, 1)
-  local scale = Chrome.fitScale(winW, winH)
-  local ox, oy = Chrome.fitOrigin(winW, winH, scale)
-  G.push()
-  G.translate(ox, oy)
-  G.scale(scale, scale)
-  self:drawPanel()
-  G.pop()
+  local ground = InitClock.GROUND
+  local r, g, b = ground[1] / 255, ground[2] / 255, ground[3] / 255
+  if self.blank then r, g, b = 1, 1, 1 end
+  local index = self.blank and 1 or 4
+  r, g, b = IntroFade.surround(self, self:palette(), r, g, b, index)
+  Chrome.withPanel(winW, winH, r, g, b, function() self:drawBody() end)
 end
 
 return InitClock

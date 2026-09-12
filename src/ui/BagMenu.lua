@@ -13,6 +13,9 @@ local BagMenu = {}
 local Bag = require("src.inventory.Bag")
 local Strings = require("src.core.Strings")
 
+-- (engine/menus/start_sub_menus.asm:414-416, home/list_menu.asm:56-82)
+local BAG_RETURN_WHITE = 19
+
 -- acquisition order like wBagItems (Bag.order), not alphabetical
 local function buildItems(game)
   local items = {}
@@ -86,8 +89,14 @@ end
 local function vanillaUseOn(game, battle, id, target, list, moveIndex, picker)
   local result, payload, extra = ItemEffects.use(game.data, game.save, id, target,
                                                  battle, moveIndex, game.overworld)
+  -- engine/menus/start_sub_menus.asm:410-416, home/list_menu.asm:56-82
+  -- engine/items/item_effects.asm:1244
   local function closePicker()
-    if picker then picker:close() end
+    if not picker then return end
+    picker:close()
+    if battle then return end
+    local Transition = require("src.render.Transition")
+    game.stack:push(Transition.whiteFlash(game, BAG_RETURN_WHITE))
   end
 
   -- .useItem_closeMenu ends at CloseStartMenu, so the START menu kept open
@@ -376,8 +385,9 @@ local function vanillaUseOn(game, battle, id, target, list, moveIndex, picker)
       -- mashing A burns through a stack of them (#796)
       -- RareCandyText carries sound_get_item_1
       -- (engine/menus/party_menu.asm:289-293)
-      -- engine/items/item_effects.asm:1394
+      -- pokered engine/items/item_effects.asm:1392-1394
       if picker and picker.eraseCursors then picker:eraseCursors() end
+      if picker and picker.setMessage then picker:setMessage(payload[1]) end
       showMessages(game, payload, function()
         local StatBox = require("src.battle.BattleState").StatBox
         local statBox
@@ -489,7 +499,8 @@ local function pickTargetAndUse(game, battle, id, list)
     -- the party menu (item_effects.asm:1392-1418); TM/HM stays up through
     -- `predef LearnMove` (item_effects.asm:2238) (#1686)
     -- engine/items/item_effects.asm:805 ItemUseMedicine, :1244 .done (#1946)
-    keepOpen = ItemEffects.healsHP(id)
+    -- engine/items/item_effects.asm:1959
+    keepOpen = ItemEffects.healsHP(id) or wantsMove
       or ((not battle)
           and (ItemEffects.keepsPartyMenuOpen(id) or (def and def.machine ~= nil))),
     onSwitch = function(mon, picker)
@@ -497,21 +508,16 @@ local function pickTargetAndUse(game, battle, id, list)
         useOn(game, battle, id, mon, list, nil, picker)
         return
       end
-      local rows = {}
-      for mi, mv in ipairs(mon.moves) do
-        local mdef = game.data.moves[mv.id]
-        table.insert(rows, {
-          value = mi,
-          label = mdef and mdef.name or mv.id,
-          right = ("%d"):format(mv.pp),
-        })
-      end
-      game.stack:push(ListMenu.new(game, Strings.source("Which move?"), rows, {
-        onChoose = function(row, l)
-          l:close()
-          useOn(game, battle, id, mon, list, row.value)
-        end,
-      }))
+      -- engine/items/item_effects.asm:1973
+      local prompt = (id == "PP_UP")
+        and romText(game.data, "_RaisePPWhichTechniqueText",
+                    "Raise PP of which\ntechnique?")
+        or romText(game.data, "_RestorePPWhichTechniqueText",
+                   "Restore PP of\nwhich technique?")
+      require("src.ui.Screens").push(game, "MoveSelectMenu", mon, prompt,
+        function(moveIndex)
+          useOn(game, battle, id, mon, list, moveIndex, picker)
+        end)
     end,
   }
   -- TM/HM: open the party menu in Gen 1's TM/HM display mode so each mon
@@ -625,26 +631,48 @@ function BagMenu.new(game, opts)
         { label = Strings("USE"), onSelect = function()
             useItem(game, battle, id, list)
           end },
-        { label = Strings("TOSS"), onSelect = function()
+        { label = Strings("TOSS"), keepOpen = true, onSelect = function()
+            -- engine/menus/start_sub_menus.asm:362
+            local menu = game.stack:top()
+            menu.hollowIndex = menu.index
+            -- engine/menus/start_sub_menus.asm:298-300, 438-439
+            local function itemMenuLoop(pops)
+              for _ = 1, pops do game.stack:pop() end
+              list.items = buildItems(game)
+              list.index = math.min(list.index, math.max(1, #list.items))
+            end
             -- KeyItemFlags + HMs decide tossability (not price:
             -- MOON STONE is price 0 but tossable)
+            local t = game.data.text or {}
             if not def or def.keyItem or id:find("^HM_") then
-              showMessages(game, { Strings("That's too impor-\ntant to toss!") })
+              showMessages(game, { t._TooImportantToTossText
+                or Strings("That's too impor-\ntant to toss!") },
+                function() itemMenuLoop(1) end)
               return
             end
             local QuantityBox = require("src.ui.QuantityBox")
             game.stack:push(QuantityBox.new(game, {
               max = game.save.inventory[id] or 1,
+              keepOpen = true,
               onDone = function(qty)
-                if not qty then return end
-                local ChoiceBox = require("src.ui.ChoiceBox")
-                game.stack:push(ChoiceBox.new(game, function(yes)
-                  if not yes then return end
-                  Bag.remove(game.save, id, qty)
-                  list.items = buildItems(game)
-                  list.index = math.min(list.index, math.max(1, #list.items))
-                  showMessages(game, { Strings("Threw away\n%s.", def and def.name or id) })
-                end))
+                if not qty then itemMenuLoop(2) return end
+                local name = def and def.name or id
+                -- engine/items/item_effects.asm:2564-2591
+                game.stack:push(TextBox.new(game,
+                  (t._IsItOKToTossItemText or Strings("Is it OK to toss\n%s?", name))
+                    :gsub("{RAM:wStringBuffer}", name), nil,
+                  { stay = { prompt = true, onShown = function()
+                    local ChoiceBox = require("src.ui.ChoiceBox")
+                    game.stack:push(ChoiceBox.new(game, function(yes)
+                      game.stack:pop()
+                      if not yes then itemMenuLoop(2) return end
+                      Bag.remove(game.save, id, qty)
+                      showMessages(game, {
+                        ((t._ThrewAwayItemText or Strings("Threw away\n%s.", name))
+                          :gsub("{RAM:wNameBuffer}", name)) },
+                        function() itemMenuLoop(2) end)
+                    end, { anchor = "bottom" }))
+                  end } }))
               end,
             }))
           end },

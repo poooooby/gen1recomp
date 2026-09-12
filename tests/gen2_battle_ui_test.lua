@@ -24,6 +24,7 @@ local Mon = require("src.battle.gen2.Mon")
 local PackMenu = require("src.ui.gen2.PackMenu")
 local PartyMenu = require("src.ui.gen2.PartyMenu")
 local Sound = require("src.core.Sound")
+local Typer = require("src.ui.gen2.Typer")
 
 -- ---------------------------------------------------------------- fixtures
 
@@ -878,10 +879,20 @@ do
   list3.index = 2
   list3:openSubmenu()
   list3:updateSubmenu({ wasPressed = function(_, b) return b == "a" end })
-  eq(screen.phase, "refuse-switch", "the mon already out is refused")
-  check((screen.message or ""):find("is already out"),
-    "with BattleText_MonIsAlreadyOut")
+  eq(screen.phase, "submenu", "the mon already out is refused in the list")
+  eq(pushed[#pushed], list3, "with the party list still up")
+  eq(list3.submenu, nil, "and the SWITCH/STATS/CANCEL box gone")
+  local refused = (list3.itemResult or {}).text or ""
+  check(refused:find("already"), "with BattleText_MonIsAlreadyOut")
+  -- SpeechTextbox's 18-tile interior (home/text.asm:124)
+  for line in refused:gmatch("[^\n]+") do
+    check(#line <= 18, "the refusal wraps inside the textbox")
+  end
   eq(battle.turn, turn0, "and no turn is spent on it")
+  list3:updateItemResult({ wasPressed = function(_, b) return b == "a" end })
+  eq(list3.itemResult, nil, "A dismisses it back to a live list")
+  eq(pushed[#pushed], list3, "which is still the top of the stack")
+  list3.onCancel()
 
   -- The forced list is PickPartyMonInBattle: WhichPKMNString, no submenu.
   check(screen:openParty(true), "the forced list opens")
@@ -1754,7 +1765,7 @@ end
 do
   local screen, lead = learnScreen()
   screen:push({ kind = "send", side = "enemy", mon = { hp = 1 }, hp = 1,
-    text = "JOE sent out PIDGEY!" })
+    text = Battle.sentOutText("JOE", "PIDGEY") })
   check(runToPhase(screen, "ask-forget"), "the pages reach the question")
   local tap = tapper(screen)
   tap("a")                      -- read the question
@@ -1777,6 +1788,72 @@ do
   check(poofed, "the forgot line follows the pause with no press between")
   check(screen.message and screen.message:find("forgot", 1, true) ~= nil,
     "and its line prints ahead of the send-out that was already queued")
+end
+
+-- ../pokecrystal/data/text/battle.asm:240-246
+-- ../pokecrystal/engine/battle/core.asm:3146-3147
+-- ../pokecrystal/home/text.asm:502-526
+do
+  local function typed(screen)
+    for _ = 1, 400 do
+      if not screen:syncTyper() then break end
+      Input:step()
+      screen:update(1 / 60)
+    end
+    return table.concat(screen:messageLines(), "|")
+  end
+  local function sendOutScreen(trainer, monName)
+    local screen, battle = newScreen()
+    check(runToMenu(screen), "reached the menu")
+    battle:takeEvents()
+    local mon = Mon.new(DATA, "PIDGEY", 5, { dvs = perfect })
+    mon.nickname = monName
+    screen.phase = "resolving"
+    screen.showEnemyHud = false
+    screen:push({ kind = "send", side = "enemy", mon = mon, hp = mon.hp,
+      text = Battle.sentOutText(trainer, monName) })
+    screen:advanceQueue()
+    return screen
+  end
+  local function sendStarted(screen)
+    return screen.afterSendOut ~= nil or screen.showEnemyHud == true
+  end
+
+  local screen = sendOutScreen("CHAMPION LANCE", "DRAGONITE")
+  eq(typed(screen), "CHAMPION LANCE|sent out",
+    "the trainer and 'sent out' are the first page, no name on it")
+  check(not sendStarted(screen) and screen.pendingSendOut ~= nil,
+    "the ball stays shut while the first page waits for A")
+  local tap = tapper(screen)
+  tap("a")
+  Input:step()
+  screen:update(1 / 60)
+  local lines = screen:messageLines()
+  eq(lines[1], "sent out", "cont scrolls 'sent out' up already printed")
+  check(lines[2] ~= "DRAGONITE!", "and only the name types")
+  eq(typed(screen), "sent out|DRAGONITE!",
+    "a nine-letter name lands whole on the scrolled row")
+  check(sendStarted(screen) and screen.pendingSendOut == nil,
+    "and ANIM_SEND_OUT_MON starts with the name page")
+
+  local short = sendOutScreen("CHAMPION LANCE", "PIDGEY")
+  eq(typed(short), "CHAMPION LANCE|sent out",
+    "a short name still gets the cart's unconditional third row")
+  tapper(short)("a")
+  eq(typed(short), "sent out|PIDGEY!", "and lands on the scrolled page")
+
+  local long = newScreen()
+  check(runToMenu(long), "reached the menu")
+  long.battle:takeEvents()
+  long.phase = "resolving"
+  long:push({ kind = "message",
+    text = "SOMELONGNAME gained 12345 EXP. Points!" })
+  long:advanceQueue()
+  eq(typed(long), "SOMELONGNAME|gained 12345 EXP.",
+    "an overlong line shows its first two rows")
+  tapper(long)("a")
+  eq(typed(long), "gained 12345 EXP.|Points!",
+    "and the third row scrolls in instead of being cut")
 end
 
 -- ---- MoveSelectionScreen's two boxes (#1478) ------------------------------
@@ -1976,6 +2053,74 @@ do
   bare:startSendOut("player", bare.battle.player)
   check(not bare:picBoxCleared("player") and bare.showPlayerHud,
     "without scripts the mon and the HUD come up together")
+end
+
+-- SlideBattlePicOut + EmptyBattleTextbox (core.asm:3221)
+do
+  local screen, battle = newScreen()
+  check(runToMenu(screen), "the intro drains")
+  screen.showEnemyTrainer = true
+  screen.picHidden.enemy = false
+  screen.trainerSlide = 0
+  for _ = 1, 400 do
+    run(screen, 1)
+    if not screen.trainerSlide then break end
+  end
+  eq(screen.showEnemyTrainer, false, "the trainer pic slides off")
+  eq(screen.picHidden.enemy, true, "and the box it emptied stays empty")
+  check(screen:picBoxCleared("enemy"), "so drawPic paints nothing there")
+
+  screen:startSendOut("enemy", battle.enemy)
+  for _ = 1, 400 do
+    if not screen.afterSendOut then break end
+    run(screen, 1)
+  end
+  check(not screen:picBoxCleared("enemy"),
+    "the send-out animation is the only thing that brings the mon back")
+end
+
+-- home/text.asm:630
+-- (home/joypad.asm:428)
+do
+  local screen = newScreen()
+  local held = false
+  for _ = 1, 600 do
+    run(screen, 1)
+    if (screen.messageTimer or 0) > 0 and not Typer.typing(screen) then
+      held = true
+      break
+    end
+  end
+  check(held, "WildPokemonAppearedText holds for PromptButton")
+
+  screen.arrowBlink = 0
+  check(screen:messageArrowVisible(), "the cursor is on at phase 0")
+  screen.arrowBlink = 15
+  check(screen:messageArrowVisible(), "and through phase 15")
+  screen.arrowBlink = 16
+  check(not screen:messageArrowVisible(), "UnloadBlinkingCursor at phase 16")
+  screen.arrowBlink = 31
+  check(not screen:messageArrowVisible(), "and through phase 31")
+
+  -- byte (home/text.asm:887-902)
+  screen.arrowBlink = 0
+  screen.waitSfx = "SFX_TACKLE"
+  check(not screen:messageArrowVisible(), "no cursor under a held SFX")
+  screen.waitSfx = nil
+  screen.messageDelay = 10
+  check(not screen:messageArrowVisible(), "none through a text_pause")
+  screen.messageDelay = 0
+  check(screen:messageArrowVisible(), "back on once the pause is done")
+
+  -- DoneText / text_end lines never load it (home/text.asm:566)
+  screen.messageTimer = 0
+  check(not screen:messageArrowVisible(), "and never on a `done` line")
+
+  local sliding = newScreen()
+  local before = sliding.arrowBlink
+  run(sliding, 1)
+  check(sliding.slideFrame > 0 and sliding.arrowBlink ~= before,
+    "the blink phase advances through update's early returns")
 end
 
 S.finish()

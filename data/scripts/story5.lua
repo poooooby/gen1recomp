@@ -517,7 +517,7 @@ M.PEWTER_CITY = {
 -- skipped (the blackout rebuilds the map mid-script).
 local function runAmbush(game, ow, rows, playerFacing, musicOpts)
   if ow.runner:isRunning() then return false end
-  ow.player.facing = playerFacing
+  if playerFacing then ow.player.facing = playerFacing end
   -- the rival encounter sting (MUSIC_MEET_RIVAL); the battle music
   -- takes over and the map theme returns after the victory jingle
   require("src.core.Music").play(game.data, "Music_MeetRival", nil, musicOpts)
@@ -573,16 +573,18 @@ local function route22Scene(n, objIndex, objName, oppClass, baseParty, beatFlag,
     { "move_npc_to", objIndex, rx, 5 },                        -- 2
     { "face_object", objIndex, rivalFacing },                  -- 3
     { "show_text", "_Route22RivalBeforeBattleText" .. n },     -- 4
-    { "rival_battle", oppClass, baseParty },                   -- 5
-    { "jump_if_false", 13 },                                   -- 6
-    { "set_flag", beatFlag },                                  -- 7
-    { "show_text", "_Route22Rival" .. n .. "DefeatedText" },   -- 8
-    { "show_text", "_Route22RivalAfterBattleText" .. n },      -- 9
+    -- scripts/Route22.asm:132-134, 288-290
+    { "save_end_battle_text", "_Route22Rival" .. n .. "DefeatedText" },
+    { "rival_battle", oppClass, baseParty },
+    { "jump_if_false", "leave" },
+    { "set_flag", beatFlag },
+    { "show_text", "_Route22RivalAfterBattleText" .. n },
     { "play_music", "Music_MeetRival", { start = "rival",
-      tempo = n == 2 and 100 or nil } },                     -- 10
-    { "walk_npc", objIndex, route22ExitDirs(n, py) },          -- 11
+      tempo = n == 2 and 100 or nil } },
+    { "walk_npc", objIndex, route22ExitDirs(n, py) },
     { "play_default_music" },                    -- scripts/Route22.asm:230
-    { "hide_object", "ROUTE_22", objName },                    -- 13
+    { "label", "leave" },
+    { "hide_object", "ROUTE_22", objName },
   }
 end
 
@@ -622,21 +624,28 @@ local function ceruleanRivalExitDirs(px)
   return { "left", "down", "down", "down", "down", "down", "down" }
 end
 
-local function ceruleanRivalScene(px, py)
+-- CeruleanCityMovement1 (scripts/CeruleanCity.asm:114)
+local CERULEAN_RIVAL_APPROACH = { "down", "down", "down" }
+
+local function ceruleanRivalScene(px)
   return {
-    { "show_object", "CERULEAN_CITY", "CERULEANCITY_RIVAL" },  -- 1
-    { "move_npc_to", 1, px, py - 1 },                          -- 2
-    { "face_object", 1, "down" },                              -- 3
-    { "show_text", "_CeruleanCityRivalPreBattleText" },        -- 4
-    { "rival_battle", "OPP_RIVAL1", 7 },                       -- 5
-    { "jump_if_false", 13 },                                   -- 6
-    { "set_flag", "EVENT_BEAT_CERULEAN_RIVAL" },               -- 7
-    { "show_text", "_CeruleanCityRivalDefeatedText" },         -- 8
-    { "show_text", "_CeruleanCityRivalIWentToBillsText" },     -- 9
-    { "play_music", "Music_MeetRival", { start = "rival" } }, -- 10
-    { "walk_npc", 1, ceruleanRivalExitDirs(px) },              -- 11
+    { "show_object", "CERULEAN_CITY", "CERULEANCITY_RIVAL" },
+    -- x 20 (scripts/CeruleanCity.asm:84-91)
+    { "place_npc", 1, px, 2, "down" },
+    { "walk_npc", 1, CERULEAN_RIVAL_APPROACH },
+    { "face_object", 1, "down" },              -- CeruleanCityFaceRivalScript
+    { "show_text", "_CeruleanCityRivalPreBattleText" },
+    -- SaveEndBattleTextPointers (scripts/CeruleanCity.asm:141)
+    { "save_end_battle_text", "_CeruleanCityRivalDefeatedText" },
+    { "rival_battle", "OPP_RIVAL1", 7 },
+    { "jump_if_false", "leave" },
+    { "set_flag", "EVENT_BEAT_CERULEAN_RIVAL" },
+    { "show_text", "_CeruleanCityRivalIWentToBillsText" },
+    { "play_music", "Music_MeetRival", { start = "rival" } },
+    { "walk_npc", 1, ceruleanRivalExitDirs(px) },
     { "play_default_music" },                -- scripts/CeruleanCity.asm:230
-    { "hide_object", "CERULEAN_CITY", "CERULEANCITY_RIVAL" },  -- 13
+    { "label", "leave" },
+    { "hide_object", "CERULEAN_CITY", "CERULEANCITY_RIVAL" },
   }
 end
 
@@ -698,7 +707,7 @@ M.CERULEAN_CITY = {
     end
     if not f.EVENT_BEAT_CERULEAN_RIVAL
        and inCoords({ { 20, 6 }, { 21, 6 } }, x, y) then
-      return runAmbush(game, ow, ceruleanRivalScene(x, y), "up")
+      return runAmbush(game, ow, ceruleanRivalScene(x), "up")
     end
     return false
   end,
@@ -873,27 +882,37 @@ M.ROUTE_18_GATE_1F = {
 -- Silph Co. 7F rival ambush (scripts/SilphCo7F.asm
 -- SilphCo7FDefaultScript: coords (3,2)/(3,3), the rival at (3,7) walks
 -- up, MUSIC_MEET_RIVAL, OPP_RIVAL2 parties 7-9 by starter, then he
--- wishes you luck, walks off right and disappears; one-time via
--- EVENT_BEAT_SILPH_CO_RIVAL)
+-- wishes you luck, walks to the (5,3) teleporter and disappears; one-time
+-- via EVENT_BEAT_SILPH_CO_RIVAL)
+
+-- scripts/SilphCo7F.asm:239 .RivalExitRightMovement (coord index 1, (3,2))
+-- scripts/SilphCo7F.asm:244 .RivalWalkAroundPlayerMovement (index 2, (3,3))
+local function silphCo7FRivalExitDirs(py)
+  if py == 2 then return { "right", "right" } end
+  return { "left", "up", "up", "right", "right", "right", "down" }
+end
+
 M.SILPH_CO_7F = {
   onStep = function(game, ow, x, y)
     if game.save.flags.EVENT_BEAT_SILPH_CO_RIVAL then return false end
     if not inCoords({ { 3, 2 }, { 3, 3 } }, x, y) then return false end
     return runAmbush(game, ow, {
-      { "show_object", "SILPH_CO_7F", "SILPHCO7F_RIVAL" },     -- 1
-      { "show_text", "_SilphCo7FRivalText" },                  -- 2
-      { "move_npc_to", 9, 3, y + 1 },                          -- 3
-      { "face_object", 9, "up" },                              -- 4
-      { "show_text", "_SilphCo7FRivalWaitedHereText" },        -- 5
-      { "rival_battle", "OPP_RIVAL2", 7 },                     -- 6
-      { "jump_if_false", 14 },                                 -- 7
-      { "set_flag", "EVENT_BEAT_SILPH_CO_RIVAL" },             -- 8
-      { "show_text", "_SilphCo7FRivalDefeatedText" },          -- 9
-      { "show_text", "_SilphCo7FRivalGoodLuckToYouText" },     -- 10
-      { "play_music", "Music_MeetRival", { start = "rival" } }, -- 11
-      { "move_npc_to", 9, 5, y + 1 },                          -- 12
+      { "show_object", "SILPH_CO_7F", "SILPHCO7F_RIVAL" },
+      { "show_text", "_SilphCo7FRivalText" },
+      { "move_npc_to", 9, 3, y + 1 },
+      { "face_object", 9, "up" },
+      { "show_text", "_SilphCo7FRivalWaitedHereText" },
+      -- scripts/SilphCo7F.asm:184-186
+      { "save_end_battle_text", "_SilphCo7FRivalDefeatedText" },
+      { "rival_battle", "OPP_RIVAL2", 7 },
+      { "jump_if_false", "leave" },
+      { "set_flag", "EVENT_BEAT_SILPH_CO_RIVAL" },
+      { "show_text", "_SilphCo7FRivalGoodLuckToYouText" },
+      { "play_music", "Music_MeetRival", { start = "rival" } },
+      { "walk_npc", 9, silphCo7FRivalExitDirs(y) },
       { "play_default_music" },                -- scripts/SilphCo7F.asm:261
-      { "hide_object", "SILPH_CO_7F", "SILPHCO7F_RIVAL" },     -- 14
+      { "label", "leave" },
+      { "hide_object", "SILPH_CO_7F", "SILPHCO7F_RIVAL" },
     }, "down")
   end,
 }
@@ -917,23 +936,29 @@ M.SS_ANNE_2F = {
     if game.save.flags.EVENT_BEAT_SS_ANNE_RIVAL then return false end
     if not inCoords({ { 36, 8 }, { 37, 8 } }, x, y) then return false end
     local onLeft = x == 36
-    return runAmbush(game, ow, {
-      { "show_object", "SS_ANNE_2F", "SSANNE2F_RIVAL" },       -- 1
-      { "move_npc_to", 2, 36, onLeft and 7 or 8 },             -- 2
-      { "face_object", 2, onLeft and "down" or "right" },      -- 3
-      { "show_text", "_SSAnne2FRivalText" },                   -- 4
+    local rows = {
+      { "show_object", "SS_ANNE_2F", "SSANNE2F_RIVAL" },
+      { "move_npc_to", 2, 36, onLeft and 7 or 8 },
+      { "face_object", 2, onLeft and "down" or "right" },
+      { "show_text", "_SSAnne2FRivalText" },
       -- SSAnne2FRivalText's text_asm arms SaveEndBattleTextPointers
       -- (scripts/SSAnne2F.asm:199), so the line prints in battle (#1688)
-      { "save_end_battle_text", "_SSAnne2FRivalDefeatedText" }, -- 5
-      { "rival_battle", "OPP_RIVAL2", 1 },                     -- 6
-      { "jump_if_false", 13 },                                 -- 7
-      { "set_flag", "EVENT_BEAT_SS_ANNE_RIVAL" },              -- 8
-      { "show_text", "_SSAnne2FRivalCutMasterText" },          -- 9
-      { "play_music", "Music_MeetRival", { start = "rival" } }, -- 10
-      { "walk_npc", 2, ssAnne2FRivalExitDirs(onLeft) },        -- 11
+      { "save_end_battle_text", "_SSAnne2FRivalDefeatedText" },
+      { "rival_battle", "OPP_RIVAL2", 1 },
+      { "jump_if_false", "leave" },
+      { "set_flag", "EVENT_BEAT_SS_ANNE_RIVAL" },
+      { "show_text", "_SSAnne2FRivalCutMasterText" },
+      { "play_music", "Music_MeetRival", { start = "rival" } },
+      { "walk_npc", 2, ssAnne2FRivalExitDirs(onLeft) },
       { "play_default_music" },                 -- scripts/SSAnne2F.asm:175
-      { "hide_object", "SS_ANNE_2F", "SSANNE2F_RIVAL" },       -- 13
-    }, onLeft and "up" or "left")
+      { "label", "leave" },
+      { "hide_object", "SS_ANNE_2F", "SSANNE2F_RIVAL" },
+    }
+    -- the wXCoord == 37 branch (scripts/SSAnne2F.asm:73-77)
+    if not onLeft then
+      table.insert(rows, 4, { "face_player_dir", "left" })
+    end
+    return runAmbush(game, ow, rows)
   end,
 }
 

@@ -221,18 +221,20 @@ function PartyMenu.drawIcon(game, mon, x, y, selected, counter, forceAlt)
   -- change its menu icon.
   local entry = (icons.bySpecies and icons.bySpecies[mon.species])
              or (def and def.icon)
-  local name, path
+  local name, path, trueColor
   if type(entry) == "string" then
     name = entry
     path = icons.icons and icons.icons[entry]
   elseif type(entry) == "table" then
     path = entry.image
+    trueColor = entry.trueColor
   end
   if not path then
     name = def and def.dex and icons.byDex and icons.byDex[def.dex]
     path = name and icons.icons and icons.icons[name]
   end
-  path = require("src.pokemon.Sprites").iconPath(game.data, mon, path, { name = name })
+  path, trueColor = require("src.pokemon.Sprites")
+    .iconPath(game.data, mon, path, { name = name, trueColor = trueColor })
   if not path then return end
   -- Built-in icon classes are DMG 2bpp OBJ art and get the OBP0 bake; a
   -- mod's own image (an entry table rather than an icon name) is authored
@@ -240,13 +242,20 @@ function PartyMenu.drawIcon(game, mon, x, y, selected, counter, forceAlt)
   -- split PartyMenu.mirrorsIcon makes for the OAM mirror.  Both live in one
   -- cache under different keys, so a mod pointing a table entry at a
   -- built-in path still gets its unbaked copy. #274
-  local key = name and (path .. "#obp") or path
+  --
+  -- trueColor art is unbaked for the same reason it is unshaded: obpIcon is
+  -- itself a 4-shade remap keyed off the red channel, so running it over
+  -- full-colour art destroys exactly what the flag asks to keep.  The flag
+  -- overrides `name`, because a pokemon.icon hook can substitute full-colour
+  -- art for a path that resolved to a built-in class and still carries one.
+  local baked = name ~= nil and not trueColor
+  local key = baked and (path .. "#obp") or path
   if iconImages[key] == nil then
     -- resolve through Assets so an overrides/ or transform-derived icon
     -- (e.g. a per-species image at assets/generated/icons/<name>.png) is
     -- picked up the same way battle sprites are
     local ok, img
-    if name then
+    if baked then
       ok, img = pcall(obpIcon, path)
     else
       ok, img = pcall(love.graphics.newImage, Assets.resolve(path))
@@ -290,6 +299,16 @@ function PartyMenu.drawIcon(game, mon, x, y, selected, counter, forceAlt)
     -- whatever size the file is (unchanged path)
     love.graphics.draw(img, x, y)
   end
+  -- Report the covering rect so Renderer:endFrame can re-blit it unshaded
+  -- over the colorized pass.  Every branch above lays a frame into a 16x16
+  -- OAM block except the last, which draws the file at its own size.
+  -- No vanilla icon record sets the flag, so this stays dead code without a
+  -- mod and the zone lists are exactly the ones the states returned.
+  if trueColor then
+    local mw, mh = 16, 16
+    if not (PartyMenu.mirrorsIcon(name) or ih > 16) then mw, mh = iw, ih end
+    require("src.render.PaletteFX").markTrueColor(x, y, mw, mh)
+  end
   return true
 end
 
@@ -330,6 +349,8 @@ function PartyMenu.new(game, opts)
   self.party = party -- link/scoped battles pass their local party view
   self.swapFrom = nil
   self.swapAnim = nil
+  -- wPartyMenuTypeOrMessageID (engine/menus/party_menu.asm:182)
+  self.message = nil
   self.submenu = nil
   self.subIndex = 1
   self.blink = 0
@@ -402,6 +423,12 @@ function PartyMenu:update(dt)
   local anim = self.swapAnim
   if anim then
     anim.frames = anim.frames + 1
+    -- engine/menus/start_sub_menus.asm:664-666
+    if anim.phase == 1 then
+      anim.blank[anim.to] = true
+      anim.phase = 2
+      return
+    end
     local playing = false
     if anim.src then
       local ok, p = pcall(anim.src.isPlaying, anim.src)
@@ -687,7 +714,9 @@ function PartyMenu:update(dt)
       if from ~= self.index then
         party[from], party[self.index] = party[self.index], party[from]
       end
-      self.swapAnim = { blank = { [from] = true }, frames = 0 }
+      -- wCurrentMenuItem (engine/menus/start_sub_menus.asm:662-666)
+      self.swapAnim = { blank = { [from] = true }, to = self.index,
+                        phase = 1, frames = 0 }
       if self.game.data then
         self.swapAnim.src = require("src.core.Sound").play(self.game.data, "Swap")
       end
@@ -776,23 +805,35 @@ function PartyMenu:update(dt)
 end
 
 -- engine/menus/party_menu.asm:229 (#147 #1610 #1901)
+-- engine/menus/party_menu.asm:226-235
+function PartyMenu:setMessage(text)
+  if type(text) ~= "string" then self.message = nil return end
+  -- constants/charmap.asm:19-20
+  self.message = require("src.render.TextBox").strip(text)
+end
+
 function PartyMenu:bottomMessage()
-  if self.swapFrom then
-    return self.game.data.text._PartyMenuSwapMonText
+  local text
+  if self.message then
+    text = self.message
+  elseif self.swapFrom then
+    text = self.game.data.text._PartyMenuSwapMonText
       or Strings("Move POKéMON\nwhere?")
   elseif self.tmhm then
-    return self.game.data.text._PartyMenuUseTMText
+    text = self.game.data.text._PartyMenuUseTMText
       or Strings("Use TM on which\nPOKéMON?")
   elseif self.softboiledFrom or self.itemUse then
-    return self.game.data.text._PartyMenuItemUseText
+    text = self.game.data.text._PartyMenuItemUseText
       or Strings("Use item on which\nPOKéMON?")
   elseif self.forceSwitch then
-    return self.game.data.text._PartyMenuBattleText
+    text = self.game.data.text._PartyMenuBattleText
       or Strings("Bring out which\nPOKéMON?")
   else
-    return self.game.data.text._PartyMenuNormalText
+    text = self.game.data.text._PartyMenuNormalText
       or Strings("Choose a POKéMON.")
   end
+  -- constants/charmap.asm:19-20
+  return require("src.render.TextBox").strip(text)
 end
 
 -- Name-row pixel Y for party slot i (1-based).

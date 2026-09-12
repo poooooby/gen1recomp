@@ -1,6 +1,4 @@
 -- Map object (NPC/item) built from a generated object_event entry.
--- STAY objects keep their facing; WALK objects wander randomly within the
--- roam constraint (ANY_DIR / UP_DOWN / LEFT_RIGHT), like the original.
 
 local Collision = require("src.world.Collision")
 local SpriteRenderer = require("src.render.SpriteRenderer")
@@ -14,11 +12,22 @@ local FACING_FROM_RANGE = {
   DOWN = "down", UP = "up", LEFT = "left", RIGHT = "right",
 }
 
+-- .randomMovement -- pokered engine/overworld/movement.asm:190
 local ROAM_DIRS = {
   ANY_DIR = { "up", "down", "left", "right" },
+  NONE = { "up", "down", "left", "right" },
   UP_DOWN = { "up", "down" },
   LEFT_RIGHT = { "left", "right" },
 }
+
+local shadowCache = {}
+local function shadowImage(path)
+  local hit = shadowCache[path]
+  if hit ~= nil then return hit or nil end
+  local ok, img = pcall(love.graphics.newImage, path)
+  shadowCache[path] = ok and img or false
+  return shadowCache[path] or nil
+end
 
 function NPC.new(data, mapId, objDef)
   local self = setmetatable({}, NPC)
@@ -27,6 +36,11 @@ function NPC.new(data, mapId, objDef)
   local spriteDef = data.sprites[objDef.sprite]
   assert(spriteDef, "unknown sprite " .. tostring(objDef.sprite))
   self.sprite = SpriteRenderer.new(spriteDef, self.id)
+  -- pokeyellow engine/pikachu/pikachu_movement.asm:917
+  local fx = data.field and data.field.overworldFx
+  if fx and fx.shadow then
+    self.shadowImg = shadowImage(fx.shadow.path)
+  end
   -- object_event coordinates are already walk-grid cells
   self.cellX, self.cellY = objDef.x, objDef.y
   self.px, self.py = self.cellX * 16, self.cellY * 16
@@ -36,8 +50,15 @@ function NPC.new(data, mapId, objDef)
   self.animClock = 0
   self.stepFlip = false
   self.frozen = false -- scripts freeze NPCs while talking
-  self.wanders = objDef.movement == "WALK"
-  self.roamDirs = ROAM_DIRS[objDef.range] or ROAM_DIRS.ANY_DIR
+  -- pokered engine/overworld/movement.asm:611
+  local turnDirs = ROAM_DIRS[objDef.range or "NONE"]
+  self.steps = objDef.movement == "WALK"
+  -- .determineDirection -- pokered engine/overworld/movement.asm:193
+  self.pinnedFacing = objDef.movement == "STAY"
+                      and FACING_FROM_RANGE[objDef.range] or nil
+  self.wanders = (self.steps or objDef.movement == "STAY")
+                 and (turnDirs ~= nil or self.pinnedFacing ~= nil)
+  self.roamDirs = turnDirs or ROAM_DIRS.ANY_DIR
   self.timer = love.math.random(30, 120)
   return self
 end
@@ -108,9 +129,17 @@ function NPC:update(map, entities)
   if self.frozen or not self.wanders then return end
   self.timer = self.timer - 1
   if self.timer > 0 then return end
+  -- TryWalking + CanWalkOntoTile .impassable -- movement.asm:262, 673
+  if self.pinnedFacing then
+    self.timer = love.math.random(1, 128)
+    self.facing = self.pinnedFacing
+    return
+  end
   self.timer = love.math.random(30, 180)
   local dir = self.roamDirs[love.math.random(#self.roamDirs)]
   self.facing = dir
+  -- pokered engine/overworld/movement.asm:262
+  if not self.steps then return end
   if love.math.random() < 0.5 then return end -- sometimes just turn
   -- never wander onto warps, so NPCs don't walk out of the map
   local tx, ty = Collision.target(self.cellX, self.cellY, dir)
@@ -150,6 +179,13 @@ end
 
 function NPC:draw(camX, camY)
   local sprite, px, py, facing, phase, flip = self:pose()
+  -- pokeyellow engine/pikachu/pikachu_movement.asm:865
+  if self.hopShadowY and self.shadowImg then
+    local sx, sy = sprite:getScreenOrigin(px, self.hopShadowY, camX, camY)
+    sy = sy + 12
+    love.graphics.draw(self.shadowImg, sx, sy)
+    love.graphics.draw(self.shadowImg, sx + 16, sy, 0, -1, 1)
+  end
   sprite:draw(px, py, camX, camY, facing, phase, flip, nil, nil,
               self.frameOverride)
 end

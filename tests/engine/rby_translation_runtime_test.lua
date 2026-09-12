@@ -267,7 +267,7 @@ end
 
 local harvestCalls = {
   ["src/ui/BagMenu.lua"] = {
-    'Strings.source("Which move?")', 'Strings.source("ITEMS")',
+    'Strings.source("ITEMS")',
   },
   ["src/ui/BoxMenu.lua"] = {
     'Strings("WITHDRAW")', 'Strings("DEPOSIT")',
@@ -282,7 +282,7 @@ local harvestCalls = {
     'Strings("No.%03d",', 'Strings("IDNo.%05d",',
   },
   ["src/ui/TrainerCard.lua"] = {
-    'Strings("MONEY/¥%d",', 'Strings("TIME/%3d:%02d",',
+    'Strings("MONEY/¥%d",', 'Strings("TIME/  %d:%02d",',
   },
   ["src/world/OverworldController.lua"] = {
     'Strings("BILL\'S PC")', 'Strings("%s\'s PC",', 'Strings("HEAL")',

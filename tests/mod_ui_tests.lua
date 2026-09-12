@@ -11,6 +11,7 @@ local check = S.check
 
 local love = _G.love or require("tests.love_stub")
 _G.love = love
+_G.POKEPORT_LOOP_PANEL_SYNC = true
 
 local Events = require("src.mods.Events")
 local Hooks = require("src.mods.Hooks")
@@ -286,7 +287,7 @@ local WANT_IDS = { "textSpeed", "animations", "battleStyle", "battleLayout",
                    "ruleset", "musicVol", "sfxVol", "musicFilter",
                    "performance", "colors",
                    "tilt", "uiLetterbox", "shaderfx", "shaderfx2", "zoom", "voidFill",
-                   "videoMode", "faithfulRes", "screenPos", "fpsCap", "vsync",
+                   "videoMode", "faithfulRes", "screenPos", "fpsCap", "vsync", "logicClock",
                    "speedOverworld", "speedBattle", "speedMenu",
                    "mods", "controls", "dateFormat", "timeFormat" }
 local function orow(menu, id)
