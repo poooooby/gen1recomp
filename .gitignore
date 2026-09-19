@@ -6,6 +6,14 @@
 #   assets/generated/minigame/intro_pika_{0,1,2,3}.png
 data/generated/
 assets/generated/
+yellow/*
+crystal/*
+mods/*
+mod_cache/*
+mod_compat/*
+probe_deoxys.lua
+probe_gen3_geometry.lua
+tools/*
 
 # LÖVE packages & archives
 *.love
