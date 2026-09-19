@@ -425,6 +425,27 @@ end)
 With no subscriber the A press reaches `talkTo` exactly as before. An object
 mid-step raises no hook, matching the vanilla gate.
 
+`handle:setAppearance(spriteId)` swaps a live NPC to another registered
+sprite (its own sheet, frames and anchors) without touching its identity,
+cell, step in flight or passability. Every handle method here works the same
+on Gen 1 and Gen 2.
+
+### Live map neighborhood
+
+`mod.world:liveMaps()` returns the active map plus every connected map the
+engine is currently drawing, as `{ mapId, ox, oy, active }` rows (`ox`/`oy`
+are pixel offsets from the active map). Two events bracket each rebuild:
+
+- `world.live_maps_preparing` `{ mapId, maps }`: the neighborhood is known
+  but connected-map ghosts are not built yet. `spawnNpc`/`removeNpc` here
+  land in this same pass, so a dynamic actor exists before its ghost does.
+- `world.live_maps_updated` `{ mapId, maps }`: ghosts are materialized.
+
+`mod.world:npc(mapId, id)` also resolves ghosts on a live neighbor map, and
+the same pooled NPC becomes the real one when the player crosses the seam.
+Both fire on map load and on survey-zoom resizes (and, in Gen 2, on the
+hourly object refresh), so handlers should be idempotent.
+
 ## Adopting an already-paired link session
 
 `LinkState.newFromSession(game, transport, mode, isHost, opts)` starts a link
@@ -452,6 +473,34 @@ false` to land straight in the world -- a mode that hands out its own starting
 state has no use for Oak's speech. `CodeEntry.new` takes an optional
 `{ length = , charset = }`, so the slot-scrub widget that enters a link code
 can also carry a room code or an address.
+
+## Items on the link cable
+
+A link battle runs under cable rules -- no items -- and keeps them by
+default. A mode built on link battles can ask for the bag back:
+
+```lua
+local battle = LinkBattle.newHost(game, net, {
+  myParty = packed, theirParty = theirPacked, theirName = name, seed = seed,
+  items = true,      -- the bag opens; an item is the turn's action
+})
+```
+
+With `items`, the FIGHT menu's ITEM row opens the vanilla bag against the
+lockstep copies (the target picker offers `battle.playerParty`), the effect
+lands through `ItemEffects.use` as in any fight, and instead of the AI's
+reply the item rides the wire as the turn's action. Both machines -- and a
+spectator -- resolve it before switches and moves: the other side applies
+the same effect to its own copies of that side (`src/link/LinkItems.lua`),
+prints "<name> used <ITEM>!" and the effect's lines, and the per-turn state
+hash still agrees. The side that used the item makes no attack that turn.
+
+Set it on **both** machines, as with `turnLimit`: a peer that did not opt in
+never sends one, and one that receives an item it cannot decode desyncs on
+the next hash. What the bag allows is what a trainer battle allows --
+medicines, X items, the flute; balls, the doll, stones, TMs and candy are
+refused. `turnLimit`'s clock ticks only at the menu, so it waits while the
+bag is open. Gen 1 only; `LinkBattle2` keeps its cable rules. RFC 0021.
 
 ## Read-only battle snapshots
 

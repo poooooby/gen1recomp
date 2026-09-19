@@ -10,9 +10,17 @@ GamepadMap.DEFAULT_GAMEPAD_BINDINGS = {
   start = "start", back = "select",
 }
 
+GamepadMap.TRIGGER_AXES = {
+  triggerleft = "triggerleft", lefttrigger = "triggerleft",
+  triggerright = "triggerright", righttrigger = "triggerright",
+}
+GamepadMap.TRIGGER_ON = 0.4
+GamepadMap.TRIGGER_OFF = 0.2
+
 GamepadMap.DEFAULT_PAD_ACTIONS = {
   rightshoulder = "speedUp", righttrigger = "speedUp",
   leftshoulder = "speedDown", lefttrigger = "speedDown",
+  -- FRLG: shoulders also drive l/r via Input dual-emit (see Input:gamepadpressed).
 }
 
 -- Switch: LÖVE/SDL labels south as "a" and east as "b", but Nintendo UX is

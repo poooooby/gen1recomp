@@ -215,6 +215,12 @@ local MAPSETUP_NO_FADE = {
   [MAPSETUP.CONNECTION] = true, [MAPSETUP.SUBMENU] = true,
 }
 
+-- data/maps/setup_scripts.asm:48, :154, :175, :26-30; home/audio.asm:281, :335, :412
+local MAPSETUP_MUSIC_BIKE = {
+  [MAPSETUP.WARP] = true, [MAPSETUP.TELEPORT] = true,
+  [MAPSETUP.CONTINUE] = true, [MAPSETUP.LINKRETURN] = true,
+}
+
 -- MapSetupCommands $26 UpdateRoamMons and $27 JumpRoamMons, read off the same
 -- eleven scripts with the same fallthroughs honoured.  This is the ONLY thing
 -- that moves the three legendary beasts around Johto, and where each sits in
@@ -271,6 +277,10 @@ local SPAWN_HOME = "SPAWN_HOME"
 local START_MAP = "PLAYERS_HOUSE_2F"
 local START_X, START_Y, START_FACING = 3, 3, "down"
 local PLAYER_SPRITE = "SPRITE_CHRIS"
+
+-- engine/overworld/player_object.asm:29-41
+local PLAYER_PAL_MALE = { palette = 8 }
+local PLAYER_PAL_FEMALE = { palette = 9 }
 
 -- constants/event_flags.asm.  HatchEggs sets this one by hand, for exactly one
 -- species, right after SetSeenAndCaughtMon.  wEventFlags is keyed by NUMBER
@@ -2676,20 +2686,23 @@ function World:playMapMusic()
   end
 end
 
--- data/maps/setup_scripts.asm:48
+-- data/maps/setup_scripts.asm:48, :117
 -- home/audio.asm:335
 -- home/audio.asm:281
-function World:setMapMusic(mapId, seamless)
+-- engine/overworld/events.asm:993
+function World:setMapMusic(mapId, seamless, method)
   local data = self.game and self.game.data
   local audio = data and data.audio
   if not (audio and audio.runtime) then return end
-  local bike = not seamless
+  method = method or self.setupMethod or MAPSETUP.WARP
+  local bikeRow = (not seamless) and MAPSETUP_MUSIC_BIKE[method] or false
+  local bike = bikeRow
     and FieldMoves.isBiking(self.playerState)
     and self:playBikeMusic()
   if bike then return end
   Music.playMap(data, mapId, nil,
                 FieldMoves.isSurfing(self.playerState),
-                seamless and Music.MAP_FADE or nil,
+                (not bikeRow) and Music.MAP_FADE or nil,
                 self:mapMusicSong(mapId))
 end
 
@@ -3582,7 +3595,11 @@ function World:runMapSetup(method, load, fly)
   -- the cart puts it -- in the setup SCRIPT, not in the map load.
   self:roamMonsBeforeLoad(method)
   local wrapped = function()
+    -- data/maps/setup_scripts.asm
+    local prevMethod = self.setupMethod
+    self.setupMethod = method
     local ok = load()
+    self.setupMethod = prevMethod
     -- engine/overworld/map_objects_2.asm:1
     self.playerMasked = nil
     -- data/maps/setup_scripts.asm:100; engine/overworld/map_setup.asm:88
@@ -5948,6 +5965,13 @@ function World:playerGender()
   return save and save.player and save.player.gender or nil
 end
 
+-- engine/overworld/player_object.asm:29-41; pokegold player_object.asm:19
+function World:playerObjectDef()
+  if not self:isCrystal() then return nil end
+  return FieldMoves.isFemale(self:playerGender())
+    and PLAYER_PAL_FEMALE or PLAYER_PAL_MALE
+end
+
 -- The Chris/Kris sheet the player wears with no state on it
 -- (data/sprites/player_sprites.asm:2, :9).
 function World:playerSpriteName()
@@ -8118,6 +8142,12 @@ end
 -- Current-map NPCs + visual-only ghosts on neighbor strips (Gen 1 pattern).
 function World:rebuildPeople(opts)
   opts = opts or {}
+  if not self.preparingLiveMaps then
+    self.preparingLiveMaps = true
+    Runtime.emit("world.live_maps_preparing",
+      { mapId = self.map.id, maps = self:liveMaps() })
+    self.preparingLiveMaps = nil
+  end
   -- Anything this function did not put in the list is a GUEST: the follower
   -- (src/world/gen2/Follower.lua) or a mod's own entity.  A rebuild runs on
   -- every zoom and time-of-day roll, so wiping guests loses a follower at the
@@ -8185,6 +8215,27 @@ function World:rebuildPeople(opts)
       end
     end
   end
+  if not self.preparingLiveMaps then
+    Runtime.emit("world.live_maps_updated",
+      { mapId = self.map.id, maps = self:liveMaps() })
+  end
+end
+
+function World:liveMaps()
+  local out = {}
+  if not self.map then return out end
+  out[1] = { mapId = self.map.id, ox = 0, oy = 0, active = true }
+  for _, nb in ipairs(self.neighbors or {}) do
+    out[#out + 1] = { mapId = nb.id, ox = nb.ox, oy = nb.oy, active = false }
+  end
+  return out
+end
+
+function World:isNeighborMap(mapId)
+  for _, nb in ipairs(self.neighbors or {}) do
+    if nb.id == mapId then return nb end
+  end
+  return nil
 end
 
 -- Mod-spawned map objects.  The Gen 1 arm (OverworldState:addRuntimeObject)
@@ -8208,7 +8259,8 @@ function World:addRuntimeObject(mapId, objDef, owner)
   objDef.owner = owner
   table.insert(def.objects, objDef)
   local npcId = mapId .. "_obj_" .. objDef.index
-  if self.map and self.map.id == mapId then
+  if self.map and not self.preparingLiveMaps
+      and (self.map.id == mapId or self:isNeighborMap(mapId)) then
     self:rebuildPeople({ seamless = true })
   end
   return npcId
@@ -8226,7 +8278,8 @@ function World:removeRuntimeObject(npcId, owner)
         if self.npcPool then
           self.npcPool[string.format("%s_obj_%d", mapId, obj.index)] = nil
         end
-        if self.map and self.map.id == mapId then
+        if self.map and not self.preparingLiveMaps
+            and (self.map.id == mapId or self:isNeighborMap(mapId)) then
           self:rebuildPeople({ seamless = true })
         end
         return true
@@ -9661,14 +9714,15 @@ function World:applySpritePalette(entity)
       self.flashUsed)
   -- entity.def is the object_event, whose own palette field OVERRIDES the
   -- sprite's (Palettes.objectPaletteId; AddMapObject, player_object.asm:187).
-  -- The player has no object_event here, so it falls through to the sheet.
+  local def = entity.def
+  if entity == self.player then def = self:playerObjectDef() end
   local colors = Palettes.spritePalette(self.palettes, daytime,
-    entity.spriteDef, entity.def)
+    entity.spriteDef, def)
   if not colors then return end
   -- The bake cache key has to be the palette actually chosen, or the three
   -- beasts -- one sheet, three object palettes -- would all share the first
   -- bake taken.
-  local id = Palettes.objectPaletteId(entity.def)
+  local id = Palettes.objectPaletteId(def)
     or entity.spriteDef.paletteId or 0
   entity.sprite:setObjPalette(colors,
     ("gen2:%s:%d"):format(tostring(daytime), id))

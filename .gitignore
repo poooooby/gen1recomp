@@ -15,6 +15,10 @@ probe_deoxys.lua
 probe_gen3_geometry.lua
 tools/*
 
+# Decoded from a user-provided dump of another game they own (IMPORTERS tab).
+# Never committed and never redistributed; re-import from the launcher.
+asset_packs/
+
 # LÖVE packages & archives
 *.love
 *.zip
@@ -115,3 +119,32 @@ lua-error.log
 /mods/*/baseroms/
 /imports/baseroms/
 /imports/baseroms-recovery/
+
+# GBA/GBC ROM files and save states
+*.gba
+*.gb
+*.gbc
+*.sav
+
+# Reference decompilation repositories (used for reference / extraction only)
+pokefirered/
+pokered/
+pokegold/
+pokecrystal/
+
+# Scratch / temporary testing artifacts
+s[0-9]_*.png
+test_*.png
+scratch_*.png
+dex_area_bg_test.png
+src/mod_cache_sevii_test/
+src/import/gba/chrome/**/*.png
+src/import/gba/chrome/**/*.bin
+src/import/gba/chrome/**/*.pal
+src/import/gba/chrome/**/*.rgba
+src/import/gba/chrome/*.png
+src/import/gba/chrome/*.bin
+src/import/gba/chrome/*.pal
+src/import/gba/chrome/*.rgba
+/os
+/re
