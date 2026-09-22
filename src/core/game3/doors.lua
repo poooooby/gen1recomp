@@ -13,6 +13,9 @@ Doors.SOUND_NORMAL = SE.SE_DOOR or 241
 Doors.SOUND_SLIDING = SE.SE_SLIDING_DOOR or 18
 Doors.SOUND_EXIT = SE.SE_EXIT or 238
 
+-- include/constants/metatile_behaviors.h:81
+local MB_WARP_DOOR = 0x69
+
 Doors.FRAME_TICKS = 4 -- 4 engine frames per door animation step (FRLG standard)
 Doors.NUM_FRAMES = 3  -- 3 animation frames (0: closed, 1: half, 2: fully open)
 
@@ -22,27 +25,69 @@ Doors._manifest = nil
 Doors._sheets = {} -- [tileName] = { image, quads, width, height, frame_width, frame_height, frames }
 Doors._manifestLoaded = false
 
+local function cacheRoot()
+  local okD, Dataset = pcall(require, "src.core.game3.dataset")
+  if okD and Dataset and Dataset.mountExtractRoots then
+    Dataset.mountExtractRoots()
+  end
+  local okE, Extract = pcall(require, "src.import.gba.extract_island1")
+  return (okE and Extract and Extract.CACHE_ROOT) or "data/generated/gba"
+end
+
+local function doorsRoot()
+  return cacheRoot() .. "/doors"
+end
+
 local function loadManifest()
   if Doors._manifestLoaded then return Doors._manifest end
   Doors._manifestLoaded = true
 
-  local ok, manifest = pcall(require, "data.generated.gba.doors.manifest")
-  if ok and type(manifest) == "table" then
-    Doors._manifest = manifest
-    return manifest
-  end
+  local rel = doorsRoot() .. "/manifest.lua"
+  local content = nil
 
-  -- Fallback attempt reading directly
-  local manifestPath = "data/generated/gba/doors/manifest.lua"
-  local f = io.open(manifestPath, "r")
-  if f then
-    local content = f:read("*a")
-    f:close()
-    local chunk = load(content, "@" .. manifestPath, "t", {})
-    if chunk then
-      Doors._manifest = chunk()
+  local okD, Dataset = pcall(require, "src.core.game3.dataset")
+  if okD and Dataset and Dataset.cache then
+    local cache = Dataset.cache()
+    if cache and cache.read then
+      content = cache:read(rel) or cache:read("doors/manifest.lua")
     end
   end
+
+  if not content then
+    local okC, CacheFs = pcall(require, "src.import.CacheFs")
+    if okC and CacheFs and CacheFs.readActive then
+      content = CacheFs.readActive(rel) or CacheFs.readActive("doors/manifest.lua")
+    end
+  end
+
+  if not content and love and love.filesystem and love.filesystem.read then
+    content = love.filesystem.read(rel) or love.filesystem.read("doors/manifest.lua")
+  end
+
+  if not content then
+    local f = io.open(rel, "r")
+    if f then
+      content = f:read("*a")
+      f:close()
+    end
+  end
+
+  if content then
+    local chunk = load(content, "@" .. rel, "t", {})
+    if chunk then
+      local ok, res = pcall(chunk)
+      if ok and type(res) == "table" then
+        Doors._manifest = res
+        return res
+      end
+    end
+  end
+
+  print("[game3/doors] no door manifest in the cache; door animations are off")
+  Doors._manifest = {
+    doors = {},
+    by_mid = {},
+  }
   return Doors._manifest
 end
 
@@ -117,14 +162,23 @@ local function resolveLayout(mapId)
   if okD and Dataset then
     local cache = Dataset.cache and Dataset.cache()
     if cache then
-      local rel1 = "data/generated/gba/native/layouts/" .. mapId .. ".mid"
-      local rel2 = "data/generated/gba/native/layouts/FR_" .. key .. ".mid"
-      local rel3 = "data/generated/gba/native/layouts/" .. key .. ".mid"
+      local nativeRoot = cacheRoot() .. "/native"
+      local rel1 = nativeRoot .. "/layouts/" .. mapId .. ".mid"
+      local rel2 = nativeRoot .. "/layouts/FR_" .. key .. ".mid"
+      local rel3 = nativeRoot .. "/layouts/" .. key .. ".mid"
       local blob = cache:read(rel1) or cache:read(rel2) or cache:read(rel3)
       if blob then
         local pair = nil
-        local okM, natManifest = pcall(require, "data.generated.gba.native.manifest")
-        if okM and natManifest and natManifest.layouts then
+        local natManifest = nil
+        local natSrc = cache:read(nativeRoot .. "/manifest.lua")
+        if natSrc then
+          local chunk = load(natSrc, "@native/manifest.lua", "t", {})
+          if chunk then
+            local okM, res = pcall(chunk)
+            if okM and type(res) == "table" then natManifest = res end
+          end
+        end
+        if natManifest and natManifest.layouts then
           local info = natManifest.layouts[mapId] or natManifest.layouts["FR_" .. key] or natManifest.layouts[key]
           pair = info and info.pair
         end
@@ -151,8 +205,7 @@ local function resolveLayout(mapId)
   return nil, nil
 end
 
---- Get door metadata entry for a map tile at (x, y) if available
-function Doors.getDoorEntryAt(mapId, x, y)
+local function lookupDoorAt(mapId, x, y)
   local manifest = loadManifest()
   if not manifest or not manifest.by_mid then return nil end
 
@@ -165,13 +218,46 @@ function Doors.getDoorEntryAt(mapId, x, y)
   if mid and manifest.by_mid[mid] then
     local entry = manifest.by_mid[mid]
     local p = pair or (layout and layout.pair)
-    if isPairMatch(entry.tileset, p) then
+    local beh = nil
+    local okC, Collision = pcall(require, "src.core.game3.collision")
+    if okC and Collision and Collision.behaviorOn then
+      beh = Collision.behaviorOn({ midLayout = layout, pair = p }, x, y)
+    end
+    -- src/field_door.c:498
+    local isDoorTile
+    if beh ~= nil then
+      isDoorTile = (beh == MB_WARP_DOOR)
+    else
+      isDoorTile = isPairMatch(entry.tileset, p)
+    end
+    if isDoorTile then
       local doorInfo = manifest.doors and manifest.doors[entry.tile]
       return entry, doorInfo
     end
   end
 
   return nil
+end
+
+-- src/fieldmap.c:367
+local function liveMapId()
+  local Runtime = package.loaded["src.core.game3.runtime"]
+  local session = Runtime and Runtime.getSession and Runtime.getSession()
+  if session and session.map then return session.map end
+  local Map = package.loaded["src.core.game3.map"]
+  return Map and Map.current or nil
+end
+
+--- Get door metadata entry for a map tile at (x, y) if available
+function Doors.getDoorEntryAt(mapId, x, y)
+  -- src/field_door.c:396
+  local live = liveMapId()
+  if live then
+    local entry, info = lookupDoorAt(live, x, y)
+    if entry then return entry, info end
+    if live == mapId then return nil end
+  end
+  return lookupDoorAt(mapId, x, y)
 end
 
 --- Determine the exact sound effect and door animation kind for a warp / doorway
@@ -189,54 +275,19 @@ function Doors.getSoundForWarp(mapId, x, y, destMap, isDoor)
     end
   end
 
-  local mapUpper = string.upper(tostring(mapId or ""))
-  local destUpper = string.upper(tostring(destMap or ""))
-
-  -- Double sliding doors: Celadon Dept Store, Silph Co
-  local isDouble = destUpper:find("DEPT_STORE")
-    or destUpper:find("SILPH_CO")
-    or mapUpper:find("DEPT_STORE")
-    or mapUpper:find("SILPH_CO")
-
-  if isDouble then
-    return Doors.SOUND_SLIDING, "sliding_double"
-  end
-
-  -- Sliding doors: Poké Center, Mart, Dept Store, Silph Co, Safari Zone, Game Corner, Elevators
-  local isSliding = destUpper:find("POKECENTER")
-    or destUpper:find("POKEMON_CENTER")
-    or destUpper:find("CENTER")
-    or destUpper:find("MART")
-    or destUpper:find("SAFARI_ZONE")
-    or destUpper:find("GAME_CORNER")
-    or destUpper:find("CABLE_CLUB")
-    or destUpper:find("ELEVATOR")
-    or destUpper:find("TELEPORTER")
-    or mapUpper:find("POKECENTER")
-    or mapUpper:find("POKEMON_CENTER")
-    or mapUpper:find("CENTER")
-    or mapUpper:find("MART")
-    or mapUpper:find("SAFARI_ZONE")
-    or mapUpper:find("GAME_CORNER")
-
-  if isSliding then
-    return Doors.SOUND_SLIDING, "sliding"
-  end
-
-  return Doors.SOUND_NORMAL, "normal"
+  -- src/field_door.c:510
+  return Doors.SOUND_SLIDING, nil
 end
 
-local function resolveDoorKind(mapId, x, y, destMap, sound)
+-- src/field_door.c:396
+local function resolveDoorKind(mapId, x, y)
   if x and y then
     local entry, _ = Doors.getDoorEntryAt(mapId, x, y)
     if entry then
-      return entry.tile, entry.size
+      return entry.tile, entry.size, entry.sound
     end
   end
-  if sound == Doors.SOUND_SLIDING then
-    return "SlidingSingle", "1x1"
-  end
-  return "General", "1x1"
+  return nil, nil, nil
 end
 
 --- Start door opening animation + sound
@@ -245,7 +296,7 @@ function Doors.open(mapId, x, y, opts, onDone)
   local sound, defaultKind = Doors.getSoundForWarp(mapId, x, y, opts.destMap, true)
   if opts.sound then sound = opts.sound end
 
-  local tile, size = resolveDoorKind(mapId, x, y, opts.destMap, sound)
+  local tile, size, soundKind = resolveDoorKind(mapId, x, y)
 
   if opts.playSound ~= false then
     local Audio = package.loaded["src.core.game3.audio"] or require("src.core.game3.audio")
@@ -259,6 +310,7 @@ function Doors.open(mapId, x, y, opts, onDone)
     x = x,
     y = y,
     kind = defaultKind or ((sound == Doors.SOUND_SLIDING) and "sliding" or "normal"),
+    soundKind = soundKind,
     tile = tile,
     size = size or "1x1",
     mode = "open",
@@ -276,13 +328,14 @@ function Doors.holdOpen(mapId, x, y, opts)
   local sound, defaultKind = Doors.getSoundForWarp(mapId, x, y, opts.destMap, true)
   if opts.sound then sound = opts.sound end
 
-  local tile, size = resolveDoorKind(mapId, x, y, opts.destMap, sound)
+  local tile, size, soundKind = resolveDoorKind(mapId, x, y)
 
   Doors._activeAnim = {
     mapId = mapId,
     x = x,
     y = y,
     kind = defaultKind or ((sound == Doors.SOUND_SLIDING) and "sliding" or "normal"),
+    soundKind = soundKind,
     tile = tile,
     size = size or "1x1",
     mode = "hold",
@@ -299,13 +352,14 @@ function Doors.close(mapId, x, y, opts, onDone)
   local sound, defaultKind = Doors.getSoundForWarp(mapId, x, y, opts.destMap, true)
   if opts.sound then sound = opts.sound end
 
-  local tile, size = resolveDoorKind(mapId, x, y, opts.destMap, sound)
+  local tile, size, soundKind = resolveDoorKind(mapId, x, y)
 
   Doors._activeAnim = {
     mapId = mapId,
     x = x,
     y = y,
     kind = defaultKind or ((sound == Doors.SOUND_SLIDING) and "sliding" or "normal"),
+    soundKind = soundKind,
     tile = tile,
     size = size or "1x1",
     mode = "close",
@@ -331,13 +385,14 @@ function Doors.closeAfterDelay(mapId, x, y, delayTicks, opts, onDone)
   local sound, defaultKind = Doors.getSoundForWarp(mapId, x, y, opts.destMap, true)
   if opts.sound then sound = opts.sound end
 
-  local tile, size = resolveDoorKind(mapId, x, y, opts.destMap, sound)
+  local tile, size, soundKind = resolveDoorKind(mapId, x, y)
 
   Doors._activeAnim = {
     mapId = mapId,
     x = x,
     y = y,
     kind = defaultKind or ((sound == Doors.SOUND_SLIDING) and "sliding" or "normal"),
+    soundKind = soundKind,
     tile = tile,
     size = size or "1x1",
     mode = "delay_close",
@@ -362,6 +417,20 @@ end
 function Doors.update(dt)
   local anim = Doors._activeAnim
   if not anim then return end
+
+  -- src/field_fadetransition.c:757
+  if not anim.tile and anim.mode ~= "hold" then
+    local cb = anim.onDone
+    anim.onDone = nil
+    anim.frame = anim.targetFrame
+    if anim.mode == "open" then
+      anim.mode = "hold"
+    else
+      Doors._activeAnim = nil
+    end
+    if cb then cb() end
+    return
+  end
 
   if anim.mode == "delay_close" then
     anim.delayTimer = (anim.delayTimer or 1) - 1
@@ -435,12 +504,26 @@ local function loadSheet(tileName)
     return nil
   end
 
-  local relPath = "data/generated/gba/doors/" .. info.file
+  local relPath = doorsRoot() .. "/" .. info.file
   local bytes = nil
 
-  if love.filesystem and love.filesystem.read then
-    local readBytes = love.filesystem.read(relPath)
-    if readBytes then bytes = readBytes end
+  local okD, Dataset = pcall(require, "src.core.game3.dataset")
+  if okD and Dataset and Dataset.cache then
+    local cache = Dataset.cache()
+    if cache and cache.read then
+      bytes = cache:read(relPath) or cache:read("doors/" .. info.file)
+    end
+  end
+
+  if not bytes then
+    local okC, CacheFs = pcall(require, "src.import.CacheFs")
+    if okC and CacheFs and CacheFs.readActive then
+      bytes = CacheFs.readActive(relPath) or CacheFs.readActive("doors/" .. info.file)
+    end
+  end
+
+  if not bytes and love and love.filesystem and love.filesystem.read then
+    bytes = love.filesystem.read(relPath) or love.filesystem.read("doors/" .. info.file)
   end
 
   if not bytes then
@@ -496,7 +579,7 @@ local function loadSheet(tileName)
 end
 
 --- Draw active door animation overlay
-function Doors.draw(camX, camY)
+function Doors.draw(camX, camY, canvasW, canvasH)
   local anim = Doors._activeAnim
   if not anim then return end
   if not (love and love.graphics and love.graphics.rectangle) then return end
@@ -505,22 +588,23 @@ function Doors.draw(camX, camY)
   local sx = anim.x * CELL - (camX or 0)
   local sy = anim.y * CELL - (camY or 0)
 
-  -- Viewport bounds check
-  if sx < -CELL or sy < -32 or sx > 256 or sy > 176 then
+  -- src/field_door.c:457
+  local tileName = anim.tile
+  if not tileName then return end
+
+  local sheet = loadSheet(tileName)
+  local hasSheet = sheet and sheet.image and sheet.quads
+  local width = hasSheet and sheet.frame_width or CELL
+  local height = hasSheet and sheet.frame_height or CELL
+  local yOffset = (height > CELL) and CELL or 0
+  local top = sy - yOffset
+  if sx + width <= 0 or top + height <= 0
+      or sx >= (canvasW or 240) or top >= (canvasH or 160) then
     return
   end
 
-  local tileName = anim.tile
-  if not tileName then
-    local entry, _ = Doors.getDoorEntryAt(anim.mapId, anim.x, anim.y)
-    if entry then tileName = entry.tile end
-  end
-
-  local sheet = tileName and loadSheet(tileName)
-
-  if sheet and sheet.image and sheet.quads then
+  if hasSheet then
     local frame = math.min(anim.frame, sheet.frames - 1)
-    local yOffset = (sheet.frame_height > 16) and 16 or 0
 
     -- Authentic black interior background behind the door graphic
     love.graphics.setColor(0.05, 0.07, 0.1, 1)
@@ -538,7 +622,7 @@ function Doors.draw(camX, camY)
   love.graphics.setColor(0.05, 0.07, 0.1, 1)
   love.graphics.rectangle("fill", sx + 1, sy + 1, 14, 15)
 
-  if anim.kind == "sliding_double" then
+  if tileName == "SlidingDouble" then
     if anim.frame == 1 then
       love.graphics.setColor(0.65, 0.8, 0.88, 0.95)
       love.graphics.rectangle("fill", sx + 1, sy + 1, 4, 14)
@@ -549,7 +633,7 @@ function Doors.draw(camX, camY)
       love.graphics.setColor(0.35, 0.5, 0.6, 1)
       love.graphics.rectangle("line", sx + 11, sy + 1, 4, 14)
     end
-  elseif anim.kind == "sliding" or anim.kind == "SlidingSingle" then
+  elseif anim.soundKind == "sliding" then
     if anim.frame == 1 then
       love.graphics.setColor(0.65, 0.8, 0.88, 0.95)
       love.graphics.rectangle("fill", sx + 8, sy + 1, 7, 14)
@@ -582,6 +666,5 @@ function Doors.reset()
 end
 
 return Doors
-
 
 

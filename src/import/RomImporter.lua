@@ -1089,6 +1089,30 @@ local function findPendingRequiredImport(self)
   return nil
 end
 
+local function importerPickName(importerId)
+  return "picked_importer_" .. tostring(importerId) .. ".bin"
+end
+
+local function findPendingImporter(self)
+  if self and self.pickerPendingImporterId then
+    local name = importerPickName(self.pickerPendingImporterId)
+    if love.filesystem.getInfo(name, "file") then
+      return name, self.pickerPendingImporterId
+    end
+  end
+
+  local Importers = require("src.import.Importers")
+  for _, name in ipairs(love.filesystem.getDirectoryItems("")) do
+    local importerId = name:lower():match(
+      "^picked_importer_([%l%d_%-]+)%.bin$")
+    if importerId and Importers.get(importerId)
+        and love.filesystem.getInfo(name, "file") then
+      return name, importerId
+    end
+  end
+  return nil
+end
+
 -- Retire an Android pick once it has been through the installer / importer,
 -- whether or not it worked: a pick left on disk wins the scans above forever,
 -- so the next tap re-runs the same failing file and the picker never reopens
@@ -1692,7 +1716,13 @@ function RomImporter:focus(f)
     end
     local legacyRequiredPick = self.requiredImportLegacyRomPick
       and self.pickerPendingKind == "required_import"
-    if self.pickerPendingKind == "required_import"
+    if self.pickerPendingKind == "importer"
+        or pickError:find("picked_importer_", 1, true) then
+      self._importerNotice = { ok = false, text = text }
+      self.pickPending = nil
+      self.pickerPendingKind = nil
+      self.pickerPendingImporterId = nil
+    elseif self.pickerPendingKind == "required_import"
         or pickError:find("picked_required_import", 1, true)
         or pickError:find("picked_stadium", 1, true)
         or pickError:find("/baseroms/", 1, true)
@@ -1732,6 +1762,24 @@ function RomImporter:focus(f)
     self.pickerPendingModId = nil
     self.pickerPendingImportId = nil
     self.requiredImportLegacyRomPick = nil
+    return
+  end
+
+  local importerName, importerId = findPendingImporter(self)
+  if importerName then
+    local data = love.filesystem.read(importerName)
+    love.filesystem.remove(importerName)
+    self.pickPending = nil
+    self.pickerPendingKind = nil
+    self.pickerPendingImporterId = nil
+    if type(data) ~= "string" then
+      self._importerNotice = {
+        ok = false,
+        text = "Could not read the picked importer file.",
+      }
+    else
+      self:_runImporterData(importerId, data)
+    end
     return
   end
 
@@ -2675,12 +2723,19 @@ end
 -- create-document picker (love.system.createFile) so the player can save to
 -- Downloads / Drive / etc. -- the app-private exports/ path is not useful there.
 -- NX: surface exports path + MTP hint; do not rely on openURL / open-folder.
-function RomImporter:exportSave(version)
+function RomImporter:exportSave(version, format, scope, slotId)
   if self.workState == "working" then return end
   version = self:_resolveSaveVersion(version)
-  local ok, res = require("src.import.SaveFileIO").exportActiveSlot(version)
+  local noticeScope = scope or version
+  local IO = require("src.import.SaveFileIO")
+  local ok, res
+  if format == "lua" then
+    ok, res = IO.exportLuaSlot(version, slotId, cartOfScope(scope))
+  else
+    ok, res = IO.exportActiveSlot(version)
+  end
   if not ok then
-    self.saveNotice[version] = { ok = false, text = tostring(res) }
+    self.saveNotice[noticeScope] = { ok = false, text = tostring(res) }
     return
   end
   if self.isNX then
@@ -2688,7 +2743,7 @@ function RomImporter:exportSave(version)
     local rel = RomImporter.mtpHintPath(saveDir)
     if rel ~= "" and rel:sub(-1) ~= "/" then rel = rel .. "/" end
     local outDir = exportsDir(version)
-    self.saveNotice[version] = {
+    self.saveNotice[noticeScope] = {
       ok = true,
       text = Strings("Exported to %s\nDBI MTP → 1: SD Card/%s%s/", res, rel, outDir),
     }
@@ -2699,32 +2754,32 @@ function RomImporter:exportSave(version)
       or res:match("(exports[/\\].+)$")
     local data = rel and love.filesystem.read(rel)
     if not data then
-      self.saveNotice[version] = { ok = false,
+      self.saveNotice[noticeScope] = { ok = false,
         text = "Exported, but could not stage the file for the picker." }
       return
     end
     local suggested = rel:match("[^/\\]+$") or "export.sav"
     local wrote, writeErr = love.filesystem.write("pending_export.sav", data)
     if not wrote then
-      self.saveNotice[version] = { ok = false,
+      self.saveNotice[noticeScope] = { ok = false,
         text = "Could not stage the export: " .. tostring(writeErr) }
       return
     end
-    self.androidPendingExportVersion = version
+    self.androidPendingExportVersion = noticeScope
     if love.system.createFile and love.system.createFile(suggested, love.filesystem.getSaveDirectory()) then
       self.pickPending = true
       self.pickTimer = 0
-      self.saveNotice[version] = { ok = true,
+      self.saveNotice[noticeScope] = { ok = true,
         text = "Pick where to save " .. suggested .. "..." }
     else
       self.androidPendingExportVersion = nil
-      self.saveNotice[version] = { ok = true,
+      self.saveNotice[noticeScope] = { ok = true,
         text = "Exported inside the app folder (picker unavailable)." }
     end
     return
   end
   local dir = res:match("^(.*)[/\\][^/\\]+$")
-  self.saveNotice[version] = { ok = true, text = "Exported to " .. res, dir = dir }
+  self.saveNotice[noticeScope] = { ok = true, text = "Exported to " .. res, dir = dir }
 end
 
 -- Delete a save slot from the registry and disk, then refresh the panel.  If the
@@ -2916,7 +2971,8 @@ function RomImporter:_pollPickedFiles(dt)
     for _, name in ipairs(love.filesystem.getDirectoryItems("")) do
       local n = name:lower()
       if isRomFilename(n) or n == "picked_mod.zip" or n == "picked_save.sav"
-          or n == "picked_required_import.bin" or n == "picked_stadium.z64" then
+          or n == "picked_required_import.bin" or n == "picked_stadium.z64"
+          or n:match("^picked_importer_[%l%d_%-]+%.bin$") then
         found = true
         break
       end
@@ -3542,6 +3598,14 @@ function RomImporter:gamepadpressed(_, button)
     end
   end
 
+  if self._saveExport or self._savePicker or self._modGames or self._cartPopup then
+    if action == "b" then
+      self._saveExport, self._savePicker, self._modGames, self._cartPopup = nil, nil, nil, nil
+      return
+    end
+    if button == "start" or button == "leftshoulder" or button == "rightshoulder" then return end
+  end
+
   -- Shoulder buttons: cycle tabs
   if button == "leftshoulder" then
     self:_cycleTab(-1)
@@ -3961,6 +4025,17 @@ function RomImporter:_beginImporterImport(importerId)
     end
     return
   end
+  if self.android then
+    self.pickerPendingKind = "importer"
+    self.pickerPendingImporterId = importerId
+    if pickFile("required_import", importerPickName(importerId)) then
+      self.pickPending = true
+      self.pickTimer = 0
+      return
+    end
+    self.pickerPendingKind = nil
+    self.pickerPendingImporterId = nil
+  end
   local path = chooseImporterFile(desc.name, desc.source.formats or { "sfc" })
   if path then
     self:_runImporter(importerId, path)
@@ -3971,7 +4046,7 @@ function RomImporter:_beginImporterImport(importerId)
     self._padCursorActive = false
     Kit.FileBrowser.open({
       title = "Select " .. desc.name,
-      mode = "rom",
+      mode = "all",
       onSelect = function(pickedPath)
         self:_runImporter(importerId, pickedPath)
       end,
@@ -4962,6 +5037,14 @@ function RomImporter:keypressed(key)
     end
     return
   end
+  if self._saveExport or self._savePicker or self._modGames then
+    if key == "escape" then
+      self._saveExport, self._savePicker, self._modGames = nil, nil, nil
+    elseif self._flex then
+      require("src.import.LauncherView").keypressed(self, key)
+    end
+    return
+  end
   if self._cartPopup then
     if self._flex and require("src.import.LauncherView").keypressed(self, key) then
       return
@@ -5498,6 +5581,17 @@ function RomImporter:_commitCartSave()
   self:_refreshCarts(version)
   self._cartPopup = version
   self._cartNotice = Strings("Saved %s. It is in this list now.", title)
+end
+
+function RomImporter:deleteCart(version, id)
+  if self.workState == "working" then return end
+  local ok, err = require("src.carts.CartStore").uninstall(id)
+  if not ok then self._cartNotice = tostring(err); return end
+  if self.activeCart[version] == id then self:_selectCart(version, nil) end
+  self:_refreshCarts(version)
+  self._cartPicker = nil
+  self._cartPopup = version
+  self._cartNotice = Strings("Cart deleted. Its saves and installed mods were kept.")
 end
 
 function RomImporter:exportCart(id)

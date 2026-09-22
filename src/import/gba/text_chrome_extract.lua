@@ -13,7 +13,11 @@ local Versions = require("src.import.gba.versions")
 local TextChromeExtract = {}
 
 TextChromeExtract.CACHE_SUB = "chrome"
-TextChromeExtract.FORMAT_VERSION = 1
+TextChromeExtract.FORMAT_VERSION = 2
+
+-- src/braille_text.c:15
+TextChromeExtract.BRAILLE_GFX = 0x46FB0C
+TextChromeExtract.BRAILLE_GLYPHS = 64
 
 local function bgr555_to_rgb8(c)
   c = (tonumber(c) or 0) % 32768
@@ -54,8 +58,8 @@ end
 
 --- Decode latin_normal font: 512 glyphs (each is four 8x8 2bpp tiles in 16x16 layout)
 function TextChromeExtract.extractLatinNormal(rom)
-  local baseGfx = 0x1FF300
-  local baseWidths = 0x207300
+  local baseGfx = Versions.address(0x1FF300)
+  local baseWidths = Versions.address(0x207300)
   local glyphCount = 512
   local cols = 16
   local rows = math.floor((glyphCount + cols - 1) / cols)
@@ -126,8 +130,8 @@ end
 
 --- Decode latin_small font: 288 glyphs (each is two 8x8 2bpp tiles in 8x16 layout)
 function TextChromeExtract.extractLatinSmall(rom)
-  local baseGfx = 0x1EAF00
-  local baseWidths = 0x1EEF00
+  local baseGfx = Versions.address(0x1EAF00)
+  local baseWidths = Versions.address(0x1EEF00)
   local glyphCount = 288 -- 0x120
   local cols = 16
   local rows = math.floor((glyphCount + cols - 1) / cols) -- 18
@@ -192,9 +196,75 @@ function TextChromeExtract.extractLatinSmall(rom)
   }
 end
 
+-- src/braille_text.c:15
+function TextChromeExtract.extractBraille(rom)
+  local baseGfx = Versions.address(TextChromeExtract.BRAILLE_GFX)
+  local glyphCount = TextChromeExtract.BRAILLE_GLYPHS
+  local cols = 16
+  local rows = math.floor((glyphCount + cols - 1) / cols)
+  local sheetW, sheetH = cols * 16, rows * 16
+
+  local fgPixels = {}
+  local shPixels = {}
+  for i = 1, sheetW * sheetH * 4 do
+    fgPixels[i] = 0
+    shPixels[i] = 0
+  end
+
+  for gid = 0, glyphCount - 1 do
+    -- src/braille_text.c:333
+    local gOff = baseGfx + 512 * math.floor(gid / 8) + 32 * (gid % 8)
+    local subTiles = {
+      { tx = 0, ty = 0, t = unpack_tile16(rom, gOff) },
+      { tx = 8, ty = 0, t = unpack_tile16(rom, gOff + 16) },
+      { tx = 0, ty = 8, t = unpack_tile16(rom, gOff + 256) },
+      { tx = 8, ty = 8, t = unpack_tile16(rom, gOff + 272) },
+    }
+    local ox = (gid % cols) * 16
+    local oy = math.floor(gid / cols) * 16
+    for _, sub in ipairs(subTiles) do
+      for y = 0, 7 do
+        for x = 0, 7 do
+          local v = sub.t[y][x]
+          local pi = ((oy + sub.ty + y) * sheetW + ox + sub.tx + x) * 4 + 1
+          if v == 1 then
+            fgPixels[pi] = 255
+            fgPixels[pi + 1] = 255
+            fgPixels[pi + 2] = 255
+            fgPixels[pi + 3] = 255
+          elseif v == 2 then
+            shPixels[pi] = 255
+            shPixels[pi + 1] = 255
+            shPixels[pi + 2] = 255
+            shPixels[pi + 3] = 255
+          end
+        end
+      end
+    end
+  end
+
+  local fgChars, shChars = {}, {}
+  for i = 1, sheetW * sheetH * 4 do
+    fgChars[i] = string.char(fgPixels[i] or 0)
+    shChars[i] = string.char(shPixels[i] or 0)
+  end
+
+  return {
+    fgRgba = table.concat(fgChars),
+    shRgba = table.concat(shChars),
+    width = sheetW,
+    height = sheetH,
+    cols = cols,
+    rows = rows,
+    glyphCount = glyphCount,
+    glyphW = 16,
+    glyphH = 16,
+  }
+end
+
 --- Decode down_arrows: 8 frames of 16x16 (sDownArrowTiles @ 0x1EA14C in FireRed)
 function TextChromeExtract.extractDownArrows(rom)
-  local baseGfx = 0x1EA14C
+  local baseGfx = Versions.address(0x1EA14C)
   local sheetW, sheetH = 128, 16
   local pal = {
     [0] = { 0, 0, 0, 0 },
@@ -256,7 +326,7 @@ end
 
 -- pokefirered/src/text.c:32
 function TextChromeExtract.extractTextCursor(rom)
-  local baseGfx, basePal = 0x1EA54C, 0x3CC2E4
+  local baseGfx, basePal = Versions.address(0x1EA54C), Versions.address(0x3CC2E4)
   local pal = { [0] = { 0, 0, 0, 0 } }
   for i = 1, 15 do
     local lo = (rom and rom:get(basePal + i * 2)) or 0
@@ -337,13 +407,13 @@ local function decode_4bpp_frame(rom, offset, tilesW, tilesH, pal, maxTiles)
 end
 
 function TextChromeExtract.extractMenuMessage(rom)
-  local pal0 = read_pal(rom, 0x471DEC)
-  return decode_4bpp_frame(rom, 0x41F1C8, 6, 3, pal0, 18)
+  local pal0 = read_pal(rom, Versions.address(0x471DEC))
+  return decode_4bpp_frame(rom, Versions.address(0x41F1C8), 6, 3, pal0, 18)
 end
 
 function TextChromeExtract.extractStdFrame(rom)
-  local pal3 = read_pal(rom, 0x471E4C)
-  return decode_4bpp_frame(rom, 0x471A4C, 3, 3, pal3, 9)
+  local pal3 = read_pal(rom, Versions.address(0x471E4C))
+  return decode_4bpp_frame(rom, Versions.address(0x471A4C), 3, 3, pal3, 9)
 end
 
 local KEYPAD_PALETTE = {
@@ -413,8 +483,8 @@ function TextChromeExtract.extractKeypadIcons(rom)
 end
 
 function TextChromeExtract.extractSignpostFrame(rom)
-  local pal1 = read_pal(rom, 0x471E0C)
-  return decode_4bpp_frame(rom, 0x470B0C, 5, 4, pal1, 19)
+  local pal1 = read_pal(rom, Versions.address(0x471E0C))
+  return decode_4bpp_frame(rom, Versions.address(0x470B0C), 5, 4, pal1, 19)
 end
 
 local function format_widths_lua(widths, comment)
@@ -446,7 +516,7 @@ local function read_ptr(rom, offset)
 end
 
 function TextChromeExtract.extractUserFrame(rom, frameType)
-  local entry = TextChromeExtract.USER_FRAMES_TABLE + frameType * 8
+  local entry = Versions.address(TextChromeExtract.USER_FRAMES_TABLE) + frameType * 8
   local tiles = read_ptr(rom, entry)
   local pal = read_pal(rom, read_ptr(rom, entry + 4))
   return decode_4bpp_frame(rom, tiles, 3, 3, pal, 9)
@@ -476,6 +546,14 @@ function TextChromeExtract.run(rom, cache, opts)
   write_cache(cache, fDir .. "/latin_small_fg.rgba", small.fgRgba)
   write_cache(cache, fDir .. "/latin_small_shadow.rgba", small.shRgba)
   write_cache(cache, fDir .. "/latin_small_widths.lua", format_widths_lua(small.widths, "sFontSmallLatinGlyphWidths (FireRed @ 0x1EEF00)"))
+
+  local braille = TextChromeExtract.extractBraille(rom)
+  write_cache(cache, fDir .. "/braille_fg.rgba", braille.fgRgba)
+  write_cache(cache, fDir .. "/braille_shadow.rgba", braille.shRgba)
+  write_cache(cache, fDir .. "/braille.lua", string.format(
+    "return { glyphCount = %d, cols = %d, rows = %d, glyphW = %d, glyphH = %d, width = %d, height = %d }\n",
+    braille.glyphCount, braille.cols, braille.rows,
+    braille.glyphW, braille.glyphH, braille.width, braille.height))
 
   local arrows = TextChromeExtract.extractDownArrows(rom)
   write_cache(cache, fDir .. "/down_arrows_fg.rgba", arrows.rgba)

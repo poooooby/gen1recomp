@@ -48,19 +48,36 @@ test("TrainerCard front and back flip", function()
   assert(TrainerCard.isOpen() == true, "Should be open")
   assert(TrainerCard.side == "front", "Initial side should be front")
 
-  -- Press A to flip to back
   local inpA = { wasPressed = function(_, k) return k == "a" end }
+  local inpB = { wasPressed = function(_, k) return k == "b" end }
+  local function settle()
+    for _ = 1, 64 do TrainerCard.update(1 / 60) end
+  end
+
+  -- src/trainer_card.c:558 A on the front starts the flip to the back
   TrainerCard.handleInput(inpA)
+  settle()
   assert(TrainerCard.side == "back", "Side should flip to back")
 
-  -- Press A again to flip to front
-  TrainerCard.handleInput(inpA)
+  -- src/trainer_card.c:588 B on the back flips to the front
+  TrainerCard.handleInput(inpB)
+  settle()
   assert(TrainerCard.side == "front", "Side should flip back to front")
 
-  -- Press B to close
-  local inpB = { wasPressed = function(_, k) return k == "b" end }
+  -- src/trainer_card.c:566 B on the front closes the card
   TrainerCard.handleInput(inpB)
   assert(TrainerCard.isOpen() == false, "Should be closed after B")
+end)
+
+test("A on the back closes the card", function()
+  -- src/trainer_card.c:604 A on the back exits instead of flipping
+  TrainerCard.show({ session = session })
+  local inpA = { wasPressed = function(_, k) return k == "a" end }
+  TrainerCard.handleInput(inpA)
+  for _ = 1, 64 do TrainerCard.update(1 / 60) end
+  assert(TrainerCard.side == "back", "Should be on the back")
+  TrainerCard.handleInput(inpA)
+  assert(TrainerCard.isOpen() == false, "A on the back should close the card")
 end)
 
 print("[test] 2. SaveMenu lifecycle and state machine")
@@ -202,6 +219,24 @@ test("Runtime.pumpRtc increments and synchronizes playtime", function()
   assert(sess.playTimeSeconds == 0, "Seconds should roll over to 0 (was " .. tostring(sess.playTimeSeconds) .. ")")
   assert(game.save.playTimeHours == 2, "Save hours should synchronize to 2")
   assert(game.save.playTimeMinutes == 0, "Save minutes should synchronize to 0")
+end)
+
+print("[test] 7. SaveMenu location header resolution from ROM mapsec")
+test("SaveMenu location resolution does not print engine internal map IDs", function()
+  local MapSectionsExtract = require("src.import.gba.map_sections_extract")
+  local tests = {
+    { map = "FR_ROUTE_22", want = "ROUTE 22" },
+    { map = "FR_PALLET_TOWN", want = "PALLET TOWN" },
+    { map = "FR_VIRIDIAN_CITY", want = "VIRIDIAN CITY" },
+    { map = "FR_CELADON_CITY_DEPARTMENT_STORE_2F", want = "CELADON DEPT." },
+    { map = "FR_POKEMON_TOWER_3F", want = "POKéMON TOWER" },
+    { map = "FR_ROUTE_1", want = "ROUTE 1" },
+  }
+
+  for _, item in ipairs(tests) do
+    local place = MapSectionsExtract.getPlaceName(item.map)
+    assert(place == item.want, string.format("Expected %s for map %s, got %s", item.want, item.map, tostring(place)))
+  end
 end)
 
 print("[test] all passed")

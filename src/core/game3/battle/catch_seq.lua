@@ -8,6 +8,7 @@ local ItemsData = require("src.core.game3.items_data")
 local Pokemon = require("src.core.game3.pokemon")
 local Catching = require("src.core.game3.battle.catching")
 local BallOpen = require("src.core.game3.battle.ball_open")
+local Strings = require("src.core.Strings")
 
 local MUS_CAUGHT_INTRO = 319
 local MUS_CAUGHT = 322
@@ -100,39 +101,43 @@ function CatchSeq.begin(st, itemId, caught, shakes, opts)
 
   local playerName = (session and (session.name or session.playerName)) or "RED"
   local ballName = ItemsData.displayName(itemId) or "POKé BALL"
-  local ename = (st and st.enemy and st.enemy.mon and (st.enemy.mon.nickname or st.enemy.mon.name))
+  local emon = st and st.enemy and st.enemy.mon
+  local ename = (emon and ((emon.nickname ~= "" and emon.nickname) or emon.name))
     or Pokemon.name(st and st.enemy and st.enemy.species) or "POKéMON"
 
   -- pokefirered/data/battle_scripts_2.s:124
-  local DODGE = "It dodged the thrown BALL!\nThis POKéMON can't be caught!"
+  local DODGE = Strings("It dodged the thrown BALL!\nThis POKéMON can't be caught!")
   if opts.ghostDodge then CatchSeq._result = "fail_catch" end
   if CatchSeq._headless then
     if CatchSeq._pushMsg then
-      CatchSeq._pushMsg(playerName .. " used\nthe " .. ballName .. "!")
+      CatchSeq._pushMsg(Strings("%s used\nthe %s!", playerName, ballName))
     end
     if opts.ghostDodge then
       if CatchSeq._pushMsg then CatchSeq._pushMsg(DODGE) end
     elseif caught then
       local res = Catching.storeCaught(session, st and st.enemy, itemId)
+      CatchSeq._catchResult = res
       if CatchSeq._pushMsg then
-        CatchSeq._pushMsg("Gotcha!\n" .. ename .. " was caught!")
+        CatchSeq._pushMsg(Strings("Gotcha!\n%s was caught!", ename))
         if res and res.firstTimeCaught then
-          CatchSeq._pushMsg(ename .. "'s data was\nadded to the POKéDEX.")
+          CatchSeq._pushMsg(Strings("%s's data was\nadded to the POKéDEX.", ename))
         end
         if res and res.location == "pc" then
-          CatchSeq._pushMsg(ename .. " was transferred\nto the PC.")
+          -- pokefirered/src/battle_script_commands.c:9617
+          local Storage = require("src.core.game3.storage")
+          CatchSeq._pushMsg(Storage.pcTransferMessage(session, ename))
         end
       end
     else
       if CatchSeq._pushMsg then
         if CatchSeq._shakes == 0 then
-          CatchSeq._pushMsg("Oh no! The POKéMON broke free!")
+          CatchSeq._pushMsg(Strings("Oh no! The POKéMON broke free!"))
         elseif CatchSeq._shakes == 1 then
-          CatchSeq._pushMsg("Aww! It appeared to be caught!")
+          CatchSeq._pushMsg(Strings("Aww! It appeared to be caught!"))
         elseif CatchSeq._shakes == 2 then
-          CatchSeq._pushMsg("Aargh! Almost had it!")
+          CatchSeq._pushMsg(Strings("Aargh! Almost had it!"))
         else
-          CatchSeq._pushMsg("Shoot! It was so close too!")
+          CatchSeq._pushMsg(Strings("Shoot! It was so close too!"))
         end
       end
     end
@@ -145,7 +150,7 @@ function CatchSeq.begin(st, itemId, caught, shakes, opts)
     steps[#steps + 1] = { kind = kind, data = data or {} }
   end
 
-  add("msg", { text = playerName .. " used\nthe " .. ballName .. "!", wait = opts.ghostDodge and 0 or nil })
+  add("msg", { text = Strings("%s used\nthe %s!", playerName, ballName), wait = opts.ghostDodge and 0 or nil })
 
   -- pokefirered/src/battle_script_commands.c:9590
   add("throw", {
@@ -759,14 +764,14 @@ local function run_step(step)
     local ename = d.ename or "POKéMON"
     -- pokefirered/src/battle_message.c:475
     if CatchSeq._pushMsg then
-      CatchSeq._pushMsg("Gotcha!\n" .. ename .. " was caught!")
+      CatchSeq._pushMsg(Strings("Gotcha!\n%s was caught!", ename))
     end
     pcall(function()
       Audio.waitSe(MUS_CAUGHT_INTRO, function() Audio.playSong(MUS_CAUGHT) end)
     end)
     if CatchSeq._pushMsg then
       if res and res.firstTimeCaught then
-        CatchSeq._pushMsg(ename .. "'s data was\nadded to the POKéDEX.")
+        CatchSeq._pushMsg(Strings("%s's data was\nadded to the POKéDEX.", ename))
       end
     end
     advance()
@@ -776,13 +781,13 @@ local function run_step(step)
   if kind == "breakout" then
     if CatchSeq._pushMsg then
       if d.shakes == 0 then
-        CatchSeq._pushMsg("Oh no! The POKéMON broke free!")
+        CatchSeq._pushMsg(Strings("Oh no! The POKéMON broke free!"))
       elseif d.shakes == 1 then
-        CatchSeq._pushMsg("Aww! It appeared to be caught!")
+        CatchSeq._pushMsg(Strings("Aww! It appeared to be caught!"))
       elseif d.shakes == 2 then
-        CatchSeq._pushMsg("Aargh! Almost had it!")
+        CatchSeq._pushMsg(Strings("Aargh! Almost had it!"))
       else
-        CatchSeq._pushMsg("Shoot! It was so close too!")
+        CatchSeq._pushMsg(Strings("Shoot! It was so close too!"))
       end
     end
     advance()

@@ -4,8 +4,49 @@ local MapIds = require("src.core.game3.map_ids")
 local Movement = require("src.core.game3.scripting.movement")
 local Flags = require("src.core.game3.scripting.flags")
 local Opcodes = require("src.core.game3.scripting.opcodes")
+local Strings = require("src.core.Strings")
 
 local Adapters = {}
+
+-- pokefirered/src/scrcmd.c:807
+local WARP_SLOT_FIELD = {
+  setwarp = "warpDestination",
+  setdynamicwarp = "dynamicWarp",
+  setescapewarp = "escapeWarp",
+  setdivewarp = "diveWarp",
+  setholewarp = "holeWarp",
+}
+
+-- pokefirered/src/event_object_movement.c:5208 GetOppositeDirection
+local OPPOSITE_DIR = { down = "up", up = "down", left = "right", right = "left" }
+
+-- pokefirered/src/event_object_movement.c:4789 GetDirectionToFace
+local function directionToFace(x1, y1, x2, y2)
+  if x1 > x2 then return "left" end
+  if x1 < x2 then return "right" end
+  if y1 > y2 then return "up" end
+  return "down"
+end
+
+-- pokefirered/src/overworld.c:516
+local function warp_s8(v)
+  v = (tonumber(v) or 0) % 256
+  if v >= 128 then return v - 256 end
+  return v
+end
+
+local function warp_map_id(group, num)
+  local okC, MapCatalog = pcall(require, "src.import.gba.map_catalog")
+  local id = okC and MapCatalog and MapCatalog.mapIdFor and MapCatalog.mapIdFor(group, num)
+  if type(id) == "string" and id ~= "" then return id end
+  local okV, Versions = pcall(require, "src.import.gba.versions")
+  if okV and Versions then
+    id = (Versions.frMapFor and Versions.frMapFor(group, num))
+      or (Versions.mapIdFor and Versions.mapIdFor(group, num))
+    if type(id) == "string" and id ~= "" then return id end
+  end
+  return nil
+end
 
 --- Build a test/stub adapter set. opts may override any method.
 function Adapters.stub(opts)
@@ -69,6 +110,20 @@ function Adapters.stub(opts)
   a.askYesNo = opts.askYesNo or function(cb) if cb then cb(true) end end
   a.fadeScreen = opts.fadeScreen or function(_mode, _speed, done) if done then done() end end
   a.openNaming = opts.openNaming or function(_opts, done) if done then done("RED") end end
+  -- pokefirered/src/party_menu_specials.c:14
+  a.chooseParty = opts.chooseParty or function(_opts, done) if done then done(nil) end end
+  -- pokefirered/src/field_specials.c:1094
+  a.elevatorWindow = opts.elevatorWindow or function(floorLabel)
+    a.elevatorFloorLabel = floorLabel
+  end
+  -- pokefirered/src/field_specials.c:1113
+  a.elevatorWindowClose = opts.elevatorWindowClose or function()
+    a.elevatorFloorLabel = nil
+  end
+  a.openEasyChat = opts.openEasyChat or function(o, done)
+    local def = { 2601, 4128, 526, 2611 }
+    if done then done(true, (o and o.words) or def) end
+  end
   a.hallOfFame = opts.hallOfFame or function(done)
     local HallOfFame = require("src.ui.game3.hall_of_fame")
     HallOfFame.start({
@@ -94,11 +149,11 @@ function Adapters.stub(opts)
     end
     if op == "bufferstdstring" then
       local STD = {
-        [24] = "ITEMS POCKET",
-        [25] = "KEY ITEMS POCKET",
-        [26] = "POKé BALLS POCKET",
-        [27] = "TM CASE",
-        [28] = "BERRY POUCH",
+        [24] = Strings("ITEMS POCKET"),
+        [25] = Strings("KEY ITEMS POCKET"),
+        [26] = Strings("POKé BALLS POCKET"),
+        [27] = Strings("TM CASE"),
+        [28] = Strings("BERRY POUCH"),
       }
       return STD[tonumber(src) or -1]
     end
@@ -265,13 +320,42 @@ function Adapters.host(mod, game, world)
           else
             tr.i = tr.i + 1
             if act.kind == "step" then
-              if ent and ent.scriptStep then ent:scriptStep(act.dir) end
+              if ent and ent.scriptStep then ent:scriptStep(act.dir, act.run, act.slow) end
+            elseif act.kind == "jump" then
+              if ent and ent.scriptJump then
+                ent:scriptJump(act.dir, act.distance or 1)
+              elseif ent and ent.scriptStep then
+                for _ = 1, (act.distance or 1) do
+                  ent:scriptStep(act.dir)
+                end
+              end
             elseif act.kind == "turn" then
               if ent and ent.scriptFace then
                 ent:scriptFace(act.dir)
               elseif ent then
                 ent.facing = act.dir
               end
+            elseif act.kind == "face_player" then
+              -- pokefirered/src/event_object_movement.c:6772 MovementAction_FacePlayer_Step0
+              local P = package.loaded["src.core.game3.player"]
+              if not (P and P.cellX) then
+                local w = resolveWorld()
+                P = w and w.player
+              end
+              if ent and P and P.cellX and ent.cellX then
+                local dir = directionToFace(ent.cellX, ent.cellY, P.cellX, P.cellY)
+                if act.away then dir = OPPOSITE_DIR[dir] end
+                if ent.scriptFace then ent:scriptFace(dir) else ent.facing = dir end
+              end
+            elseif act.kind == "lock_facing" then
+              -- pokefirered/src/event_object_movement.c:6796 MovementAction_LockFacingDirection_Step0
+              if ent then ent.facingLocked = act.locked and true or false end
+            elseif act.kind == "animate" then
+              -- pokefirered/src/event_object_movement.c:7040 MovementAction_DisableAnimation_Step0
+              if ent then ent.inanimate = act.inanimate and true or false end
+            elseif act.kind == "remove_obstacle" then
+              -- pokefirered/src/event_object_movement.c:7135 MovementAction_RockSmashBreak_Step0
+              tr.sleep = act.frames or 32
             elseif act.kind == "sleep" then
               tr.sleep = act.frames or 1
             elseif act.kind == "hide" then
@@ -485,6 +569,22 @@ function Adapters.host(mod, game, world)
       local Party = require("src.core.game3.party")
       return Party.giveMon(session, species, level, nickname)
     end,
+    -- pokefirered/src/script_pokemon_util.c:48
+    giveMonToPlayer = function(species, level, _, nickname)
+      local Runtime = package.loaded["src.core.game3.runtime"]
+      local session = Runtime and Runtime.getSession and Runtime.getSession()
+      if not session then return nil end
+      local Party = require("src.core.game3.party")
+      return Party.giveMonToPlayer(session, species, level, nickname)
+    end,
+    -- pokefirered/src/script_pokemon_util.c:75
+    giveEggToPlayer = function(species)
+      local Runtime = package.loaded["src.core.game3.runtime"]
+      local session = Runtime and Runtime.getSession and Runtime.getSession()
+      if not session then return nil end
+      local Party = require("src.core.game3.party")
+      return Party.giveEggToPlayer(session, species)
+    end,
     freezeLocal = function(localId, snap)
       local G3 = useGame3Objects()
       if G3 then
@@ -602,6 +702,12 @@ function Adapters.host(mod, game, world)
         return
       end
       finish()
+    end,
+    setFieldEffectArgument = function(argNum, value)
+      local FieldEffects = require("src.core.game3.field_effects")
+      if FieldEffects.setFieldEffectArgument then
+        FieldEffects.setFieldEffectArgument(argNum, value)
+      end
     end,
     openPc = function(done, pcOpts)
       local function finish()
@@ -780,14 +886,9 @@ function Adapters.host(mod, game, world)
           npc.cellX, npc.cellY = x, y
           if npc.x then npc.x = x * 16 end
           if npc.y then npc.y = y * 16 end
-          if npc.def then
-            npc.def.x, npc.def.y = x, y
-          end
         end
       elseif op == "copyobjectxytoperm" then
-        if npc.cellX and npc.cellY and npc.def then
-          npc.def.x, npc.def.y = npc.cellX, npc.cellY
-        end
+        -- Instance template copy on live NPC; do not poison global mapDef.objects.
       elseif op == "setobjectmovementtype" then
         -- Cosmetic on host; facing types 7–10 are FACE_*.
         local mt = tonumber(row[2]) or 0
@@ -992,6 +1093,97 @@ function Adapters.host(mod, game, world)
       end
       Fade.clear()
       Naming.open(opts)
+    end,
+    -- pokefirered/src/party_menu_specials.c:14
+    chooseParty = function(chooseOpts, done)
+      local PartyMenu = require("src.ui.game3.party_menu")
+      local Message = require("src.ui.game3.message")
+      local Runtime = require("src.core.game3.runtime")
+      chooseOpts = chooseOpts or {}
+      local g = resolveGame()
+      local session = (Runtime.getSession and Runtime.getSession())
+        or (g and g.session)
+      local party = session and session.party
+      if not (party and party[1]) then
+        if done then done(nil) end
+        return
+      end
+      if Message.isOpen and Message.isOpen() and Message.close then
+        Message.close()
+      end
+      local picked = nil
+      local function resume()
+        if done then done(picked) end
+        tick_vm()
+      end
+      PartyMenu.show(party, nil, {
+        -- pokefirered/src/party_menu.c:5651 InitChooseMonsForBattle
+        mode = chooseOpts.mode or "choose",
+        count = chooseOpts.count,
+        menuType = chooseOpts.menuType,
+        chooseMonsBattleType = chooseOpts.chooseMonsBattleType,
+        session = session,
+        onSelect = function(slot)
+          if type(slot) == "table" then
+            picked = slot
+            return
+          end
+          local s = tonumber(slot)
+          if s and s >= 1 then picked = s - 1 end
+        end,
+        onClose = function()
+          -- pokefirered/src/party_menu.c:5746 Task_ValidateChosenMonsForBattle
+          if picked == nil and PartyMenu.chosenOrder then
+            local order = PartyMenu.chosenOrder()
+            if order and order[1] then picked = order end
+          end
+          if not Runtime.defer(resume) then resume() end
+        end,
+      })
+    end,
+    -- pokefirered/src/field_specials.c:1094
+    elevatorWindow = function(floorLabel)
+      local ok, Window = pcall(require, "src.ui.game3.elevator_window")
+      if ok and Window and Window.show then Window.show(floorLabel) end
+    end,
+    -- pokefirered/src/field_specials.c:1113
+    elevatorWindowClose = function()
+      local ok, Window = pcall(require, "src.ui.game3.elevator_window")
+      if ok and Window and Window.hide then Window.hide() end
+    end,
+    -- pokefirered/src/overworld.c:605
+    setWarp = function(op, group, num, warpId, x, y)
+      local Runtime = package.loaded["src.core.game3.runtime"]
+      local session = (Runtime and Runtime.getSession and Runtime.getSession())
+        or (resolveGame() and resolveGame().session)
+      if not session then return nil end
+      local slot = WARP_SLOT_FIELD[op]
+      if not slot then return nil end
+      local warp = {
+        map = warp_map_id(group, num),
+        mapGroup = tonumber(group) or 0,
+        mapNum = tonumber(num) or 0,
+        warpId = warp_s8(warpId),
+        x = warp_s8(x),
+        y = warp_s8(y),
+      }
+      session[slot] = warp
+      return warp
+    end,
+    openEasyChat = function(opts, done)
+      local EasyChat = require("src.ui.game3.easy_chat")
+      local Fade = require("src.ui.game3.fade")
+      local Message = require("src.ui.game3.message")
+      opts = opts or {}
+      opts.onDone = function(confirmed, words)
+        if done then done(confirmed, words) end
+        tick_vm()
+      end
+      if Message.isOpen and Message.isOpen() and Message.close then
+        Message.close()
+      end
+      Fade.clear()
+      EasyChat.open(opts)
     end,
     warp = function(group, num, warpId, x, y, done)
       local Versions = require("src.import.gba.versions")
@@ -1214,6 +1406,8 @@ function Adapters.host(mod, game, world)
       a.log("[game3] showTownMap via RegionMap")
       RegionMap.show({
         session = session,
+        -- pokefirered/src/field_specials.c:185 ShowTownMap
+        mode = "wall",
         onClose = function()
           Fade.clear()
           if done then done() end
@@ -1244,17 +1438,33 @@ function Adapters.host(mod, game, world)
         victoryText = battleOpts.victoryText or (foe and foe.victoryText),
         earlyRival = battleOpts.earlyRival,
         rivalFlags = battleOpts.rivalFlags,
+        firstBattle = battleOpts.firstBattle or (foe and foe.firstBattle),
         noWhiteout = battleOpts.noWhiteout,
         double = battleOpts.double,
+        -- pokefirered/src/trainer_tower.c:735 BATTLE_TYPE_TRAINER_TOWER
+        trainerTower = battleOpts.trainerTower,
+        -- pokefirered/src/battle_tower.c:933 BATTLE_TYPE_EREADER_TRAINER
+        eReader = battleOpts.eReader,
+        -- pokefirered/src/battle_message.c:2066 GetTrainerTowerOpponentName
+        trainerName = battleOpts.trainerName or (foe and foe.trainerName),
+        trainerPicId = battleOpts.trainerPicId or (foe and foe.trainerPicId),
         done = function(result)
           if done then done(result or "win") end
           tick_vm()
         end,
       })
     end,
-    startWildBattle = function(foe, done)
+    startWildBattle = function(foe, done, battleOpts)
       local BattleBridge = require("src.core.game3.battle_bridge")
+      battleOpts = battleOpts or {}
       BattleBridge.startWild(mod, resolveGame(), foe, {
+        wildScripted = (foe and foe.wildScripted) or battleOpts.wildScripted,
+        legendary = (foe and foe.legendary) or battleOpts.legendary,
+        oldManTutorial = (foe and foe.oldManTutorial) or battleOpts.oldManTutorial,
+        safari = (foe and foe.safari) or battleOpts.safari,
+        roamer = (foe and foe.roamer) or battleOpts.roamer,
+        firstBattle = (foe and foe.firstBattle) or battleOpts.firstBattle,
+        aiFlags = (foe and foe.aiFlags) or battleOpts.aiFlags,
         done = function(result)
           if done then done(result or "win") end
           tick_vm()
@@ -1275,16 +1485,16 @@ function Adapters.host(mod, game, world)
       if op == "bufferstdstring" then
         -- pret constants/menu.h STDSTRING_*
         local STD = {
-          [10] = "ITEMS",
-          [11] = "KEY ITEMS",
-          [12] = "POKé BALLS",
-          [13] = "TMs & HMs",
-          [14] = "BERRIES",
-          [24] = "ITEMS POCKET",
-          [25] = "KEY ITEMS POCKET",
-          [26] = "POKé BALLS POCKET",
-          [27] = "TM CASE",
-          [28] = "BERRY POUCH",
+          [10] = Strings("ITEMS"),
+          [11] = Strings("KEY ITEMS"),
+          [12] = Strings("POKé BALLS"),
+          [13] = Strings("TMs & HMs"),
+          [14] = Strings("BERRIES"),
+          [24] = Strings("ITEMS POCKET"),
+          [25] = Strings("KEY ITEMS POCKET"),
+          [26] = Strings("POKé BALLS POCKET"),
+          [27] = Strings("TM CASE"),
+          [28] = Strings("BERRY POUCH"),
         }
         return STD[tonumber(src) or -1] or tostring(src)
       end

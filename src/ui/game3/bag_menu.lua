@@ -10,6 +10,7 @@ local ItemUse = require("src.core.game3.item_use")
 local Options = require("src.core.game3.options")
 local Trig = require("src.core.game3.trig")
 local PartyView = require("src.core.game3.battle.party_view")
+local Strings = require("src.core.Strings")
 
 local BagMenu = {}
 
@@ -37,6 +38,9 @@ local SE_SELECT = 5
 
 -- src/item_menu_icons.c:81
 local SHAKE_ROT = { -2, -4, -2, 0, 2, 4, 2, 0, -2, -4, -2, 0 }
+
+-- src/item_use.c:159
+local FIELD_EXIT_FADE = { bike = true, rod = true }
 
 -- src/bag.c:13
 local WIN_WHITE = { fg = FrlgFont.STDPAL[1], shadow = FrlgFont.STDPAL[2], bg = FrlgFont.STDPAL[0] }
@@ -241,6 +245,10 @@ function BagMenu.show(sessionBag, opts)
   local st = bag_state()
   BagMenu.pocketIdx = opts.pocketIdx or st.pocket or 1
   BagMenu.mode = "list"
+  BagMenu.messageText = nil
+  BagMenu._msgPages = nil
+  BagMenu._msgPage = 1
+  BagMenu._msgDone = nil
   BagMenu.partyPurpose = "use"
   BagMenu.tossQty = 1
   BagMenu._onClose = opts.onClose
@@ -267,6 +275,7 @@ function BagMenu.close()
   BagMenu._open = nil
   BagMenu._exit = nil
   BagMenu._switch = nil
+  BagMenu._msgDone = nil
   BagMenu.open = false
   local battleCb = BagMenu._onBattleUse
   local wasBattle = BagMenu._battle
@@ -396,6 +405,27 @@ local function open_submenu(fn)
   begin_exit(false, fn)
 end
 
+-- src/text.c:796
+local function show_bag_message(text, onDone)
+  local pages = {}
+  for page in (tostring(text or "") .. "\f"):gsub("\\p", "\f"):gmatch("(.-)\f") do
+    if page ~= "" then pages[#pages + 1] = page end
+  end
+  BagMenu.mode = "message"
+  BagMenu._msgPages = #pages > 1 and pages or nil
+  BagMenu._msgPage = 1
+  BagMenu.messageText = pages[1] or text
+  BagMenu._msgDone = onDone
+end
+
+-- src/item_menu.c:1018 DisplayItemMessageInBag
+BagMenu.showMessage = show_bag_message
+
+-- src/item_use.c:182
+local function use_field_from_bag(session, bag, id)
+  return ItemUse.useField(session, bag, id, nil)
+end
+
 local function handle_menu_input(input)
   if BagMenu.mode == "toss" then
     local rows = BagMenu.list()
@@ -415,7 +445,7 @@ local function handle_menu_input(input)
       BagMenu.mode = "list"
       clamp_cursor()
     elseif input:wasPressed("b") then
-      se(9)
+      se(5) -- pokefirered/src/item_menu.c:1540
       BagMenu.mode = "action"
     end
     return
@@ -424,9 +454,22 @@ local function handle_menu_input(input)
   if BagMenu.mode == "message" then
     if input:wasPressed("a") or input:wasPressed("b") or input:wasPressed("start") then
       se(5)
+      local pages = BagMenu._msgPages
+      -- pokefirered/src/text.c:796
+      if pages and BagMenu._msgPage < #pages then
+        BagMenu._msgPage = BagMenu._msgPage + 1
+        BagMenu.messageText = pages[BagMenu._msgPage]
+        return
+      end
       BagMenu.mode = "list"
       BagMenu.messageText = nil
+      BagMenu._msgPages = nil
+      BagMenu._msgPage = 1
       clamp_cursor()
+      -- pokefirered/src/item_menu.c:1018 DisplayItemMessageInBag followUpFunc
+      local onDone = BagMenu._msgDone
+      BagMenu._msgDone = nil
+      if onDone then onDone() end
     end
     return
   end
@@ -480,8 +523,8 @@ local function handle_menu_input(input)
                 local mon = liveParty and liveParty[realSlot]
                 local canUse, err = BattleItems.canUseOn(st, row.id, realSlot, mon)
                 if not canUse then
-                  se(9)
-                  PartyMenu.showMessage(err or "It won't have any effect.", function()
+                  se(5) -- pokefirered/src/party_menu.c:4490
+                  PartyMenu.showMessage(err or Strings("It won't have any effect."), function()
                     PartyMenu.mode = "use"
                   end)
                   return
@@ -541,7 +584,7 @@ local function handle_menu_input(input)
           elseif ItemUse.needsPartyTarget(row.id) then
             if #party == 0 then
               BagMenu.mode = "message"
-              BagMenu.messageText = "There is no POKéMON."
+              BagMenu.messageText = Strings("There is no POKéMON.")
             else
               local PartyMenu = require("src.ui.game3.party_menu")
               open_submenu(function()
@@ -559,7 +602,7 @@ local function handle_menu_input(input)
               end)
             end
           else
-            local ok, kind, text = ItemUse.useField(BagMenu._session, BagMenu._bag, row.id, nil)
+            local ok, kind, text = use_field_from_bag(BagMenu._session, BagMenu._bag, row.id)
             if kind == "vs_seeker" and not ok then
               BagMenu.mode = "message"
               BagMenu.messageText = text
@@ -578,6 +621,56 @@ local function handle_menu_input(input)
                 require("src.core.game3.vs_seeker").use(session, nil)
               end)
               return
+            elseif kind == "itemfinder" then
+              local session = BagMenu._session
+              begin_exit(true, function()
+                BagMenu.close()
+                local StartMenu = package.loaded["src.ui.game3.start_menu"]
+                if StartMenu and StartMenu.isOpen and StartMenu.isOpen() then
+                  StartMenu.open = false
+                  StartMenu._onClose = nil
+                  Stack.pop("start")
+                end
+                field_fade_in()
+                local Field = require("src.core.game3.field")
+                Field.useItemfinder(session, true)
+              end)
+              return
+            elseif ok and kind == "escape" then
+              -- pokefirered/src/item_use.c:159 SetUpItemUseOnFieldCallback
+              begin_exit(true, function()
+                BagMenu.close()
+                local StartMenu = package.loaded["src.ui.game3.start_menu"]
+                if StartMenu and StartMenu.isOpen and StartMenu.isOpen() then
+                  StartMenu.open = false
+                  StartMenu._onClose = nil
+                  Stack.pop("start")
+                end
+                field_fade_in()
+                ItemUse.runOnFieldCallback()
+              end)
+              return
+            elseif ok and FIELD_EXIT_FADE[kind] ~= nil then
+              -- pokefirered/src/item_use.c:159
+              local fade = FIELD_EXIT_FADE[kind]
+              begin_exit(true, function()
+                BagMenu.close()
+                local StartMenu = package.loaded["src.ui.game3.start_menu"]
+                if StartMenu and StartMenu.isOpen and StartMenu.isOpen() then
+                  StartMenu.open = false
+                  StartMenu._onClose = nil
+                  Stack.pop("start")
+                end
+                if fade then field_fade_in() end
+              end)
+              return
+            elseif ok and kind == "map" then
+              -- pokefirered/src/item_use.c:649
+              BagMenu.mode = "list"
+              clamp_cursor()
+            elseif text then
+              -- pokefirered/src/item_use.c:186
+              show_bag_message(text)
             else
               BagMenu.mode = "list"
               clamp_cursor()
@@ -588,10 +681,10 @@ local function handle_menu_input(input)
         local pocket = BagMenu.currentPocket()
         if pocket == "KEY_ITEMS" or pocket == "TM_CASE" then
           BagMenu.mode = "message"
-          BagMenu.messageText = "This item can't be held."
+          BagMenu.messageText = Strings("This item can't be held.")
         elseif #party == 0 then
           BagMenu.mode = "message"
-          BagMenu.messageText = "There is no POKéMON."
+          BagMenu.messageText = Strings("There is no POKéMON.")
         else
           local PartyMenu = require("src.ui.game3.party_menu")
           -- src/item_menu.c:1620
@@ -637,7 +730,7 @@ local function handle_menu_input(input)
         BagMenu.mode = "list"
       end
     elseif input:wasPressed("b") then
-      se(9)
+      se(5) -- pokefirered/src/item_menu.c:1453
       BagMenu.mode = "list"
     end
     return
@@ -822,7 +915,7 @@ function BagMenu.draw()
 
   if not switching then
     -- src/bag.c:226
-    local pLabel = ItemsData.POCKET_LABEL[pocket] or pocket
+    local pLabel = Strings(ItemsData.POCKET_LABEL[pocket] or pocket)
     local tw = FrlgFont.measure(pLabel)
     FrlgFont.draw(pLabel, 8 + math.floor((72 - tw) / 2), 9, { colors = WIN_WHITE })
   end
@@ -845,7 +938,7 @@ function BagMenu.draw()
       end
       local r = rows[idx]
       if not r then
-        FrlgFont.draw("CANCEL", 97, y, { colors = FrlgFont.COLOR.NORMAL })
+        FrlgFont.draw(Strings("CANCEL"), 97, y, { colors = FrlgFont.COLOR.NORMAL })
       else
         local label = r.name
         if session and session.registeredItem
@@ -900,7 +993,7 @@ function BagMenu.draw()
       Window.stdFrame(Window.template(5, 14, 25, 6))
     end
     local desc = sel and sel.description
-    if not sel then desc = "CLOSE BAG" end
+    if not sel then desc = Strings("CLOSE BAG") end
     if desc then
       -- src/item_menu.c:756 (window 1 at (5, 14), x=0, y=3, maxWidth=200, linePitch=14)
       FrlgFont.draw(desc, 40, 115, { colors = WIN_WHITE, maxWidth = 200, linePitch = 14 })
@@ -912,7 +1005,7 @@ function BagMenu.draw()
     -- Bottom left prompt window (pret bag.c: sWindowTemplates[6] = (6, 15, 14, 4))
     if sel then
       Window.stdFrame(Window.template(6, 15, 14, 4))
-      FrlgFont.draw((sel.name or "ITEM") .. " is\nselected.", 6 * 8 + 4, 15 * 8 + 2, { maxWidth = 14 * 8, linePitch = 15, colors = FrlgFont.COLOR.NORMAL })
+      FrlgFont.draw(Strings("%s is\nselected.", (sel.name or "ITEM")), 6 * 8 + 4, 15 * 8 + 2, { maxWidth = 14 * 8, linePitch = 15, colors = FrlgFont.COLOR.NORMAL })
     end
 
     refresh_actions()
@@ -927,7 +1020,7 @@ function BagMenu.draw()
       if i == BagMenu.actionCursor then
         Window.cursorPx(popX * 8 + 1, rowY)
       end
-      FrlgFont.draw(act, popX * 8 + 9, rowY, { colors = FrlgFont.COLOR.NORMAL })
+      FrlgFont.draw(Strings(act), popX * 8 + 9, rowY, { colors = FrlgFont.COLOR.NORMAL })
     end
   end
 
@@ -938,7 +1031,7 @@ function BagMenu.draw()
     local popW = 12
     local popH = 4
     Window.stdFrame(Window.template(popX, popY, popW, popH))
-    FrlgFont.draw("TOSS HOW MANY?", popX * 8 + 4, popY * 8 + 2, { colors = FrlgFont.COLOR.NORMAL })
+    FrlgFont.draw(Strings("TOSS HOW MANY?"), popX * 8 + 4, popY * 8 + 2, { colors = FrlgFont.COLOR.NORMAL })
     FrlgFont.draw(string.format("× %02d", BagMenu.tossQty), popX * 8 + 24, (popY + 2) * 8 + 2, { colors = FrlgFont.COLOR.NORMAL })
   end
 

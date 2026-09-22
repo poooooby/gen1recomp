@@ -2,6 +2,7 @@
 
 local Window = require("src.ui.game3.window")
 local Display = require("src.core.game3.display")
+local Strings = require("src.core.Strings")
 
 local Choice = {}
 
@@ -15,6 +16,25 @@ Choice.top = nil
 Choice.cols = 1
 Choice.ignoreBPress = false
 
+function Choice.isOpen()
+  return Choice.active and true or false
+end
+
+-- pokefirered/src/main.c:480
+function Choice.reset()
+  Choice.active = false
+  Choice.kind = nil
+  Choice.options = nil
+  Choice.cursor = 1
+  Choice.done = nil
+  Choice.left = nil
+  Choice.top = nil
+  Choice.cols = 1
+  Choice.ignoreBPress = false
+  Choice.style = nil
+  return true
+end
+
 function Choice.yesNo(cb, layout)
   Choice.active = true
   Choice.kind = "yesno"
@@ -22,9 +42,9 @@ function Choice.yesNo(cb, layout)
   Choice.style = layout.style
   if layout.style == "battle" then
     -- pokefirered/src/battle_message.c:1288
-    Choice.options = { "Yes", "No" }
+    Choice.options = { Strings("Yes"), Strings("No") }
   else
-    Choice.options = { "YES", "NO" }
+    Choice.options = { Strings("YES"), Strings("NO") }
   end
   Choice.cursor = 1
   Choice.done = cb
@@ -116,7 +136,7 @@ function Choice.cancel()
   if Choice.ignoreBPress then
     return
   end
-  pcall(function() require("src.core.game3.audio").playSe(9) end)
+  pcall(function() require("src.core.game3.audio").playSe(5) end) -- pokefirered/src/menu_helpers.c:57
   local cb = Choice.done
   local kind = Choice.kind
   Choice.active = false

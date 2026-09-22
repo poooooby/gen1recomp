@@ -53,6 +53,82 @@ local function var_get(store, ctx, id)
   return id
 end
 
+-- Script local scratch space: pret's ScriptContext.data[4] (include/script.h:21).
+local function local_get(ctx, i)
+  return ctx.data[tonumber(i) or 0] or 0
+end
+
+local function local_set(ctx, i, v)
+  ctx.data[tonumber(i) or 0] = v or 0
+end
+
+-- The port has no flat address space, so the *ptr family shares a synthetic
+-- byte store keyed by the pointer value.  Pointers a script writes then reads
+-- round-trip; pointers into engine structures read as 0 (they did before too).
+local function mem_get(ctx, ptr)
+  ctx.scriptMem = ctx.scriptMem or {}
+  return tonumber(ctx.scriptMem[tonumber(ptr) or 0]) or 0
+end
+
+local function mem_set(ctx, ptr, v)
+  ctx.scriptMem = ctx.scriptMem or {}
+  ctx.scriptMem[tonumber(ptr) or 0] = (tonumber(v) or 0) % 256
+end
+
+-- pret src/scrcmd.c:358 Compare()
+local function cmp(a, b)
+  -- pokefirered/src/scrcmd.c:368: local comparisons read the low byte.
+  a, b = (tonumber(a) or 0) % 256, (tonumber(b) or 0) % 256
+  if a < b then return 0 end
+  if a == b then return 1 end
+  return 2
+end
+
+local function coins_api()
+  local Runtime = package.loaded["src.core.game3.runtime"]
+  local session = Runtime and Runtime.getSession and Runtime.getSession()
+  local okBag, Bag = pcall(require, "src.core.game3.bag")
+  local api = (okBag and type(Bag) == "table") and Bag.Coins or nil
+  if type(api) ~= "table" then api = nil end
+  return api, session
+end
+
+-- pokefirered/src/coins.c:11
+local function coins_get()
+  local api, session = coins_api()
+  if api and type(api.get) == "function" then
+    local ok, n = pcall(api.get, session)
+    if ok and tonumber(n) then return tonumber(n) end
+  end
+  local raw = math.floor(tonumber(session and session.coins) or 0)
+  return raw < 0 and 0 or raw
+end
+
+-- pokefirered/src/coins.c:21
+local function coins_move(add, amount)
+  amount = math.floor(tonumber(amount) or 0)
+  if amount < 0 then amount = 0 end
+  local api, session = coins_api()
+  local fn = api and (add and api.add or api.remove)
+  if type(fn) ~= "function" then return false end
+  local ok, res = pcall(fn, session, amount)
+  return (ok and res) and true or false
+end
+
+-- pokefirered/src/quest_log.c:860
+local function ql_avoid_display()
+  local Runtime = package.loaded["src.core.game3.runtime"]
+  local game = Runtime and Runtime._game
+  return (game and game.phase == "quest_log") and true or false
+end
+
+-- pokefirered/src/coins.c:79
+local function coins_box(fn, ...)
+  local okReq, Box = pcall(require, "src.ui.game3.coins_box")
+  if not (okReq and type(Box) == "table" and type(Box[fn]) == "function") then return false end
+  return (pcall(Box[fn], ...))
+end
+
 local function message_print_done()
   local Message = package.loaded["src.ui.game3.message"]
   if not Message or not Message.isOpen or not Message.isOpen() then
@@ -100,6 +176,118 @@ local function show_message(vm, ptr, stay)
     a.openMessage(body)
   end
   return false
+end
+
+local function text_ctx_view(vm)
+  local ctx = vm.ctx
+  local a = vm.adapters
+  return {
+    stringVars = ctx.stringVars,
+    playerName = a.playerName
+      and (type(a.playerName) == "function" and a.playerName() or a.playerName)
+      or ctx.playerName,
+    rivalName = a.rivalName
+      and (type(a.rivalName) == "function" and a.rivalName() or a.rivalName)
+      or ctx.rivalName,
+  }
+end
+
+-- pokefirered/src/braille_text.c:209
+local BRAILLE_GLYPH_WIDTH = 16
+
+-- pokefirered/src/text.c:1020
+local function braille_width(ir)
+  if type(ir) ~= "table" then return 0 end
+  local best, line = 0, 0
+  for _, seg in ipairs(ir) do
+    if seg.t == "text" then
+      local glyphs = select(2, tostring(seg.s or ""):gsub("[^\128-\191]", ""))
+      line = line + glyphs * BRAILLE_GLYPH_WIDTH
+    elseif seg.t == "nl" then
+      if line > best then best = line end
+      line = 0
+    end
+  end
+  if line > best then best = line end
+  return best
+end
+
+-- pokefirered/src/overworld.c:978
+local function set_map_layout(layoutId, log)
+  layoutId = tonumber(layoutId)
+  if not layoutId then return false end
+  local Runtime = package.loaded["src.core.game3.runtime"]
+  local game = Runtime and Runtime._game
+  local session = Runtime and Runtime.getSession and Runtime.getSession()
+  local mapId = session and session.map
+  local def = mapId and game and game.data and game.data.maps and game.data.maps[mapId]
+  local layout = def and def.midLayout
+  if not layout then return false end
+  local Extract = require("src.import.gba.extract_island1")
+  local Dataset = require("src.core.game3.dataset")
+  local root = Extract.NATIVE_ROOT
+    or ((Extract.CACHE_ROOT or "data/generated/gba") .. "/native")
+  local blob = Dataset.cache():read(root .. "/layouts/alt_" .. layoutId .. ".mid")
+  if not blob then
+    if log then log("[game3] setmaplayoutindex " .. layoutId .. ": no baked layout") end
+    return false
+  end
+  local NativePack = require("src.import.gba.native_pack")
+  local decoded = NativePack.decodeMidLayout(blob)
+  if not decoded or decoded.width ~= layout.width or decoded.height ~= layout.height then
+    if log then log("[game3] setmaplayoutindex " .. layoutId .. ": size mismatch") end
+    return false
+  end
+  local swapped = 0
+  for i = 1, decoded.width * decoded.height do
+    local cell = decoded.cells[i]
+    if cell then
+      local x = (i - 1) % decoded.width
+      local y = math.floor((i - 1) / decoded.width)
+      local cur = layout:cellAt(x, y)
+      if cur.mid ~= cell.mid or cur.coll ~= cell.coll or cur.elev ~= cell.elev then
+        layout:applyOverride(x, y, cell.mid, cell.coll, cell.elev)
+        swapped = swapped + 1
+      end
+    end
+  end
+  local Field = package.loaded["src.core.game3.field"]
+  if Field and Field._overrideLayouts then Field._overrideLayouts[mapId] = layout end
+  local Collision = package.loaded["src.core.game3.collision"]
+  if Collision and Collision.bindMap then Collision.bindMap(game, mapId, def) end
+  local FieldView = package.loaded["src.core.game3.field_view"]
+  if FieldView then FieldView._nativeDirty = true end
+  return true, swapped
+end
+
+-- pokefirered/include/constants/maps.h:11
+local function warp_hole_dest(group, num)
+  group, num = tonumber(group) or 0, tonumber(num) or 0
+  if group == 0xFF and num == 0xFF then return nil end
+  local Versions = require("src.import.gba.versions")
+  return (Versions.frMapFor and Versions.frMapFor(group, num))
+    or (Versions.seviiMapFor and Versions.seviiMapFor(group, num))
+end
+
+-- pret's *at script commands carry an explicit (mapGroup, mapNum) so a script
+-- can address another map's objects (asm/macros/event.inc:597-652).  The host
+-- object/movement seams only address the current map, so resolve the target
+-- map first and skip (with a note) when it is somewhere else.
+local function objectat_same_map(store, ctx, row, groupIdx)
+  local group = var_get(store, ctx, row[groupIdx])
+  local num = tonumber(var_get(store, ctx, row[groupIdx + 1]))
+  local Map = package.loaded["src.core.game3.map"]
+  local current = Map and Map.current
+  if group == nil or num == nil or not current then return true end
+  local okC, MapCatalog = pcall(require, "src.import.gba.map_catalog")
+  local dest = okC and MapCatalog and MapCatalog.mapIdFor(group, num) or nil
+  if type(dest) ~= "string" then
+    local okV, Versions = pcall(require, "src.import.gba.versions")
+    dest = okV and Versions and Versions.mapIdFor
+      and Versions.mapIdFor(group, num) or nil
+  end
+  if type(dest) ~= "string" then return true end
+  return dest == current
 end
 
 local function dispatch(vm, row)
@@ -179,6 +367,25 @@ local function dispatch(vm, row)
     end
     vm:setPc(key, 1)
     return false
+  elseif op == "callstd_if" or op == "gotostd_if" then
+    -- pret asm/macros/event.inc: .byte op / .byte condition / .byte std.
+    -- callstd_if returns to the caller; gotostd_if does not.
+    if not cond_ok(ctx, row.cond or row[1]) then return false end
+    local key = "std:" .. tostring(row.std or row[2])
+    if not vm.scripts[key] then
+      a.log("[game3] missing " .. key .. " — skipping")
+      return false
+    end
+    if op == "callstd_if" then
+      if #ctx.stack >= 20 then return false end
+      local cur = ctx.pc
+      ctx.stack[#ctx.stack + 1] = {
+        listKey = cur.listKey,
+        index = cur.index,
+      }
+    end
+    vm:setPc(key, 1)
+    return false
   elseif op == "loadword" then
     local dest = row.dest or row[1] or 0
     local value = row.value or row[2]
@@ -189,6 +396,16 @@ local function dispatch(vm, row)
     return false
   elseif op == "setvar" then
     Flags.setVar(store, ctx, row.var or row[1], row.value or row[2])
+    return false
+  elseif op == "addvar" then
+    -- pokefirered/src/scrcmd.c:441
+    local id = row.var or row[1]
+    Flags.setVar(store, ctx, id, Flags.getVar(store, ctx, id) + (tonumber(row.value or row[2]) or 0))
+    return false
+  elseif op == "subvar" then
+    -- pokefirered/src/scrcmd.c:448
+    local id = row.var or row[1]
+    Flags.setVar(store, ctx, id, Flags.getVar(store, ctx, id) - var_get(store, ctx, row.value or row[2]))
     return false
   elseif op == "copyvar" then
     local v = Flags.getVar(store, ctx, row[2])
@@ -351,9 +568,18 @@ local function dispatch(vm, row)
     ctx.status = "waiting"
     ctx.nativePoll = function() return pressed end
     if a.armWaitButton then
-      a.armWaitButton(function()
-        pressed = true
-      end)
+      -- pokefirered/src/scrcmd.c:1401, pokefirered/src/script.c:95
+      local armed = false
+      ctx.nativePoll = function()
+        if not armed then
+          armed = true
+          a.armWaitButton(function()
+            pressed = true
+          end)
+        end
+        return pressed
+      end
+      return true
     elseif a.waitButton then
       a.waitButton(function()
         pressed = true
@@ -419,18 +645,41 @@ local function dispatch(vm, row)
         nickname = gift.nickname
       end
     end
-    local ok = false
-    if a.giveMon then
-      ok = a.giveMon(species, level, row[3], row[4], row[5], nickname)
+    -- pokefirered/src/script_pokemon_util.c:48
+    local code
+    if a.giveMonToPlayer then
+      code = tonumber((a.giveMonToPlayer(species, level, row[3], nickname)))
+    elseif a.giveMon then
+      local ok, c = a.giveMon(species, level, row[3], row[4], row[5], nickname)
+      code = tonumber(c) or (ok and 0 or 2)
     else
       local Party = require("src.core.game3.party")
       local Runtime = package.loaded["src.core.game3.runtime"]
       local session = Runtime and Runtime.getSession and Runtime.getSession()
       if session then
-        ok = Party.giveMon(session, species, level, nickname)
+        code = tonumber((Party.giveMonToPlayer(session, species, level, nickname)))
       end
     end
-    Flags.setVar(store, ctx, Ctx.VAR_RESULT, ok and 0 or 2) -- 0=party, 2=fail
+    Flags.setVar(store, ctx, Ctx.VAR_RESULT, code or 2)
+    return false
+  elseif op == "giveegg" then
+    local species = var_get(store, ctx, row[1] or row.species)
+    -- pokefirered/src/script_pokemon_util.c:75
+    local code
+    if a.giveEggToPlayer then
+      code = tonumber((a.giveEggToPlayer(species)))
+    elseif a.giveEgg then
+      local ok, c = a.giveEgg(species)
+      code = tonumber(c) or (ok and 0 or 2)
+    else
+      local Party = require("src.core.game3.party")
+      local Runtime = package.loaded["src.core.game3.runtime"]
+      local session = Runtime and Runtime.getSession and Runtime.getSession()
+      if session then
+        code = tonumber((Party.giveEggToPlayer(session, species)))
+      end
+    end
+    Flags.setVar(store, ctx, Ctx.VAR_RESULT, code or 2)
     return false
   elseif op == "textcolor" then
     Flags.setVar(store, ctx, Ctx.VAR_PREV_TEXT_COLOR, Flags.getVar(store, ctx, Ctx.VAR_TEXT_COLOR)) -- src/scrcmd.c:1257
@@ -478,29 +727,33 @@ local function dispatch(vm, row)
     end
     return false
   elseif op == "specialvar" then
-    if Natives.special(ctx, row[2], a) then
+    -- pokefirered/src/scrcmd.c:109
+    local yield, value, known = Natives.special(ctx, row[2], a)
+    if value == nil and not known then value = 0 end
+    if value ~= nil then
+      Flags.setVar(store, ctx, row[1], value)
+    end
+    if yield then
       return true
     end
     return false
   elseif op == "waitstate" then
-    -- Host specials / warps that set nativePoll or warpPending: wait out; else no-op.
-    if ctx.warpPending then
+    -- pokefirered/src/scrcmd.c:127
+    local task = ctx.stateWait
+    ctx.stateWait = nil
+    local inner = (ctx.mode == "native") and ctx.nativePoll or nil
+    if task or ctx.warpPending or inner then
       ctx.mode = "native"
       ctx.status = "waiting"
       ctx.nativePoll = function()
-        -- Drain Gen2 MAPSETUP fade (adapters.warp defers done until mapSetup clears).
-        if a.pollWarp then a.pollWarp() end
-        return not ctx.warpPending
+        if ctx.warpPending then
+          if a.pollWarp then a.pollWarp() end
+          if ctx.warpPending then return false end
+        end
+        if task and not task() then return false end
+        if inner and not inner() then return false end
+        return true
       end
-      if ctx.nativePoll() then
-        ctx.mode = "bytecode"
-        ctx.status = "running"
-        ctx.nativePoll = nil
-        return false
-      end
-      return true
-    end
-    if ctx.mode == "native" and ctx.nativePoll then
       if ctx.nativePoll() then
         ctx.mode = "bytecode"
         ctx.status = "running"
@@ -535,6 +788,194 @@ local function dispatch(vm, row)
     local lid = var_get(store, ctx, row.localId or row[1])
     if a.removeObject then a.removeObject(lid) end
     return false
+  elseif op == "comparestat" then
+    -- pret ScrCmd_comparestat: .byte statIdx / .4byte value; sets
+    -- ctx.comparisonResult to 0 (lt) / 1 (eq) / 2 (gt) from the game stat.
+    local statIdx = tonumber(row[1]) or 0
+    local value = tonumber(row[2]) or 0
+    local Runtime = package.loaded["src.core.game3.runtime"]
+    local session = Runtime and Runtime.getSession and Runtime.getSession()
+    local stats = session and session.gameStats or {}
+    local statValue = tonumber(stats[statIdx]) or 0
+    ctx.comparisonResult = statValue < value and 0
+      or (statValue == value and 1 or 2)
+    return false
+  elseif op == "bufferitemnameplural" then
+    -- pret ScrCmd_bufferitemnameplural: the item's name pluralised the way the
+    -- ROM does -- "S" for a Poké Ball stack, "IES" replacing the final letter
+    -- for berries, and the plain name otherwise.
+    local dest = (row.dest or row[1] or 0) + 1
+    local item = var_get(store, ctx, row[2])
+    local qty = tonumber(var_get(store, ctx, row[3])) or 1
+    local ItemsData = require("src.core.game3.items_data")
+    local name = (ItemsData.displayName and ItemsData.displayName(item))
+      or tostring(item)
+    if qty >= 2 then
+      if tonumber(item) == 4 then -- ITEM_POKE_BALL (include/constants/items.h:8)
+        name = name .. "S"
+      elseif ItemsData.isBerry and ItemsData.isBerry(item) then
+        name = name:sub(1, -2) .. "IES"
+      end
+    end
+    ctx.stringVars[dest] = name
+    return false
+  elseif op == "setmonmove" or op == "setmonmetlocation"
+      or op == "setmonmodernfatefulencounter"
+      or op == "checkmonmodernfatefulencounter" then
+    -- pret ScrCmd_* (src/scrcmd.c:1767, :2239, :2248, :2256).  Party indices,
+    -- move slots and map-section ids are 0-based in the ROM.
+    local Runtime = package.loaded["src.core.game3.runtime"]
+    local session = Runtime and Runtime.getSession and Runtime.getSession()
+    local idx = (tonumber(var_get(store, ctx, row[1])) or 0) + 1
+    local mon = session and session.party and session.party[idx]
+    if op == "setmonmove" then
+      local slot = (tonumber(var_get(store, ctx, row[2])) or 0) + 1
+      local move = tonumber(var_get(store, ctx, row[3])) or 0
+      local Pokemon = require("src.core.game3.pokemon")
+      if mon and Pokemon.replaceMove then Pokemon.replaceMove(mon, slot, move) end
+    elseif op == "setmonmetlocation" then
+      if mon then mon.metLocation = tonumber(row[2]) or 0 end
+    elseif op == "setmonmodernfatefulencounter" then
+      if mon then mon.modernFatefulEncounter = true end
+    else
+      Flags.setVar(store, ctx, Ctx.VAR_RESULT,
+        (mon and mon.modernFatefulEncounter) and 1 or 0)
+    end
+    return false
+  elseif op == "copylocal" then
+    -- pret ScrCmd_copylocal (src/scrcmd.c:321)
+    local_set(ctx, row[1], local_get(ctx, row[2]))
+    return false
+  elseif op == "setptr" then
+    -- pret ScrCmd_setptr (src/scrcmd.c:300): value byte, then pointer word.
+    mem_set(ctx, row[2], row[1])
+    return false
+  elseif op == "loadbytefromptr" then
+    -- pret ScrCmd_loadbytefromptr (src/scrcmd.c:293)
+    local_set(ctx, row[1], mem_get(ctx, row[2]))
+    return false
+  elseif op == "setptrbyte" then
+    -- pret ScrCmd_setptrbyte (src/scrcmd.c:314)
+    mem_set(ctx, row[2], local_get(ctx, row[1]))
+    return false
+  elseif op == "copybyte" then
+    -- pret ScrCmd_copybyte (src/scrcmd.c:329)
+    mem_set(ctx, row[1], mem_get(ctx, row[2]))
+    return false
+  elseif op == "compare_local_to_local" then
+    -- pret ScrCmd_compare_local_to_local (src/scrcmd.c:368)
+    ctx.comparisonResult = cmp(local_get(ctx, row[1]), local_get(ctx, row[2]))
+    return false
+  elseif op == "compare_local_to_value" then
+    ctx.comparisonResult = cmp(local_get(ctx, row[1]), row[2])
+    return false
+  elseif op == "compare_local_to_ptr" then
+    ctx.comparisonResult = cmp(local_get(ctx, row[1]), mem_get(ctx, row[2]))
+    return false
+  elseif op == "compare_ptr_to_local" then
+    ctx.comparisonResult = cmp(mem_get(ctx, row[1]), local_get(ctx, row[2]))
+    return false
+  elseif op == "compare_ptr_to_value" then
+    ctx.comparisonResult = cmp(mem_get(ctx, row[1]), row[2])
+    return false
+  elseif op == "compare_ptr_to_ptr" then
+    ctx.comparisonResult = cmp(mem_get(ctx, row[1]), mem_get(ctx, row[2]))
+    return false
+  elseif op == "vgoto" or op == "vcall" or op == "vgoto_if" or op == "vcall_if" then
+    -- pret ScrCmd_vgoto/vcall/vgoto_if/vcall_if (src/scrcmd.c:180-209).  The
+    -- ROM's sAddressOffset relocation is unnecessary here: script pointers are
+    -- engine keys, which Opcodes.key()/jump() already resolve.
+    local cond = true
+    local dest = row.target or row[1]
+    if op == "vgoto_if" or op == "vcall_if" then
+      cond = cond_ok(ctx, row.cond or row[1])
+      dest = row.target or row[2]
+    end
+    if cond then
+      if op == "vcall" or op == "vcall_if" then
+        if #ctx.stack >= 20 then
+          a.log("[game3] vcall stack overflow")
+          return false
+        end
+        local cur = ctx.pc
+        ctx.stack[#ctx.stack + 1] = { listKey = cur.listKey, index = cur.index }
+      end
+      jump(vm, dest)
+    end
+    return false
+  elseif op == "setvaddress" then
+    -- pret ScrCmd_setvaddress (src/scrcmd.c:171) records a ROM-address
+    -- relocation for the v* family; the port resolves pointers by key, so
+    -- there is nothing to relocate.  Kept for bookkeeping only.
+    ctx.vaddress = row[1]
+    return false
+  elseif op == "vmessage" then
+    -- pret ScrCmd_vmessage (src/scrcmd.c:1580) shows a field message.
+    return show_message(vm, row[1], false)
+  elseif op == "vbuffermessage" then
+    -- pret ScrCmd_vbuffermessage (src/scrcmd.c:1706) expands placeholders into
+    -- the field message buffer (gStringVar4 → ctx.stringVars[4]).
+    local ir = resolve_text(vm, row[1])
+    ctx.stringVars[4] = ir and TextIR.toPlain(ir, {
+      stringVars = ctx.stringVars,
+      playerName = a.playerName,
+      rivalName = a.rivalName,
+    }) or ""
+    return false
+  elseif op == "vbufferstring" then
+    -- pret ScrCmd_vbufferstring (src/scrcmd.c:1714)
+    local dest = (row.dest or row[1] or 0) + 1
+    local ir = resolve_text(vm, row.ptr or row[2])
+    ctx.stringVars[dest] = ir and TextIR.toPlain(ir, { stringVars = ctx.stringVars }) or ""
+    return false
+  elseif op == "endram" then
+    -- pret ScrCmd_endram (src/scrcmd.c:262) clears the RAM script and stops.
+    vm:halt()
+    return true
+  elseif op == "returnram" then
+    -- pret ScrCmd_returnram (src/scrcmd.c:256) resumes the RAM script's caller.
+    local frame = table.remove(ctx.stack)
+    if not frame then
+      vm:halt()
+      return true
+    end
+    vm:setPc(frame.listKey, frame.index)
+    return false
+  elseif op == "checkpcitem" or op == "addpcitem" then
+    -- pret ScrCmd_checkpcitem / ScrCmd_addpcitem: the Player PC item bag.
+    -- VAR_RESULT is 1 for success (check: enough stored; add: stored), else 0.
+    local item = tostring(var_get(store, ctx, row[1]))
+    local qty = math.max(1, tonumber(var_get(store, ctx, row[2])) or 1)
+    local Runtime = package.loaded["src.core.game3.runtime"]
+    local session = Runtime and Runtime.getSession and Runtime.getSession()
+    local Storage = require("src.core.game3.storage")
+    local storage = session and Storage.ensure(session) or nil
+    local ok = false
+    if storage then
+      storage.items = storage.items or {}
+      local slot
+      for _, entry in ipairs(storage.items) do
+        if tostring(entry.id) == item then slot = entry break end
+      end
+      if op == "checkpcitem" then
+        local have = slot and (tonumber(slot.qty) or 0) or 0
+        ok = have >= qty
+      elseif slot then
+        local room = Storage.MAX_ITEM_QTY - (tonumber(slot.qty) or 0)
+        if room >= qty then
+          slot.qty = (tonumber(slot.qty) or 0) + qty
+          ok = true
+        end
+      elseif #storage.items < Storage.PC_ITEMS_COUNT then
+        storage.items[#storage.items + 1] = { id = item, qty = math.min(qty, Storage.MAX_ITEM_QTY) }
+        ok = true
+      end
+    end
+    if op == "addpcitem" and not ok then
+      a.log("[game3] addpcitem had no PC room for " .. item)
+    end
+    Flags.setVar(store, ctx, Ctx.VAR_RESULT, ok and 1 or 0)
+    return false
   elseif op == "bufferspeciesname" or op == "bufferitemname"
       or op == "buffermovename" or op == "bufferdecorationname"
       or op == "bufferstdstring" or op == "bufferpartymonnick" then
@@ -545,6 +986,14 @@ local function dispatch(vm, row)
     end
     local name = tostring(src)
     if a.bufferName then name = a.bufferName(op, src) or name end
+    if op == "buffermovename" and name == tostring(src) then
+      -- pokefirered/src/scrcmd.c:1669
+      local okP, Pokemon = pcall(require, "src.core.game3.pokemon")
+      if okP and Pokemon and Pokemon.moveName then
+        local okN, moveName = pcall(Pokemon.moveName, tonumber(src) or src)
+        if okN and type(moveName) == "string" and #moveName > 0 then name = moveName end
+      end
+    end
     ctx.stringVars[dest] = name
     return false
   elseif op == "bufferleadmonspeciesname" then
@@ -593,7 +1042,11 @@ local function dispatch(vm, row)
     return false
   elseif op == "hideobjectat" or op == "showobjectat" then
     local lid = var_get(store, ctx, row.localId or row[1])
-    if op == "hideobjectat" and a.hideObject then
+    if not objectat_same_map(store, ctx, row, 2) then
+      if a.log then
+        a.log("[game3] " .. op .. " targets another map — skipped")
+      end
+    elseif op == "hideobjectat" and a.hideObject then
       a.hideObject(lid)
     elseif op == "showobjectat" and a.showObject then
       a.showObject(lid)
@@ -601,6 +1054,25 @@ local function dispatch(vm, row)
       a.removeObject(lid)
     end
     return false
+  elseif op == "applymovementat" or op == "waitmovementat"
+      or op == "removeobjectat" or op == "addobjectat" then
+    -- pret ScrCmd_applymovementat / waitmovementat / removeobjectat /
+    -- addobjectat (src/scrcmd.c:993, :1022, :1046, :1064).  On the current map
+    -- they behave exactly like the plain command, so re-dispatch to it.
+    local groupIdx = (op == "applymovementat") and 3 or 2
+    if not objectat_same_map(store, ctx, row, groupIdx) then
+      if a.log then
+        a.log("[game3] " .. op .. " targets another map — skipped")
+      end
+      return false
+    end
+    local plain = ({
+      applymovementat = "applymovement",
+      waitmovementat = "waitmovement",
+      removeobjectat = "removeobject",
+      addobjectat = "addobject",
+    })[op]
+    return dispatch(vm, { op = plain, row[1], row[2] })
   elseif op == "addobject" then
     local lid = var_get(store, ctx, row.localId or row[1])
     if a.addObject then a.addObject(lid) end
@@ -608,6 +1080,17 @@ local function dispatch(vm, row)
   elseif op == "opendoor" or op == "closedoor" then
     -- Cosmetic on host; waitdooranim yields briefly.
     if a.doorAnim then a.doorAnim(op, row[1], row[2]) end
+    return false
+  elseif op == "setdooropen" or op == "setdoorclosed" then
+    -- pret ScrCmd_setdooropen/setdoorclosed record a door's state (used to
+    -- restore doors on re-entry).  The host exposes only the door animation
+    -- seam, so map the stored state onto the matching action.
+    if a.doorAnim then
+      -- pret ScrCmd_setdooropen/setdoorclosed read their x/y through VarGet
+      -- (src/scrcmd.c:2156).
+      a.doorAnim(op == "setdooropen" and "opendoor" or "closedoor",
+        var_get(store, ctx, row[1]), var_get(store, ctx, row[2]))
+    end
     return false
   elseif op == "waitdooranim" then
     -- Short soft wait (no re-entrant tick_vm). Instant adapter done() was
@@ -643,6 +1126,32 @@ local function dispatch(vm, row)
       return true
     end
     return false
+  elseif op == "setflashlevel" then
+    -- pokefirered/src/scrcmd.c:612
+    local okV, FieldView = pcall(require, "src.core.game3.field_view")
+    if okV and type(FieldView) == "table" and type(FieldView.setFlashLevel) == "function" then
+      pcall(FieldView.setFlashLevel, var_get(store, ctx, row[1]))
+    end
+    return false
+  elseif op == "animateflash" then
+    -- pokefirered/src/scrcmd.c:605
+    local okV, FieldView = pcall(require, "src.core.game3.field_view")
+    local okFx, FieldEffects = pcall(require, "src.core.game3.field_effects")
+    if not (okV and type(FieldView) == "table" and type(FieldView.getFlashLevel) == "function"
+        and okFx and type(FieldEffects) == "table"
+        and type(FieldEffects.animateFlashLevel) == "function") then
+      return false
+    end
+    -- pokefirered/src/field_screen_effect.c:194
+    local okAnim, anim = pcall(FieldEffects.animateFlashLevel,
+      FieldView.getFlashLevel(), tonumber(row[1]) or 0)
+    if not (okAnim and type(anim) == "table") then return false end
+    local flashDone = false
+    anim.onDone = function() flashDone = true end
+    ctx.mode = "native"
+    ctx.status = "waiting"
+    ctx.nativePoll = function() return flashDone end
+    return true
   elseif op == "warp" or op == "warpsilent" or op == "warpdoor"
       or op == "warpteleport" or op == "warpspinenter" then
     local group, num = row[1], row[2]
@@ -655,10 +1164,36 @@ local function dispatch(vm, row)
       end)
     end
     return false
+  elseif op == "warphole" then
+    -- pokefirered/src/scrcmd.c:761
+    local Player = package.loaded["src.core.game3.player"]
+      or require("src.core.game3.player")
+    local destX, destY = tonumber(Player.cellX) or 0, tonumber(Player.cellY) or 0
+    local destMap = warp_hole_dest(row[1], row[2])
+    if not destMap then
+      a.log(string.format("[game3] warphole unknown FRLG map %s.%s",
+        tostring(row[1]), tostring(row[2])))
+      return false
+    end
+    local Warp = require("src.core.game3.warp")
+    local Runtime = package.loaded["src.core.game3.runtime"]
+    local started = Warp.startFall(Runtime and Runtime._mod, Runtime and Runtime._game,
+      destMap, destX, destY)
+    if not started then return false end
+    ctx.warpPending = true
+    local Task = require("src.core.game3.task")
+    Task.spawn(function()
+      if Warp.isBusy and Warp.isBusy() then return false end
+      ctx.warpPending = false
+      return true
+    end)
+    return false
   elseif op == "setwarp" or op == "setdynamicwarp" or op == "setescapewarp"
       or op == "setdivewarp" or op == "setholewarp" then
+    -- pokefirered/src/scrcmd.c:819
     if a.setWarp then
-      a.setWarp(op, row[1], row[2], row[3], row[4], row[5])
+      a.setWarp(op, row[1], row[2], row[3],
+        var_get(store, ctx, row[4]), var_get(store, ctx, row[5]))
     end
     return false
   elseif op == "playse" or op == "playfanfare" or op == "waitfanfare" then
@@ -737,6 +1272,56 @@ local function dispatch(vm, row)
       return false
     end
     return true
+  elseif op == "playmoncry" then
+    -- pokefirered/src/scrcmd.c:2088
+    local Audio = require("src.core.game3.audio")
+    Audio.playCry(var_get(store, ctx, row[1]), var_get(store, ctx, row[2]))
+    return false
+  elseif op == "waitmoncry" then
+    -- pokefirered/src/scrcmd.c:2097
+    local Audio = require("src.core.game3.audio")
+    local isFinished = function()
+      if Audio.isCryFinished then return Audio.isCryFinished() == true end
+      return true
+    end
+    if isFinished() then return false end
+    ctx.mode = "native"
+    ctx.status = "waiting"
+    local lastClock = Audio._cryClock
+    ctx.nativePoll = function()
+      if isFinished() then return true end
+      -- pokefirered/src/sound.c:502
+      if Audio._cryClock == lastClock and Audio.tickCry then Audio.tickCry(1 / 60) end
+      lastClock = Audio._cryClock
+      return isFinished()
+    end
+    return true
+  elseif op == "braillemessage" then
+    -- pokefirered/src/scrcmd.c:1558
+    local ptr = row.ptr or row[1]
+    local ir = resolve_text(vm, ptr)
+    if not ir then return show_message(vm, ptr, true) end
+    local body = TextIR.toPlain(ir, text_ctx_view(vm)) or ""
+    local okB, Braille = pcall(require, "src.ui.game3.braille")
+    if okB and type(Braille) == "table" and type(Braille.show) == "function" then
+      local okShow = pcall(Braille.show, body, { width = braille_width(ir) })
+      if okShow then
+        ctx.messageOpen = true
+        return false
+      end
+    end
+    return show_message(vm, ptr, true)
+  elseif op == "getbraillestringwidth" then
+    -- pokefirered/src/scrcmd.c:1570
+    local ir = resolve_text(vm, row.ptr or row[1])
+    local width
+    local okB, Braille = pcall(require, "src.ui.game3.braille")
+    if okB and type(Braille) == "table" and type(Braille.width) == "function" then
+      local okW, v = pcall(Braille.width, TextIR.toPlain(ir or {}, text_ctx_view(vm)) or "")
+      if okW then width = tonumber(v) end
+    end
+    Flags.setVar(store, ctx, 0x8004, width or braille_width(ir))
+    return false
   elseif op == "messageautoscroll" then
     return show_message(vm, row.ptr or row[1], false)
   elseif op == "setmetatile" or op == "dofieldeffect" or op == "waitfieldeffect"
@@ -757,10 +1342,28 @@ local function dispatch(vm, row)
       return true
     end
     if op == "setmetatile" and a.setMetatile then
-      a.setMetatile(row[1], row[2], row[3], row[4])
+      a.setMetatile(row[1], row[2], row[3], (tonumber(row[4]) or 0) ~= 0)
     elseif op == "dofieldeffect" and a.doFieldEffect then
       a.doFieldEffect(row[1])
+    elseif op == "setfieldeffectargument" then
+      -- pokefirered/src/scrcmd.c:2051 — the value operand is VarGet'd, which
+      -- passes raw constants (< 0x4000) straight through.
+      local argNum = tonumber(row[1]) or 0
+      local value = var_get(store, ctx, row[2])
+      if a.setFieldEffectArgument then
+        a.setFieldEffectArgument(argNum, value)
+      end
     end
+    return false
+  elseif op == "setstepcallback" then
+    -- pokefirered/src/scrcmd.c:705
+    local Runtime = package.loaded["src.core.game3.runtime"]
+    local session = Runtime and Runtime.getSession and Runtime.getSession()
+    Ctx.setStepCallback(row[1] or 0, session and session.map)
+    return false
+  elseif op == "setmaplayoutindex" then
+    -- pokefirered/src/scrcmd.c:711
+    set_map_layout(var_get(store, ctx, row[1]), a.log)
     return false
   elseif op == "setweather" then
     if a.setWeather then a.setWeather(row[1] or row.weather or 0) end
@@ -779,11 +1382,18 @@ local function dispatch(vm, row)
     local Enc = require("src.core.game3.encounters")
     local foe = Enc.takePendingWild()
     if a.startWildBattle and foe then
+      foe.wildScripted = true
       ctx.mode = "native"
       ctx.status = "waiting"
       local done = false
       ctx.nativePoll = function() return done end
-      a.startWildBattle(foe, function() done = true end)
+      a.startWildBattle(foe, function(result)
+        local Natives = require("src.core.game3.scripting.natives")
+        local code = Natives.outcome_to_code and Natives.outcome_to_code(result) or 1
+        if ctx then ctx.lastBattleOutcome = code end
+        Flags.setVar(store, ctx, 0x800D, code)
+        done = true
+      end, { wildScripted = true })
       if done then
         ctx.mode = "bytecode"
         ctx.status = "running"
@@ -830,6 +1440,8 @@ local function dispatch(vm, row)
     local battleType = tonumber(row.type) or 0
     local rivalFlags = tonumber(row.flags or row.localId) or 0
     local earlyRival = (battleType == 9) -- TRAINER_BATTLE_EARLY_RIVAL
+    -- pokefirered/src/battle_setup.c:899
+    local tutorialBattle = earlyRival and (rivalFlags % 4) ~= 0
     local eventScript = row.eventScript
     local trainerFlag = Flags.trainerFlagId(trainerId)
     local VsSeeker = require("src.core.game3.vs_seeker")
@@ -974,6 +1586,7 @@ local function dispatch(vm, row)
           trainerId = opponentA,
           earlyRival = earlyRival,
           rivalFlags = rivalFlags,
+          firstBattle = tutorialBattle,
           noWhiteout = earlyRival and (rivalFlags % 2 == 1),
           defeatText = defeatText,
           victoryText = victoryText,
@@ -1124,7 +1737,8 @@ local function dispatch(vm, row)
     local x = tonumber(row[1] or row.x) or 19
     local y = tonumber(row[2] or row.y) or 1
     local ignore = tonumber(row[3] or row.ignore) or 0
-    if ignore == 0 then
+    -- pokefirered/src/scrcmd.c:1834
+    if ignore == 0 and not ql_avoid_display() then
       local MoneyBox = require("src.ui.game3.money_box")
       MoneyBox.show(x, y)
     end
@@ -1136,6 +1750,30 @@ local function dispatch(vm, row)
   elseif op == "updatemoneybox" then
     local MoneyBox = require("src.ui.game3.money_box")
     MoneyBox.update()
+    return false
+  elseif op == "checkcoins" then
+    -- pokefirered/src/scrcmd.c:2197
+    Flags.setVar(store, ctx, row[1] or row.dest, coins_get())
+    return false
+  elseif op == "addcoins" or op == "removecoins" then
+    -- pokefirered/src/scrcmd.c:2204
+    local amount = var_get(store, ctx, row[1] or row.amount)
+    local moved = coins_move(op == "addcoins", amount)
+    Flags.setVar(store, ctx, Ctx.VAR_RESULT, moved and 0 or 1)
+    return false
+  elseif op == "showcoinsbox" then
+    -- pokefirered/src/scrcmd.c:1864
+    if not ql_avoid_display() then
+      coins_box("show", tonumber(row[1] or row.x) or 0, tonumber(row[2] or row.y) or 0, coins_get())
+    end
+    return false
+  elseif op == "hidecoinsbox" then
+    -- pokefirered/src/scrcmd.c:1869
+    coins_box("hide")
+    return false
+  elseif op == "updatecoinsbox" then
+    -- pokefirered/src/scrcmd.c:1878
+    coins_box("update", coins_get())
     return false
   elseif op == "pokemart" then
     local ptr = row[1] or row.ptr or row.items
@@ -1161,6 +1799,41 @@ local function dispatch(vm, row)
     -- Decor shops are a separate item namespace; skip until decor pack exists.
     if a.log then a.log("[game3] skip " .. tostring(op)) end
     return false
+  elseif op == "playslotmachine" then
+    -- pokefirered/src/scrcmd.c:1980
+    local machineIdx = var_get(store, ctx, row[1] or row.id)
+    local okUi, SlotUi = pcall(require, "src.ui.game3.slot_machine")
+    if not (okUi and type(SlotUi) == "table" and type(SlotUi.show) == "function") then
+      if a.log then a.log("[game3] playslotmachine skipped (no screen)") end
+      return false
+    end
+    if a.closeMessage then a.closeMessage() end
+    local okMsg, Message = pcall(require, "src.ui.game3.message")
+    if okMsg and Message and Message.close then Message.close() end
+    local Runtime = package.loaded["src.core.game3.runtime"]
+    local session = Runtime and Runtime.getSession and Runtime.getSession()
+    local done = false
+    local function poll()
+      if done and ctx.stateWait == poll then ctx.stateWait = nil end
+      return done
+    end
+    ctx.mode = "native"
+    ctx.status = "waiting"
+    ctx.nativePoll = poll
+    Natives.awaitState(ctx, poll)
+    SlotUi.show({
+      machineIdx = machineIdx,
+      session = session,
+      onClose = function() done = true end,
+    })
+    if done then
+      ctx.mode = "bytecode"
+      ctx.status = "running"
+      ctx.nativePoll = nil
+      ctx.stateWait = nil
+      return false
+    end
+    return true
   elseif op == "setobjectxyperm" or op == "setobjectxy" or op == "setobjectmovementtype"
       or op == "copyobjectxytoperm" then
     if a.setObjectState then a.setObjectState(op, row) end
@@ -1168,6 +1841,46 @@ local function dispatch(vm, row)
   elseif op == "multichoice" or op == "multichoicedefault" or op == "multichoicegrid" then
     -- Economy/UI pack: pick option 0 into VAR_RESULT unless host implements.
     Flags.setVar(store, ctx, 0x800D, 0)
+    if op == "multichoice" then
+      local listId = tonumber(row.listId or row[3]) or -1
+      local okP, Prize = pcall(require, "src.ui.game3.prize_corner")
+      if okP and type(Prize) == "table" and Prize.isPrizeList(listId) then
+        local Multi = require("src.core.game3.scripting.multichoice")
+        local labels = Multi.resolve(listId)
+        local done = false
+        local function poll()
+          if done and ctx.stateWait == poll then ctx.stateWait = nil end
+          return done
+        end
+        ctx.mode = "native"
+        ctx.status = "waiting"
+        ctx.nativePoll = poll
+        Natives.awaitState(ctx, poll)
+        -- pokefirered/src/script_menu.c:713
+        local shown = Prize.show({
+          listId = listId,
+          labels = labels,
+          left = tonumber(row.x or row.left or row[1]) or 0,
+          top = tonumber(row.y or row.top or row[2]) or 0,
+          ignoreBPress = (tonumber(row[4] or row.ignoreBPress) or 0) ~= 0,
+          onChoose = function(sel)
+            Flags.setVar(store, ctx, 0x800D, tonumber(sel) or 0)
+            done = true
+          end,
+        })
+        if not shown then
+          done = true
+        end
+        if done then
+          ctx.mode = "bytecode"
+          ctx.status = "running"
+          ctx.nativePoll = nil
+          ctx.stateWait = nil
+        else
+          return true
+        end
+      end
+    end
     if a.multichoice then
       ctx.mode = "native"
       ctx.status = "waiting"
@@ -1191,6 +1904,37 @@ local function dispatch(vm, row)
     if maxv < 1 then maxv = 1 end
     Flags.setVar(store, ctx, 0x800D, math.random(0, maxv - 1))
     return false
+  elseif op == "getplayerxy" then
+    -- pokefirered/src/scrcmd.c:867
+    local Player = package.loaded["src.core.game3.player"]
+      or require("src.core.game3.player")
+    Flags.setVar(store, ctx, row[1], tonumber(Player.cellX) or 0)
+    Flags.setVar(store, ctx, row[2], tonumber(Player.cellY) or 0)
+    return false
+  elseif op == "getpartysize" then
+    -- pokefirered/src/scrcmd.c:877
+    local Party = require("src.core.game3.party")
+    local Runtime = package.loaded["src.core.game3.runtime"]
+    local session = Runtime and Runtime.getSession and Runtime.getSession()
+    Flags.setVar(store, ctx, Ctx.VAR_RESULT, Party.size(session and session.party))
+    return false
+  elseif op == "checkplayergender" then
+    -- pokefirered/src/scrcmd.c:2082
+    local Runtime = package.loaded["src.core.game3.runtime"]
+    local session = Runtime and Runtime.getSession and Runtime.getSession()
+    Flags.setVar(store, ctx, Ctx.VAR_RESULT, tonumber(session and session.gender) or 0)
+    return false
+  elseif op == "bufferboxname" then
+    -- pokefirered/src/pokemon_storage_system.c:118
+    local dest = (tonumber(row.dest or row[1]) or 0) + 1
+    local boxId = var_get(store, ctx, row.src or row[2])
+    local Storage = require("src.core.game3.storage")
+    local Runtime = package.loaded["src.core.game3.runtime"]
+    local session = Runtime and Runtime.getSession and Runtime.getSession()
+    local storage = session and Storage.ensure(session)
+    local box = storage and Storage.getBox(storage, boxId + 1)
+    ctx.stringVars[dest] = (box and box.name) or ""
+    return false
   elseif op == "setrespawn" then
     -- pret ScrCmd_setrespawn → SetLastHealLocationWarp(healLocationId)
     local id = var_get(store, ctx, row[1])
@@ -1200,8 +1944,14 @@ local function dispatch(vm, row)
       Field.setRespawn(id)
     end
     return false
+  elseif op == "trywondercardscript" then
+    -- pokefirered/src/scrcmd.c:275 ScrCmd_trywondercardscript
+    local Gift = require("src.core.game3.scripting.natives_gift")
+    local yield, jumped = Gift.runWonderCardScript(ctx, a)
+    if jumped then ctx.pc = nil end
+    return yield
   elseif op == "incrementgamestat" or op == "checkpartymove"
-      or op == "trywondercardscript" or op == "erasebox" then
+      or op == "erasebox" then
     return false
   else
     local Runtime = package.loaded["src.core.game3.runtime"]
@@ -1248,5 +1998,9 @@ function Ops.dispatch(vm, row)
   end
   return ModRuntime.call("script.command", commandVanilla(vm), Ctx.modCtx(vm), row.op, row)
 end
+
+Ops.warpHoleDest = warp_hole_dest
+Ops.setMapLayout = set_map_layout
+Ops.brailleWidth = braille_width
 
 return Ops

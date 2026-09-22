@@ -4,6 +4,7 @@ local Extract = require("src.import.gba.extract_island1")
 local PokemonExtract = require("src.import.gba.pokemon_extract")
 local Versions = require("src.import.gba.versions")
 local ModRuntime = require("src.mods.Runtime")
+local Strings = require("src.core.Strings")
 
 local Pokemon = {}
 
@@ -21,6 +22,11 @@ Pokemon._abilities = nil
 Pokemon._abilityNames = nil
 Pokemon._speciesMeta = nil
 Pokemon._moveNames = nil
+-- The ROM's English move and ability names, copied at install before a mod
+-- renames entries of _moveNames/_abilityNames in place.  Anything keyed by
+-- the English name (the summary's descriptions) reads these.
+Pokemon._romMoveNames = nil
+Pokemon._romAbilityNames = nil
 Pokemon._learnsets = nil
 Pokemon._eggMoves = nil
 Pokemon._evolutions = nil
@@ -60,6 +66,13 @@ local function resolve_cache(cache)
       return nil
     end,
   }
+end
+
+local function copy_names(names)
+  if type(names) ~= "table" then return nil end
+  local out = {}
+  for k, v in pairs(names) do out[k] = v end
+  return out
 end
 
 local function load_lua(cache, rel)
@@ -124,6 +137,8 @@ function Pokemon.install(cache)
   Pokemon._abilityNames = nil
   Pokemon._speciesMeta = nil
   Pokemon._moveNames = nil
+  Pokemon._romMoveNames = nil
+  Pokemon._romAbilityNames = nil
   Pokemon._learnsets = nil
   Pokemon._eggMoves = nil
   Pokemon._evolutions = nil
@@ -145,6 +160,8 @@ function Pokemon.install(cache)
   Pokemon._abilityNames = load_lua(c, root .. "/ability_names.lua")
   Pokemon._speciesMeta = load_lua(c, root .. "/meta.lua")
   Pokemon._moveNames = load_lua(c, root .. "/move_names.lua")
+  Pokemon._romMoveNames = copy_names(Pokemon._moveNames)
+  Pokemon._romAbilityNames = copy_names(Pokemon._abilityNames)
   Pokemon._learnsets = load_lua(c, root .. "/learnsets.lua")
   Pokemon._eggMoves = load_lua(c, root .. "/egg_moves.lua")
   Pokemon._evolutions = load_lua(c, root .. "/evolutions.lua")
@@ -205,6 +222,8 @@ function Pokemon.invalidate()
   Pokemon._abilityNames = nil
   Pokemon._speciesMeta = nil
   Pokemon._moveNames = nil
+  Pokemon._romMoveNames = nil
+  Pokemon._romAbilityNames = nil
   Pokemon._learnsets = nil
   Pokemon._eggMoves = nil
   Pokemon._evolutions = nil
@@ -228,7 +247,7 @@ function Pokemon.name(species)
   if not Pokemon._names then Pokemon.install(Pokemon._cache) end
   local n = Pokemon._names and Pokemon._names[species]
   if n and n ~= "" and n ~= "??????????" then return n end
-  return string.format("POKéMON %03d", species)
+  return Strings("POKéMON %03d", species)
 end
 
 function Pokemon.keyName(species)
@@ -308,7 +327,7 @@ function Pokemon.abilityName(abilityId)
   if not Pokemon._abilityNames then Pokemon.install(Pokemon._cache) end
   local n = Pokemon._abilityNames and Pokemon._abilityNames[abilityId]
   if n and n ~= "" then return n end
-  return string.format("ABILITY %d", abilityId)
+  return Strings("ABILITY %d", abilityId)
 end
 
 function Pokemon.speciesMeta(species)
@@ -421,7 +440,7 @@ function Pokemon.calcStats(species, level, ivs, evs, personality)
   local function ev(k) return tonumber(evs[k]) or 0 end
 
   local maxHp
-  if species == 292 then -- Shedinja
+  if species == 303 then -- pokefirered/src/pokemon.c:2124 SPECIES_SHEDINJA
     maxHp = 1
   else
     maxHp = math.floor(((2 * base.hp + iv("hp") + math.floor(ev("hp") / 4)) * level) / 100)
@@ -470,6 +489,387 @@ function Pokemon.applyStats(mon)
   return mon
 end
 
+-- pokefirered/include/constants/pokemon.h:215
+Pokemon.FRIENDSHIP_EVENT_GROW_LEVEL = 0
+Pokemon.FRIENDSHIP_EVENT_VITAMIN = 1
+Pokemon.FRIENDSHIP_EVENT_BATTLE_ITEM = 2
+Pokemon.FRIENDSHIP_EVENT_LEAGUE_BATTLE = 3
+Pokemon.FRIENDSHIP_EVENT_LEARN_TMHM = 4
+Pokemon.FRIENDSHIP_EVENT_WALKING = 5
+Pokemon.FRIENDSHIP_EVENT_MASSAGE = 6
+Pokemon.FRIENDSHIP_EVENT_FAINT_SMALL = 7
+Pokemon.FRIENDSHIP_EVENT_FAINT_OUTSIDE_BATTLE = 8
+Pokemon.FRIENDSHIP_EVENT_FAINT_LARGE = 9
+
+-- pokefirered/include/constants/pokemon.h:226,233
+Pokemon.MAX_FRIENDSHIP = 255
+Pokemon.MAX_PER_STAT_EVS = 255
+Pokemon.MAX_TOTAL_EVS = 510
+Pokemon.EV_ITEM_RAISE_LIMIT = 100
+
+Pokemon.SPECIES_EGG = 412
+local ITEM_LUXURY_BALL = 11 -- pokefirered/include/constants/items.h:15
+local HOLD_EFFECT_MACHO_BRACE = 24 -- pokefirered/include/constants/hold_effects.h:28
+local HOLD_EFFECT_FRIENDSHIP_UP = 27 -- pokefirered/include/constants/hold_effects.h:31
+
+-- pokefirered/src/pokemon.c:1618 sFriendshipEventDeltas
+local FRIENDSHIP_DELTAS = {
+  [0] = { 5, 3, 2 },
+  [1] = { 5, 3, 2 },
+  [2] = { 1, 1, 0 },
+  [3] = { 3, 2, 1 },
+  [4] = { 1, 1, 0 },
+  [5] = { 1, 1, 1 },
+  [6] = { 3, 3, 3 },
+  [7] = { -1, -1, -1 },
+  [8] = { -5, -5, -10 },
+  [9] = { -5, -5, -10 },
+}
+
+-- pokefirered/include/constants/pokemon.h:166
+local EV_KEYS = { "hp", "atk", "def", "spe", "spa", "spd" }
+local EV_YIELD_KEYS = { "evHp", "evAtk", "evDef", "evSpe", "evSpa", "evSpd" }
+Pokemon.EV_KEYS = EV_KEYS
+
+-- pokefirered/include/pokemon.h:229
+function Pokemon.baseFriendship(species)
+  local meta = Pokemon.speciesMeta(species)
+  local v = meta and tonumber(meta.friendship)
+  if v then return v end
+  return 70
+end
+
+-- pokefirered/include/pokemon.h:219
+function Pokemon.evYield(species)
+  if type(species) == "table" then
+    species = tonumber(species.species or species.speciesId)
+  end
+  local meta = Pokemon.speciesMeta(species)
+  local out = {}
+  for i = 1, 6 do
+    out[EV_KEYS[i]] = (meta and tonumber(meta[EV_YIELD_KEYS[i]])) or 0
+  end
+  return out
+end
+
+-- pokefirered/src/pokemon.c:1815
+function Pokemon.friendshipOf(mon)
+  if type(mon) ~= "table" then return 0 end
+  local v = tonumber(mon.friendship or mon.happiness)
+  if v then return v end
+  return Pokemon.baseFriendship(tonumber(mon.species or mon.speciesId))
+end
+
+function Pokemon.setFriendship(mon, value)
+  if type(mon) ~= "table" then return 0 end
+  value = math.floor(tonumber(value) or 0)
+  if value < 0 then value = 0 end
+  if value > Pokemon.MAX_FRIENDSHIP then value = Pokemon.MAX_FRIENDSHIP end
+  mon.friendship = value
+  mon.happiness = value
+  return value
+end
+
+function Pokemon.evsOf(mon)
+  if type(mon) ~= "table" then return {} end
+  local evs = mon.evs
+  if type(evs) ~= "table" then
+    evs = {}
+    mon.evs = evs
+  end
+  for i = 1, 6 do
+    local k = EV_KEYS[i]
+    evs[k] = math.max(0, math.min(Pokemon.MAX_PER_STAT_EVS, math.floor(tonumber(evs[k]) or 0)))
+  end
+  return evs
+end
+
+-- pokefirered/src/pokemon.c:5597 GetMonEVCount
+function Pokemon.evCount(mon)
+  local evs = Pokemon.evsOf(mon)
+  local count = 0
+  for i = 1, 6 do
+    count = count + (tonumber(evs[EV_KEYS[i]]) or 0)
+  end
+  return count
+end
+
+local function hold_effect_of(mon)
+  local ok, HeldItems = pcall(require, "src.core.game3.battle.held_items")
+  if not ok or not HeldItems or not HeldItems.effectOf then return 0 end
+  local effect = HeldItems.effectOf(mon and (mon.item or mon.heldItem))
+  return tonumber(effect) or 0
+end
+
+-- pokefirered/src/pokemon.c:5630 CheckPartyPokerus
+function Pokemon.hasPokerus(mon)
+  return (tonumber(mon and mon.pokerus) or 0) % 16 ~= 0
+end
+
+-- pokefirered/src/pokemon.c:5646 CheckPartyHasHadPokerus
+function Pokemon.hasHadPokerus(mon)
+  return (tonumber(mon and mon.pokerus) or 0) ~= 0
+end
+
+function Pokemon.checkPartyPokerus(party, selection)
+  if type(party) ~= "table" then return 0 end
+  if not selection or selection == 0 then
+    return Pokemon.hasPokerus(party[1]) and 1 or 0
+  end
+  local retVal, curBit, index = 0, 1, 1
+  while selection ~= 0 do
+    if selection % 2 == 1 and Pokemon.hasPokerus(party[index]) then
+      retVal = retVal + curBit
+    end
+    index = index + 1
+    curBit = curBit * 2
+    selection = math.floor(selection / 2)
+  end
+  return retVal
+end
+
+function Pokemon.checkPartyHasHadPokerus(party, selection)
+  if type(party) ~= "table" then return 0 end
+  if not selection or selection == 0 then
+    return Pokemon.hasHadPokerus(party[1]) and 1 or 0
+  end
+  local retVal, curBit, index = 0, 1, 1
+  while selection ~= 0 do
+    if selection % 2 == 1 and Pokemon.hasHadPokerus(party[index]) then
+      retVal = retVal + curBit
+    end
+    index = index + 1
+    curBit = curBit * 2
+    selection = math.floor(selection / 2)
+  end
+  return retVal
+end
+
+-- pokefirered/src/pokemon.c:5612, :5676, :5682 (all stubbed in FRLG)
+function Pokemon.randomlyGivePartyPokerus(_) end
+function Pokemon.updatePartyPokerusTime(_) end
+function Pokemon.partySpreadPokerus(_) end
+
+-- pokefirered/src/pokemon.c:5512 MonGainEVs
+function Pokemon.gainEVs(mon, defeatedSpecies)
+  if type(mon) ~= "table" then return nil end
+  local evs = Pokemon.evsOf(mon)
+  local cur, total = {}, 0
+  for i = 1, 6 do
+    cur[i] = tonumber(evs[EV_KEYS[i]]) or 0
+    total = total + cur[i]
+  end
+  local yield = Pokemon.evYield(defeatedSpecies)
+  local multiplier = Pokemon.hasHadPokerus(mon) and 2 or 1
+  local macho = hold_effect_of(mon) == HOLD_EFFECT_MACHO_BRACE
+  local gained = 0
+  for i = 1, 6 do
+    if total >= Pokemon.MAX_TOTAL_EVS then break end
+    local inc = (tonumber(yield[EV_KEYS[i]]) or 0) * multiplier
+    if macho then inc = inc * 2 end
+    if total + inc > Pokemon.MAX_TOTAL_EVS then
+      inc = Pokemon.MAX_TOTAL_EVS - total
+    end
+    if cur[i] + inc > Pokemon.MAX_PER_STAT_EVS then
+      inc = Pokemon.MAX_PER_STAT_EVS - cur[i]
+    end
+    cur[i] = cur[i] + inc
+    total = total + inc
+    gained = gained + inc
+    evs[EV_KEYS[i]] = cur[i]
+  end
+  return gained
+end
+
+-- pokefirered/src/overworld.c:1265 GetCurrentRegionMapSectionId
+function Pokemon.currentMapSec(session)
+  session = session or {}
+  local sec = tonumber(session.regionMapSectionId or session.mapSec)
+  if sec then return sec end
+  local Runtime = package.loaded["src.core.game3.runtime"]
+  local game = Runtime and Runtime._game
+  local def = session.map and game and game.data and game.data.maps and game.data.maps[session.map]
+  return def and tonumber(def.regionMapSectionId) or nil
+end
+
+local function player_identity(player)
+  player = player or {}
+  local id = player.trainerId or player.id or player.playerId
+  local name = player.name or player.playerName or player.otName
+  if id == nil or name == nil then
+    local Runtime = package.loaded["src.core.game3.runtime"]
+    local ok, sess = pcall(function()
+      return Runtime and Runtime.getSession and Runtime.getSession()
+    end)
+    if ok and sess then
+      id = id or sess.trainerId or sess.id or sess.playerId
+      name = name or sess.name or sess.playerName
+    end
+  end
+  return tonumber(id), name
+end
+
+-- pokefirered/src/pokemon.c:5974 IsOtherTrainer
+function Pokemon.isOtherTrainer(otId, otName, player)
+  local playerId, playerName = player_identity(player)
+  if playerId == nil then return false end
+  if tonumber(otId) ~= playerId then return true end
+  local mine = tostring(playerName or "")
+  local theirs = tostring(otName or "")
+  for i = 1, #theirs do
+    if theirs:sub(i, i) ~= mine:sub(i, i) then return true end
+  end
+  return false
+end
+
+-- pokefirered/src/pokemon.c:5965 IsTradedMon
+function Pokemon.isTradedMon(mon, player)
+  if type(mon) ~= "table" or mon.otId == nil then return false end
+  return Pokemon.isOtherTrainer(mon.otId, mon.otName or mon.ot, player)
+end
+
+local function friendship_bonuses(mon, friendship, ctx)
+  if (tonumber(mon.pokeball or mon.ball) or 0) == ITEM_LUXURY_BALL then
+    friendship = friendship + 1
+  end
+  local sec = ctx and tonumber(ctx.mapSec)
+  local met = tonumber(mon.metLocation)
+  if sec and met and met == sec then
+    friendship = friendship + 1
+  end
+  return friendship
+end
+
+-- pokefirered/include/constants/trainers.h:267
+Pokemon.LEAGUE_TRAINER_CLASSES = { [84] = true, [87] = true, [90] = true }
+
+-- pokefirered/src/pokemon.c:5480
+function Pokemon.isLeagueTrainerClass(trainerClass)
+  local cls = tonumber(trainerClass)
+  return (cls ~= nil) and Pokemon.LEAGUE_TRAINER_CLASSES[cls] == true
+end
+
+-- pokefirered/src/pokemon.c:5440 AdjustFriendship
+function Pokemon.adjustFriendship(mon, event, ctx)
+  if type(mon) ~= "table" then return false end
+  ctx = ctx or {}
+  local species = tonumber(mon.species or mon.speciesId) or 0
+  if species == 0 or species == Pokemon.SPECIES_EGG or mon.isEgg or mon.egg then
+    return false
+  end
+  local deltas = FRIENDSHIP_DELTAS[tonumber(event)]
+  if not deltas then return false end
+
+  local friendship = Pokemon.friendshipOf(mon)
+  local tier = 1
+  if friendship >= 100 then tier = tier + 1 end
+  if friendship >= 200 then tier = tier + 1 end
+
+  if event == Pokemon.FRIENDSHIP_EVENT_WALKING then
+    local okR, Rng = pcall(require, "src.core.game3.rng")
+    if okR and Rng and Rng.Random and Rng.Random() % 2 == 1 then return false end
+  end
+  if event == Pokemon.FRIENDSHIP_EVENT_LEAGUE_BATTLE and not ctx.leagueBattle then
+    return false
+  end
+
+  local delta = deltas[tier]
+  if delta > 0 and hold_effect_of(mon) == HOLD_EFFECT_FRIENDSHIP_UP then
+    delta = math.floor(150 * delta / 100)
+  end
+  friendship = friendship + delta
+  if delta > 0 then
+    friendship = friendship_bonuses(mon, friendship, ctx)
+  end
+  Pokemon.setFriendship(mon, friendship)
+  return true
+end
+
+-- pokefirered/src/battle_util2.c:78 AdjustFriendshipOnBattleFaint
+function Pokemon.adjustFriendshipOnBattleFaint(mon, faintedLevel, opposingLevel, ctx)
+  faintedLevel = tonumber(faintedLevel) or 1
+  opposingLevel = tonumber(opposingLevel) or 1
+  local event = Pokemon.FRIENDSHIP_EVENT_FAINT_SMALL
+  if opposingLevel > faintedLevel and opposingLevel - faintedLevel > 29 then
+    event = Pokemon.FRIENDSHIP_EVENT_FAINT_LARGE
+  end
+  return Pokemon.adjustFriendship(mon, event, ctx)
+end
+
+-- pokefirered/src/pokemon.c:3976 UPDATE_FRIENDSHIP_FROM_ITEM
+function Pokemon.itemFriendship(mon, lowMidHigh, ctx)
+  if type(mon) ~= "table" or type(lowMidHigh) ~= "table" then return false end
+  local friendship = Pokemon.friendshipOf(mon)
+  local change
+  if friendship < 100 then
+    change = tonumber(lowMidHigh[1])
+  elseif friendship < 200 then
+    change = tonumber(lowMidHigh[2])
+  else
+    change = tonumber(lowMidHigh[3])
+  end
+  if not change or change == 0 then return false end
+  if change > 0 and hold_effect_of(mon) == HOLD_EFFECT_FRIENDSHIP_UP then
+    friendship = friendship + math.floor(150 * change / 100)
+  else
+    friendship = friendship + change
+  end
+  if change > 0 then
+    friendship = friendship_bonuses(mon, friendship, ctx)
+  end
+  Pokemon.setFriendship(mon, friendship)
+  return true
+end
+
+-- pokefirered/src/data/pokemon/item_effects.h:163 VITAMIN_FRIENDSHIP_CHANGE
+Pokemon.VITAMIN_FRIENDSHIP_CHANGE = { 5, 3, 2 }
+-- pokefirered/src/data/pokemon/item_effects.h:225 STAT_BOOST_FRIENDSHIP_CHANGE
+Pokemon.STAT_BOOST_FRIENDSHIP_CHANGE = { 1, 1, 0 }
+
+-- pokefirered/src/pokemon.c:4229
+function Pokemon.raiseEvFromItem(mon, statKey, amount)
+  local evs = Pokemon.evsOf(mon)
+  if evs[statKey] == nil then return nil end
+  local evCount = Pokemon.evCount(mon)
+  if evCount >= Pokemon.MAX_TOTAL_EVS then return nil end
+  local data = tonumber(evs[statKey]) or 0
+  if data >= Pokemon.EV_ITEM_RAISE_LIMIT then return nil end
+  amount = math.floor(tonumber(amount) or 0)
+  local delta = amount
+  if data + amount > Pokemon.EV_ITEM_RAISE_LIMIT then
+    delta = Pokemon.EV_ITEM_RAISE_LIMIT - data
+  end
+  if evCount + delta > Pokemon.MAX_TOTAL_EVS then
+    delta = Pokemon.MAX_TOTAL_EVS - evCount
+  end
+  evs[statKey] = data + delta
+  -- pokefirered/src/pokemon.c:2155
+  local oldMaxHp = tonumber(mon.maxHp) or 0
+  local oldHp = tonumber(mon.hp) or 0
+  Pokemon.applyStats(mon)
+  local newMaxHp = tonumber(mon.maxHp) or oldMaxHp
+  if oldHp ~= 0 or oldMaxHp ~= 0 then
+    mon.hp = math.max(0, math.min(newMaxHp, oldHp + (newMaxHp - oldMaxHp)))
+  end
+  return delta
+end
+
+-- The ROM's English name for a move or ability number, whatever a mod renamed
+-- it to; nil when the pack has none.
+function Pokemon.romMoveName(num)
+  num = tonumber(num)
+  if not num then return nil end
+  if not Pokemon._moveNames then Pokemon.install(Pokemon._cache) end
+  return Pokemon._romMoveNames and Pokemon._romMoveNames[num]
+end
+
+function Pokemon.romAbilityName(abilityId)
+  abilityId = tonumber(abilityId)
+  if not abilityId then return nil end
+  if not Pokemon._abilityNames then Pokemon.install(Pokemon._cache) end
+  return Pokemon._romAbilityNames and Pokemon._romAbilityNames[abilityId]
+end
+
 function Pokemon.moveName(moveId)
   if type(moveId) == "table" then
     moveId = moveId.id or moveId.move or moveId.moveId or moveId.num or moveId.name or moveId[1]
@@ -490,7 +890,7 @@ function Pokemon.moveName(moveId)
   if not Pokemon._moveNames then Pokemon.install(Pokemon._cache) end
   local n = Pokemon._moveNames and Pokemon._moveNames[num]
   if n and n ~= "" then return n end
-  return string.format("MOVE %d", num)
+  return Strings("MOVE %d", num)
 end
 
 function Pokemon.learnset(species)
@@ -550,40 +950,52 @@ function Pokemon.movePp(moveId)
 end
 Pokemon.moveMaxPp = Pokemon.movePp
 
---- FRLG GiveBoxMonInitialMoveset: learn all ≤ level; if full, drop first.
+--- FRLG GiveBoxMonInitialMoveset: learn all ≤ level; if full, drop first; avoid duplicates.
 function Pokemon.movesAtLevel(species, level)
   if type(species) == "table" then species = Pokemon.speciesOf(species) end
   if type(species) == "string" then species = Pokemon.speciesFromName(species) or tonumber(species) end
   species = tonumber(species)
   level = tonumber(level) or 1
   local set = Pokemon.learnset(species)
-  local pool = {}
-  for _, e in ipairs(set) do
-    local lv = e[1] or e.level or 0
-    local mv = tonumber(e[2] or e.move) or 0
-    if lv <= level and mv > 0 then
-      pool[#pool + 1] = mv
-    end
-  end
   local moves = {}
   local pp = {}
   local maxPp = {}
-  for _, m in ipairs(pool) do
+
+  local function giveMove(moveId)
+    if not moveId or moveId <= 0 then return end
+    for i = 1, #moves do
+      if moves[i] == moveId then
+        return -- already knows this move (pret GiveMoveToBoxMon)
+      end
+    end
+    local mpp = Pokemon.movePp(moveId)
     if #moves < 4 then
-      moves[#moves + 1] = m
-      local mpp = Pokemon.movePp(m)
+      moves[#moves + 1] = moveId
       pp[#pp + 1] = mpp
       maxPp[#maxPp + 1] = mpp
     else
       table.remove(moves, 1)
       table.remove(pp, 1)
       table.remove(maxPp, 1)
-      moves[4] = m
-      local mpp = Pokemon.movePp(m)
+      moves[4] = moveId
       pp[4] = mpp
       maxPp[4] = mpp
     end
   end
+
+  for _, e in ipairs(set) do
+    local lv = e[1] or e.level or 0
+    local mv = tonumber(e[2] or e.move) or 0
+    if lv > level then
+      break
+    end
+    giveMove(mv)
+  end
+
+  if #moves == 0 then
+    giveMove(33) -- fallback to Tackle if learnset empty
+  end
+
   return moves, pp, maxPp
 end
 
@@ -748,8 +1160,18 @@ function Pokemon.replaceMove(mon, slot, newMoveId)
   return old
 end
 
+-- An egg reads as the language's own EGG whatever its nickname holds: pret's
+-- GetMonData(MON_DATA_NICKNAME) returns gText_EggNickname for any egg
+-- (pokefirered/src/pokemon.c:3020).  The stored nickname is only a placeholder
+-- -- the cart's daycare writes タマゴ (daycare.c:1100), this engine "EGG".
+local function eggName(mon)
+  if Pokemon.isEgg(mon) then return Strings("EGG") end
+end
+
 function Pokemon.displayMonName(mon)
   if not mon then return "POKéMON" end
+  local egg = eggName(mon)
+  if egg then return egg end
   local nick = mon.nickname
   if type(nick) == "string" and nick ~= "" then return nick end
   if mon.name and mon.name ~= "" then return mon.name end
@@ -832,6 +1254,13 @@ end
 function Pokemon.isEgg(mon)
   if not mon then return false end
   return (mon.isEgg == true) or (mon.egg == true) or (mon.species == 412)
+end
+
+-- pokefirered/src/pokemon.c:3245 MON_DATA_SPECIES_OR_EGG: an egg's menu icon is
+-- SPECIES_EGG's, not the species it will hatch into (party_menu.c:2655).
+function Pokemon.speciesOrEgg(mon)
+  if Pokemon.isEgg(mon) then return Pokemon.SPECIES_EGG end
+  return Pokemon.speciesOf(mon)
 end
 
 local function read_rgba(species)
@@ -1104,6 +1533,33 @@ function Pokemon.ghostPic()
   return pic_entry(Pokemon._front, "ghost", rgba)
 end
 
+Pokemon.NUMBERING_INTERNAL = "internal"
+Pokemon.NUMBERING_NATIONAL = "national"
+
+-- pokefirered/src/data/text/species_names.h:254
+function Pokemon.isInternalSpecies(n)
+  n = tonumber(n)
+  if not n or n < 1 then return false end
+  if not Pokemon._names then Pokemon.install(Pokemon._cache) end
+  local name = Pokemon._names and Pokemon._names[n]
+  if type(name) ~= "string" or name == "" then return false end
+  return name:match("^%?+$") == nil
+end
+
+function Pokemon.numberingOf(mon)
+  if type(mon) ~= "table" then return nil end
+  local tag = mon.speciesNumbering
+  if tag == Pokemon.NUMBERING_INTERNAL or tag == Pokemon.NUMBERING_NATIONAL then return tag end
+  return nil
+end
+
+function Pokemon.tagNumbering(mon, kind)
+  if type(mon) ~= "table" then return mon end
+  if kind ~= Pokemon.NUMBERING_NATIONAL then kind = Pokemon.NUMBERING_INTERNAL end
+  mon.speciesNumbering = kind
+  return mon
+end
+
 --- Resolve display species for a host/opaque mon table.
 -- Host mons use string ids ("KYOGRE"); FRLG scripts use internal SPECIES ints.
 function Pokemon.speciesOf(mon)
@@ -1121,26 +1577,20 @@ function Pokemon.speciesOf(mon)
   local n = tonumber(raw)
   if not n or n < 1 then return nil end
 
-  -- Prefer internal id when pack has that name; else try national → internal.
-  if not Pokemon._names then Pokemon.install(Pokemon._cache) end
-  if Pokemon._names and Pokemon._names[n] and Pokemon._names[n] ~= "??????????" then
-    -- Ambiguous for Gen3: national 382 is KYOGRE but internal 382 is ARON.
-    -- Host numeric ids in this project are Gen1/2 range or string names.
-    if n <= 251 then return n end
-    -- If national map says this number is a national dex, resolve.
-    local fromNat = Pokemon.speciesFromNational(n)
-    if fromNat and fromNat ~= n then
-      -- Heuristic: if name at n looks like a valid mon and equals national's
-      -- species name mismatch, prefer national mapping when n > 251.
-      return fromNat
-    end
-    return n
+  local numbering = Pokemon.numberingOf(mon)
+  if numbering == Pokemon.NUMBERING_NATIONAL then
+    return Pokemon.speciesFromNational(n) or n
   end
+  if numbering == Pokemon.NUMBERING_INTERNAL then return n end
+
+  if Pokemon.isInternalSpecies(n) then return n end
   return Pokemon.speciesFromNational(n) or n
 end
 
 function Pokemon.displayName(mon)
   if not mon then return "?????" end
+  local egg = eggName(mon)
+  if egg then return egg end
   if mon.nickname and mon.nickname ~= "" then return tostring(mon.nickname) end
   -- Prefer pack name over host species string when we can resolve.
   local sp = Pokemon.speciesOf(mon)

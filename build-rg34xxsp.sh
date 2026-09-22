@@ -88,22 +88,24 @@ mkdir -p "$GAME_SRC"
 # Same payload as scripts/build.sh's game.love — never ship ROM-derived cache.
 # tools/save-editor is part of that payload: the launcher's Edit button on a
 # save row opens it in-process (main.lua).
+rm -f "$WORK/game-payload.zip"
 (cd "$ROOT" && zip -q -9 -r "$WORK/game-payload.zip" \
   main.lua conf.lua src libs data assets tools/save-editor \
   tools/rom_manifest.json tools/rom_manifest_blue.json \
   tools/rom_manifest_yellow.json tools/rom_manifest_gold.json \
   tools/rom_manifest_silver.json tools/rom_manifest_crystal.json \
+  tools/rom_manifest_firered.json tools/rom_manifest_leafgreen.json \
   -x '*.DS_Store' 'data/generated/*' 'assets/generated/*')
-payload_list="$(unzip -Z1 "$WORK/game-payload.zip")"
-printf '%s\n' "$payload_list" \
-  | grep -Eq '^(data|assets)/generated/[^/]+|^(data|assets)/generated/.+/' \
-  && fail "payload unexpectedly contains generated ROM data"
-printf '%s\n' "$payload_list" | grep -qxF "tools/rom_manifest_gold.json" \
-  || fail "payload is missing tools/rom_manifest_gold.json"
-printf '%s\n' "$payload_list" | grep -qxF "tools/rom_manifest_silver.json" \
-  || fail "payload is missing tools/rom_manifest_silver.json"
-printf '%s\n' "$payload_list" | grep -qxF "tools/rom_manifest_crystal.json" \
-  || fail "payload is missing tools/rom_manifest_crystal.json"
+unzip -Z1 "$WORK/game-payload.zip" > "$WORK/payload-listing.txt"
+if grep -Eq '^(data|assets)/generated/[^/]+|^(data|assets)/generated/.+/' "$WORK/payload-listing.txt"; then
+  fail "payload unexpectedly contains generated ROM data"
+fi
+for manifest in rom_manifest.json rom_manifest_blue.json rom_manifest_yellow.json \
+                rom_manifest_gold.json rom_manifest_silver.json rom_manifest_crystal.json \
+                rom_manifest_firered.json rom_manifest_leafgreen.json; do
+  grep -qxF "tools/$manifest" "$WORK/payload-listing.txt" \
+    || fail "payload is missing tools/$manifest"
+done
 unzip -q "$WORK/game-payload.zip" -d "$GAME_SRC"
 rm -f "$WORK/game-payload.zip"
 
@@ -240,6 +242,9 @@ cd "$GAMEDIR" || exit 1
 
 export XDG_DATA_HOME="$CONFDIR"
 export XDG_CONFIG_HOME="$CONFDIR"
+# Release-target marker for the self-updater: a full-package fallback here must
+# offer gen1recomp-<v>-rg34xxsp-stockos64-mod.zip, never a desktop package.
+export POKEPORT_RG34XXSP=1
 export LD_LIBRARY_PATH="$GAMEDIR/libs.aarch64:${LD_LIBRARY_PATH:-}"
 export SDL_GAMECONTROLLERCONFIG="${sdl_controllerconfig:-}"
 # Mali / H700: prefer GLES where available

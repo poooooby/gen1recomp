@@ -17,6 +17,7 @@ local PcChrome = require("src.ui.game3.pc_chrome")
 local ReleaseSeq = require("src.ui.game3.release_seq")
 local SummaryMenu = require("src.ui.game3.summary_menu")
 local ItemsData = require("src.core.game3.items_data")
+local Strings = require("src.core.Strings")
 
 local BoxStorageUI = {}
 
@@ -50,6 +51,29 @@ local ROW_H = 24
 
 local function se(id)
   pcall(function() require("src.core.game3.audio").playSe(id) end)
+end
+
+-- pokefirered/include/constants/vars.h:105
+local VAR_PC_BOX_TO_SEND_MON = 0x4037
+-- pokefirered/include/constants/flags.h:1401
+local FLAG_SHOWN_BOX_WAS_FULL_MESSAGE = 0x843
+
+local function script_store(session)
+  local Space = package.loaded["src.core.game3.scripting.space"]
+  return (Space and Space.store) or (session and session.store) or nil
+end
+
+-- pokefirered/src/pokemon_storage_system_tasks.c:2763
+local function update_box_to_send_mons()
+  local storage = Storage.ensure(BoxStorageUI._session)
+  if not storage then return end
+  local cur = (tonumber(storage.currentBox) or 1) - 1
+  if BoxStorageUI._lastUsedBox == cur then return end
+  local Flags = require("src.core.game3.scripting.flags")
+  local store = script_store(BoxStorageUI._session)
+  Flags.setFlag(store, nil, FLAG_SHOWN_BOX_WAS_FULL_MESSAGE, false)
+  Flags.setVar(store, nil, VAR_PC_BOX_TO_SEND_MON, cur)
+  BoxStorageUI._lastUsedBox = cur
 end
 
 local function current_box_data()
@@ -99,7 +123,9 @@ function BoxStorageUI.show(opts)
   BoxStorageUI.drawerOpen = false
   BoxStorageUI._actionSource = nil
   BoxStorageUI._actionTarget = nil
-  Storage.ensure(BoxStorageUI._session)
+  local storage = Storage.ensure(BoxStorageUI._session)
+  -- pokefirered/src/pokemon_storage_system_tasks.c:426
+  BoxStorageUI._lastUsedBox = storage and ((tonumber(storage.currentBox) or 1) - 1) or nil
 
   if BoxStorageUI.subMode == "deposit" then
     -- In deposit submode, start directly in party drawer mode
@@ -113,6 +139,8 @@ function BoxStorageUI.show(opts)
 end
 
 function BoxStorageUI.close()
+  -- pokefirered/src/pokemon_storage_system_tasks.c:1979
+  update_box_to_send_mons()
   BoxStorageUI.open = false
   BoxStorageUI.holdingMon = nil
   BoxStorageUI.holdingSource = nil
@@ -363,9 +391,9 @@ function BoxStorageUI.handleInput(input)
             BoxStorageUI.mode = returnMode
             se(246)
           else
-            BoxStorageUI._status = "Your party is full!"
+            BoxStorageUI._status = Strings("Your party is full!")
             BoxStorageUI.mode = "message"
-            se(9)
+            se(5) -- pokefirered/src/pokemon_storage_system_tasks.c:992
           end
         end
       elseif choice == "STORE" or choice == "DEPOSIT" then
@@ -373,9 +401,9 @@ function BoxStorageUI.handleInput(input)
         if loc == "party" and mon then
           local party = (BoxStorageUI._session and BoxStorageUI._session.party) or {}
           if #party <= 1 then
-            BoxStorageUI._status = "Can't deposit the last POKéMON!"
+            BoxStorageUI._status = Strings("Can't deposit the last POKéMON!")
             BoxStorageUI.mode = "message"
-            se(9)
+            se(26) -- pokefirered/src/pokemon_storage_system_tasks.c:1052
           else
             local ok, b, s = Storage.deposit(BoxStorageUI._session, sId)
             if ok then
@@ -390,9 +418,9 @@ function BoxStorageUI.handleInput(input)
               end
               se(246)
             else
-              BoxStorageUI._status = "The Box is full!"
+              BoxStorageUI._status = Strings("The Box is full!")
               BoxStorageUI.mode = "message"
-              se(9)
+              se(5) -- pokefirered/src/pokemon_storage_system_tasks.c:1225
             end
           end
         end
@@ -412,17 +440,17 @@ function BoxStorageUI.handleInput(input)
         if mon then
           local ok, err = Storage.detachHeldItem(BoxStorageUI._session, mon)
           if ok then
-            BoxStorageUI._status = string.format("Took the %s and put it in the BAG.", ItemsData.displayName(err))
+            BoxStorageUI._status = Strings("Took the %s and put it in the BAG.", ItemsData.displayName(err))
             BoxStorageUI.mode = "message"
             se(246)
           elseif err == "bag_full" then
-            BoxStorageUI._status = "The BAG is full."
+            BoxStorageUI._status = Strings("The BAG is full.")
             BoxStorageUI.mode = "message"
-            se(9)
+            se(26) -- pokefirered/src/pokemon_storage_system_tasks.c:1487
           else
-            BoxStorageUI._status = "This POKéMON isn't holding anything."
+            BoxStorageUI._status = Strings("This POKéMON isn't holding anything.")
             BoxStorageUI.mode = "message"
-            se(9)
+            se(5) -- pokefirered/src/pokemon_storage_system_tasks.c:1493
           end
         end
       elseif choice == "RELEASE" then
@@ -710,7 +738,7 @@ function BoxStorageUI.draw()
       local isHovered = (BoxStorageUI.cursorSlot == s and BoxStorageUI.mode ~= "party_drawer" and not BoxStorageUI.holdingMon)
       local bounceY = (isHovered and BoxStorageUI.hoverFrame == 1) and -2 or 0
       local f = (isHovered and BoxStorageUI.hoverFrame == 1) and 1 or 0
-      local sp = Pokemon.speciesOf(mon)
+      local sp = Pokemon.speciesOrEgg(mon)
       local icon = Pokemon.icon(sp)
 
       if icon and icon.image then
@@ -776,7 +804,7 @@ function BoxStorageUI.draw()
 
   -- If holding a mon, draw floating mini-icon under hand cursor
   if BoxStorageUI.holdingMon then
-    local hSp = Pokemon.speciesOf(BoxStorageUI.holdingMon)
+    local hSp = Pokemon.speciesOrEgg(BoxStorageUI.holdingMon)
     local hIcon = Pokemon.icon(hSp)
     if hIcon and hIcon.image then
       local q = hIcon.quads and hIcon.quads[0]
@@ -808,7 +836,7 @@ function BoxStorageUI.draw()
     for i, act in ipairs(actions) do
       local yPx = (menuTop * 8 + 2) + (i - 1) * 16
       if i == BoxStorageUI.actionCursor then Window.cursorPx(textLeft - 8, yPx) end
-      Window.printPx(act, textLeft, yPx)
+      Window.printPx(Strings(act), textLeft, yPx)
     end
   end
 
@@ -819,17 +847,17 @@ function BoxStorageUI.draw()
     for i, act in ipairs(boxActions) do
       local yPx = 26 + (i - 1) * 16
       if i == BoxStorageUI.boxMenuCursor then Window.cursorPx(42, yPx) end
-      Window.printPx(act, 50, yPx)
+      Window.printPx(Strings(act), 50, yPx)
     end
   end
 
   -- 11. Wallpaper Picker Popup
   if BoxStorageUI.mode == "pick_wallpaper" then
     Window.stdFrame(Window.template(5, 2, 14, 10))
-    Window.printPx("SELECT WALLPAPER", 44, 18, { small = true })
+    Window.printPx(Strings("SELECT WALLPAPER"), 44, 18, { small = true })
     for i = 1, 4 do
       local wpId = ((BoxStorageUI.wallpaperCursor - 1 + i - 1) % 16) + 1
-      local wpName = Storage.WALLPAPERS[wpId] or string.format("THEME %d", wpId)
+      local wpName = Storage.WALLPAPERS[wpId] and Strings(Storage.WALLPAPERS[wpId]) or Strings("THEME %d", wpId)
       local yPx = 34 + (i - 1) * 14
       if i == 1 then Window.cursorPx(44, yPx) end
       Window.printPx(wpName, 52, yPx)

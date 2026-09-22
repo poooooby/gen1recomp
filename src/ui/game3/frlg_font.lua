@@ -411,6 +411,29 @@ local function ensure_small()
   return true
 end
 
+-- The remaining single characters of the Latin block of pret
+-- pokefirered/charmap.txt: glyphs the US ROM font draws (latin_normal and
+-- latin_small, both charmap-ordered) that US text never prints, so
+-- TextIR.CHARMAP (the decode table) leaves them out.  Named multi-glyph
+-- entries (LV, POKEBLOCK, the SUPER_E/ER/RE superscripts) are not characters
+-- and stay out.
+-- Mod text in French, German, Spanish or Italian needs them; without an entry
+-- glyphId falls back to 0x00 and the letter prints blank.  Render-only: the
+-- ROM decode path is unchanged.
+FrlgFont.LATIN_GLYPHS = {
+  [0x01] = "À", [0x02] = "Á", [0x03] = "Â", [0x04] = "Ç", [0x05] = "È",
+  [0x07] = "Ê", [0x08] = "Ë", [0x09] = "Ì", [0x0B] = "Î", [0x0C] = "Ï",
+  [0x0D] = "Ò", [0x0E] = "Ó", [0x0F] = "Ô", [0x10] = "Œ", [0x11] = "Ù",
+  [0x12] = "Ú", [0x13] = "Û", [0x14] = "Ñ", [0x15] = "ß", [0x16] = "à",
+  [0x17] = "á", [0x19] = "ç", [0x1A] = "è", [0x1C] = "ê", [0x1D] = "ë",
+  [0x1E] = "ì", [0x20] = "î", [0x21] = "ï", [0x22] = "ò", [0x23] = "ó",
+  [0x24] = "ô", [0x25] = "œ", [0x26] = "ù", [0x27] = "ú", [0x28] = "û",
+  [0x29] = "ñ", [0x2A] = "º", [0x2B] = "ª", [0x36] = ";", [0x51] = "¿",
+  [0x52] = "¡", [0x5A] = "Í", [0x68] = "â", [0x6F] = "í",
+  [0xEF] = "▶", [0xF1] = "Ä", [0xF2] = "Ö", [0xF3] = "Ü", [0xF4] = "ä",
+  [0xF5] = "ö", [0xF6] = "ü",
+}
+
 local function buildRev()
   if FrlgFont._rev then return FrlgFont._rev end
   local rev = {
@@ -423,6 +446,11 @@ local function buildRev()
     ["⑦"] = 0x110, ["⑧"] = 0x111, ["⑨"] = 0x112,
     ["◎"] = 0x115, ["△"] = 0x116, ["✕"] = 0x117,
     ["No"] = 0x108,
+    ["▶"] = 0xEF, -- gText_SelectorArrow2 / CHAR_SELECTOR_ARROW
+    ["▲"] = 0x79, -- CHAR_UP_ARROW
+    ["▼"] = 0x7A, -- CHAR_DOWN_ARROW
+    ["◀"] = 0x7B, -- CHAR_LEFT_ARROW
+    ["_"] = 0x109, -- CHAR_EXTRA_SYMBOL + CHAR_UNDERSCORE
     ['"'] = 0xB2,
     ["“"] = 0xB1,
     ["”"] = 0xB2,
@@ -437,6 +465,9 @@ local function buildRev()
     if type(ch) == "string" and #ch > 0 and not rev[ch] then
       rev[ch] = code
     end
+  end
+  for code, ch in pairs(FrlgFont.LATIN_GLYPHS) do
+    if not rev[ch] then rev[ch] = code end
   end
   -- ASCII digits/letters already via CHARMAP; ensure common punctuation.
   FrlgFont._rev = rev
@@ -473,26 +504,34 @@ local function resolveColorId(val)
   return nil
 end
 
-local function copyColors(c)
+local colorScratchPool = {
+  { fg = nil, shadow = nil, bg = nil },
+  { fg = nil, shadow = nil, bg = nil },
+  { fg = nil, shadow = nil, bg = nil },
+  { fg = nil, shadow = nil, bg = nil },
+}
+local colorScratchIdx = 0
+
+local function acquireColorScratch(c)
+  colorScratchIdx = (colorScratchIdx % 4) + 1
+  local cur = colorScratchPool[colorScratchIdx]
   if not c then
-    return {
-      fg = FrlgFont.STDPAL[2],
-      shadow = FrlgFont.STDPAL[3],
-      bg = FrlgFont.STDPAL[0],
-    }
+    cur.fg = FrlgFont.STDPAL[2]
+    cur.shadow = FrlgFont.STDPAL[3]
+    cur.bg = FrlgFont.STDPAL[0]
+  else
+    cur.fg = c.fg or FrlgFont.STDPAL[2]
+    cur.shadow = c.shadow or FrlgFont.STDPAL[3]
+    cur.bg = c.bg or FrlgFont.STDPAL[0]
   end
-  return {
-    fg = c.fg or FrlgFont.STDPAL[2],
-    shadow = c.shadow or FrlgFont.STDPAL[3],
-    bg = c.bg or FrlgFont.STDPAL[0],
-  }
+  return cur
 end
 
 --- Byte-by-byte token scanner for GBA FRLG text strings.
 -- Handles \xFC bytecode sequences, {TAG} macros, and UTF-8 characters without choking on null bytes.
 function FrlgFont.scanTokens(text, initialColors)
   local s = tostring(text or "")
-  local curColors = copyColors(initialColors)
+  local curColors = acquireColorScratch(initialColors)
   local i, n = 1, #s
 
   return function()

@@ -5,6 +5,7 @@
 local FrlgFont = require("src.ui.game3.frlg_font")
 local Pokemon = require("src.core.game3.pokemon")
 local ItemsData = require("src.core.game3.items_data")
+local Strings = require("src.core.Strings")
 
 local PcChrome = {}
 
@@ -42,28 +43,42 @@ PcChrome.WALLPAPER_NAMES = {
   [16] = "simple",
 }
 
+local function read_bytes(rel)
+  local okD, Dataset = pcall(require, "src.core.game3.dataset")
+  if okD and Dataset and Dataset.mountExtractRoots then
+    Dataset.mountExtractRoots()
+  end
+  if okD and Dataset and Dataset.cache then
+    local cacheObj = Dataset.cache()
+    if cacheObj and cacheObj.read then
+      local d = cacheObj:read(rel)
+      if type(d) == "string" and #d > 0 then return d end
+    end
+  end
+  local okC, CacheFs = pcall(require, "src.import.CacheFs")
+  if okC and CacheFs and CacheFs.readActive then
+    local d = CacheFs.readActive(rel)
+    if type(d) == "string" and #d > 0 then return d end
+  end
+  if love and love.filesystem and love.filesystem.read then
+    local ok, d = pcall(love.filesystem.read, rel)
+    if ok and type(d) == "string" and #d > 0 then return d end
+  end
+  local f = io.open(rel, "rb")
+  if f then
+    local d = f:read("*a")
+    f:close()
+    if type(d) == "string" and #d > 0 then return d end
+  end
+  return nil
+end
+
 local function load_texture(name)
   local candidates = {
     "pokemon/storage/" .. name,
     "data/generated/gba/pokemon/storage/" .. name,
     "src/import/gba/chrome/menus/storage/" .. name,
   }
-  local okC, CacheFs = pcall(require, "src.import.CacheFs")
-  if okC and CacheFs and CacheFs.readActive then
-    for _, path in ipairs(candidates) do
-      local bytes = CacheFs.readActive(path)
-      if bytes and #bytes > 0 and love and love.image and love.graphics and love.filesystem then
-        local ok, img = pcall(function()
-          local fd = love.filesystem.newFileData(bytes, name)
-          local id = love.image.newImageData(fd)
-          local image = love.graphics.newImage(id)
-          if image.setFilter then image:setFilter("nearest", "nearest") end
-          return image
-        end)
-        if ok and img then return img end
-      end
-    end
-  end
   local okA, Assets = pcall(require, "src.render.Assets")
   for _, path in ipairs(candidates) do
     if okA and Assets and Assets.image then
@@ -73,35 +88,16 @@ local function load_texture(name)
         return img
       end
     end
-    if love and love.filesystem and love.filesystem.read then
-      local bytes = love.filesystem.read(path)
-      if bytes and #bytes > 0 and love.image and love.graphics then
-        local ok, img = pcall(function()
-          local fd = love.filesystem.newFileData(bytes, name)
-          local id = love.image.newImageData(fd)
-          local image = love.graphics.newImage(id)
-          if image.setFilter then image:setFilter("nearest", "nearest") end
-          return image
-        end)
-        if ok and img then return img end
-      end
-    end
-    if love and love.image and love.graphics and love.filesystem then
-      local f = io.open(path, "rb")
-      if f then
-        local bytes = f:read("*a")
-        f:close()
-        if bytes and #bytes > 0 then
-          local ok, img = pcall(function()
-            local fd = love.filesystem.newFileData(bytes, name)
-            local id = love.image.newImageData(fd)
-            local image = love.graphics.newImage(id)
-            if image.setFilter then image:setFilter("nearest", "nearest") end
-            return image
-          end)
-          if ok and img then return img end
-        end
-      end
+    local bytes = read_bytes(path)
+    if bytes and #bytes > 0 and love and love.image and love.graphics and love.filesystem then
+      local ok, img = pcall(function()
+        local fd = love.filesystem.newFileData(bytes, name)
+        local id = love.image.newImageData(fd)
+        local image = love.graphics.newImage(id)
+        if image.setFilter then image:setFilter("nearest", "nearest") end
+        return image
+      end)
+      if ok and img then return img end
     end
     if love and love.graphics and love.graphics.newImage then
       local ok, img = pcall(love.graphics.newImage, path)
@@ -209,8 +205,8 @@ function PcChrome.drawLeftDataPanel(hoveredMon, hoverFrame)
   if not hoveredMon then return end
 
   -- 1. Front Sprite in TV Screen (X: 10..73, Y: 19..80, W: 64, H: 61)
-  local sp = Pokemon.speciesOf(hoveredMon)
-  local sprite = Pokemon.frontPic(sp)
+  -- pokefirered/src/pokemon_storage_system_data.c:1034, :1057 MON_DATA_SPECIES_OR_EGG
+  local sprite = Pokemon.frontPic(Pokemon.speciesOrEgg(hoveredMon))
   if sprite and sprite.image then
     love.graphics.setColor(1, 1, 1, 1)
     local sw, sh = sprite.image:getDimensions()
@@ -233,6 +229,10 @@ function PcChrome.drawLeftDataPanel(hoveredMon, hoverFrame)
   end
   local lvl = hoveredMon.level or 5
   local gender = hoveredMon.gender or (hoveredMon.personality and ((hoveredMon.personality % 256 < 127) and "F" or "M"))
+  -- pokefirered/src/pokemon_storage_system_data.c:1091: an egg shows only
+  -- gText_EggNickname; the species, gender/level and item lines stay blank.
+  local isEgg = Pokemon.isEgg(hoveredMon)
+  if isEgg then nick = Strings("EGG") end
 
   -- Line 1: Nickname or Species Name (FONT_NORMAL, Y: 88)
   FrlgFont.draw(nick:sub(1, 10), 6, 88, {
@@ -240,32 +240,34 @@ function PcChrome.drawLeftDataPanel(hoveredMon, hoverFrame)
     colors = FrlgFont.COLOR.WHITE
   })
 
-  -- Line 2: /Species Name (FONT_NORMAL, Y: 102)
-  FrlgFont.draw("/" .. spName:sub(1, 10), 6, 102, {
-    small = false,
-    colors = FrlgFont.COLOR.WHITE
-  })
+  if not isEgg then
+    -- Line 2: /Species Name (FONT_NORMAL, Y: 102)
+    FrlgFont.draw("/" .. spName:sub(1, 10), 6, 102, {
+      small = false,
+      colors = FrlgFont.COLOR.WHITE
+    })
 
-  -- Line 3: Gender & Level (FONT_NORMAL, Y: 116)
-  if gender == "M" or gender == "male" then
-    FrlgFont.draw("♂", 6, 116, { small = false, colors = FrlgFont.COLOR.MALE })
-    FrlgFont.draw("Lv" .. tostring(lvl), 18, 116, { small = false, colors = FrlgFont.COLOR.WHITE })
-  elseif gender == "F" or gender == "female" then
-    FrlgFont.draw("♀", 6, 116, { small = false, colors = FrlgFont.COLOR.FEMALE })
-    FrlgFont.draw("Lv" .. tostring(lvl), 18, 116, { small = false, colors = FrlgFont.COLOR.WHITE })
-  else
-    FrlgFont.draw("Lv" .. tostring(lvl), 6, 116, { small = false, colors = FrlgFont.COLOR.WHITE })
-  end
+    -- Line 3: Gender & Level (FONT_NORMAL, Y: 116)
+    if gender == "M" or gender == "male" then
+      FrlgFont.draw("♂", 6, 116, { small = false, colors = FrlgFont.COLOR.MALE })
+      FrlgFont.draw(Strings("Lv%s", tostring(lvl)), 18, 116, { small = false, colors = FrlgFont.COLOR.WHITE })
+    elseif gender == "F" or gender == "female" then
+      FrlgFont.draw("♀", 6, 116, { small = false, colors = FrlgFont.COLOR.FEMALE })
+      FrlgFont.draw(Strings("Lv%s", tostring(lvl)), 18, 116, { small = false, colors = FrlgFont.COLOR.WHITE })
+    else
+      FrlgFont.draw(Strings("Lv%s", tostring(lvl)), 6, 116, { small = false, colors = FrlgFont.COLOR.WHITE })
+    end
 
-  -- Line 4: Held Item Name (if holding an item) (FONT_SMALL, Y: 132)
-  local held = hoveredMon.heldItem or hoveredMon.item
-  if held and held > 0 then
-    local heldName = ItemsData.displayName(held)
-    if heldName and heldName ~= "" and heldName ~= "NONE" then
-      FrlgFont.draw(heldName:sub(1, 10), 6, 132, {
-        small = true,
-        colors = FrlgFont.COLOR.WHITE
-      })
+    -- Line 4: Held Item Name (if holding an item) (FONT_SMALL, Y: 132)
+    local held = hoveredMon.heldItem or hoveredMon.item
+    if held and held > 0 then
+      local heldName = ItemsData.displayName(held)
+      if heldName and heldName ~= "" and heldName ~= "NONE" then
+        FrlgFont.draw(heldName:sub(1, 10), 6, 132, {
+          small = true,
+          colors = FrlgFont.COLOR.WHITE
+        })
+      end
     end
   end
 
@@ -319,7 +321,12 @@ function PcChrome.drawBoxHeader(boxName, boxNum, isHovered)
   end
 
   -- Box Name Text (drawn centered on the ROM wallpaper's capsule)
-  local nameStr = tostring(boxName or ("BOX " .. tostring(boxNum or 1)))
+  -- Default names are stored in English ("BOX 3", see Storage.new); show those
+  -- translated and leave the names the player typed alone.
+  local num = tonumber(boxNum) or 1
+  local nameStr = (boxName == nil or boxName == string.format("BOX %d", num))
+    and Strings("BOX %d", num)
+    or tostring(boxName)
   local nw = FrlgFont.measure(nameStr)
   local tx = math.floor(160 - nw / 2)
   FrlgFont.draw(nameStr, tx, 20, {
@@ -380,7 +387,7 @@ function PcChrome.drawPartyDrawer(party, partyCursor, hoverFrame, holdingSource)
   local isLeadPickedUp = (holdingSource and holdingSource.loc == "party" and holdingSource.slot == 1)
   local leadMon = (not isLeadPickedUp) and party[1]
   if leadMon then
-    local sp = Pokemon.speciesOf(leadMon)
+    local sp = Pokemon.speciesOrEgg(leadMon)
     local icon = Pokemon.icon(sp)
     if icon and icon.image then
       local isHovered = (partyCursor == 1)
@@ -400,7 +407,7 @@ function PcChrome.drawPartyDrawer(party, partyCursor, hoverFrame, holdingSource)
     local isPickedUp = (holdingSource and holdingSource.loc == "party" and holdingSource.slot == p)
     local pMon = (not isPickedUp) and party[p]
     if pMon then
-      local sp = Pokemon.speciesOf(pMon)
+      local sp = Pokemon.speciesOrEgg(pMon)
       local icon = Pokemon.icon(sp)
       if icon and icon.image then
         local isHovered = (partyCursor == p)

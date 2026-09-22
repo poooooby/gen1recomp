@@ -562,6 +562,50 @@ assert_eq(partyActionSession.party[1].nickname, "RATTATA", "Rattata back in slot
 BoxStorageUI.close()
 print("[ok] Party Drawer Action Menu interaction and persistence verified")
 
+print("=== [TEST 15] Storage Chrome & Wallpapers Extraction and Manifest Integrity ===")
+local StorageChromeExtract = require("src.import.gba.storage_chrome_extract")
+local Cache = require("tests.game3_cache")
+local storageRoot = Cache.root("pokemon/storage/wallpapers/forest.png")
+if not storageRoot then
+  print("[skip] TEST 15: no imported FireRed cache with storage chrome")
+else
+local chromeDir = storageRoot .. "/" .. StorageChromeExtract.CACHE_SUB
+assert_true(StorageChromeExtract.ready(nil, storageRoot), "StorageChromeExtract ready check passed")
+
+local manifestChunk = assert(loadfile(chromeDir .. "/manifest.lua"))
+local manifest = manifestChunk()
+assert_eq(manifest.version, 3, "Manifest version is 3")
+assert_true(manifest.textures.cursor ~= nil, "Manifest includes cursor texture")
+assert_true(manifest.textures.party_drawer_bg ~= nil, "Manifest includes party_drawer_bg")
+assert_true(manifest.textures.scrolling_bg ~= nil, "Manifest includes scrolling_bg")
+assert_true(manifest.wallpapers.forest ~= nil, "Manifest includes forest wallpaper")
+assert_true(manifest.wallpapers.stars ~= nil, "Manifest includes stars wallpaper")
+assert_true(manifest.wallpapers.simple ~= nil, "Manifest includes simple wallpaper")
+
+local function assert_png(path, label)
+  local f = io.open(path, "rb")
+  assert_true(f ~= nil, label .. " exists on disk")
+  local header = f:read(8)
+  f:close()
+  assert_true(header ~= nil and header:sub(2, 4) == "PNG", label .. " is a valid PNG")
+end
+
+local assetCount = 0
+for _, tex in ipairs(StorageChromeExtract.TEXTURE_FILES) do
+  assert_eq(manifest.textures[tex.key], tex.file, "Texture " .. tex.key .. " present in manifest")
+  assert_png(chromeDir .. "/" .. tex.file, "Texture " .. tex.file)
+  assetCount = assetCount + 1
+end
+for _, wpName in ipairs(PcChrome.WALLPAPER_NAMES) do
+  assert_eq(manifest.wallpapers[wpName], "wallpapers/" .. wpName .. ".png",
+    "Wallpaper " .. wpName .. " present in manifest")
+  assert_png(chromeDir .. "/wallpapers/" .. wpName .. ".png", "Wallpaper " .. wpName .. ".png")
+  assetCount = assetCount + 1
+end
+assert_eq(assetCount, 30, "14 UI textures + 16 box wallpapers (total 30 assets)")
+print("[ok] All 14 UI textures and 16 wallpapers validated in manifest and file system")
+end
+
 print("\n========================================================")
-print("ALL 14 POKÉMON STORAGE & PC SYSTEM TESTS PASSED CLEANLY!")
+print("ALL 15 POKÉMON STORAGE & PC SYSTEM TESTS PASSED CLEANLY!")
 print("========================================================")

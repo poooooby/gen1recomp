@@ -9,12 +9,14 @@ local Window = require("src.ui.game3.window")
 local Chrome = require("src.ui.game3.chrome")
 local FrlgFont = require("src.ui.game3.frlg_font")
 local MapSectionsExtract = require("src.import.gba.map_sections_extract")
+local Strings = require("src.core.Strings")
 
 local SaveMenu = {}
 
 SaveMenu.open = false
 SaveMenu.cursor = 1 -- 1=YES 2=NO
-SaveMenu._phase = "confirm" -- confirm | overwrite | saving | saved
+SaveMenu._phase = "confirm" -- confirm | overwrite | saving | saved | save_failed
+SaveMenu._error = nil -- reason the last write failed, for the log
 SaveMenu._session = nil
 SaveMenu._game = nil
 SaveMenu._onClose = nil
@@ -63,11 +65,12 @@ function SaveMenu.show(opts)
   SaveMenu.open = true
   SaveMenu.cursor = 1
   SaveMenu._phase = "confirm"
+  SaveMenu._error = nil
   SaveMenu._session = opts.session
   SaveMenu._game = opts.game
   SaveMenu._onClose = opts.onClose
   Stack.push("save", SaveMenu, { hideBelow = true })
-  se(6) -- SE_WIN_OPEN
+  -- pokefirered/src/start_menu.c:605
 end
 
 function SaveMenu.close()
@@ -75,7 +78,6 @@ function SaveMenu.close()
   Stack.pop("save")
   local cb = SaveMenu._onClose
   SaveMenu._onClose = nil
-  se(9) -- SE_EXIT
   if cb then cb() end
 end
 
@@ -95,21 +97,52 @@ local function do_save()
   local Bridge = require("src.core.game3.bridge")
   local game = Runtime._game
   local mod = Runtime._mod
-  if game and mod then
-    pcall(function() Bridge.persistSessionOnly(mod, game) end)
+
+  -- A write that did not happen must not be reported as one.  Neither call
+  -- signals success by itself: persistSessionOnly returns nothing useful, and
+  -- saveGame returns false for a refused write and nil for a deliberate no-op
+  -- (no session / quest-log phase).  Treat a raise, an explicit false, or an
+  -- absent saveGame as failure.
+  local failure = nil
+  if game and mod and Bridge and type(Bridge.persistSessionOnly) == "function" then
+    local ok, err = pcall(Bridge.persistSessionOnly, mod, game)
+    if not ok then failure = "sidecar persist failed: " .. tostring(err) end
   end
-  if game and game.saveGame then
-    pcall(function() game:saveGame() end)
+  if not failure then
+    if game and type(game.saveGame) == "function" then
+      local ok, written = pcall(game.saveGame, game)
+      if not ok then
+        failure = "saveGame raised: " .. tostring(written)
+      elseif not written then
+        failure = "saveGame did not confirm a write (" .. tostring(written) .. ")"
+      end
+    else
+      failure = "no saveGame available"
+    end
   end
+
+  if failure then
+    SaveMenu._phase = "save_failed"
+    SaveMenu._error = failure
+    pcall(function() require("src.core.Logger").warn("[save] %s", failure) end)
+    return
+  end
+
   se(48) -- SE_SAVE
   SaveMenu._phase = "saved"
 end
 
 function SaveMenu.confirm()
+  if SaveMenu._phase == "save_failed" then
+    -- The dialog stays up so the failure is readable; dismissing it returns
+    -- to the start menu so the player can retry.
+    SaveMenu.close()
+    return
+  end
   if SaveMenu._phase == "saved" then
     SaveMenu.close()
     local StartMenu = require("src.ui.game3.start_menu")
-    if StartMenu.isOpen() then StartMenu.close() end
+    if StartMenu.isOpen() then StartMenu.close(true) end -- pokefirered/src/start_menu.c:583
     return
   end
   if SaveMenu._phase == "saving" then
@@ -126,6 +159,7 @@ function SaveMenu.confirm()
       do_save()
     end
   else -- NO
+    se(5) -- pokefirered/src/menu.c:376
     SaveMenu.close()
   end
 end
@@ -147,35 +181,57 @@ end
 -- engine's internal map id (which is what session.map holds).
 function SaveMenu.locationName(session)
   session = session or {}
-  if type(session.mapName) == "string" and session.mapName ~= "" then
+  if type(session.mapName) == "string" and session.mapName ~= "" and not session.mapName:find("^FR_") and not session.mapName:find("^SEVII_") then
     return session.mapName:upper()
   end
   local mapId = session.map
   local Runtime = package.loaded["src.core.game3.runtime"]
   local game = SaveMenu._game or (Runtime and Runtime._game)
   local def = mapId and game and game.data and game.data.maps and game.data.maps[mapId]
+  local secId = session.regionMapSectionId or session.mapSec or (def and def.regionMapSectionId)
   -- floorNum 0: save_menu_util.c passes fill = 0, like map_name_popup.c.
-  local info = MapSectionsExtract.getInfo(def and def.regionMapSectionId, mapId, 0)
+  local info = MapSectionsExtract.getInfo(secId, mapId, 0)
   if info and info.resolved and type(info.name) == "string" and info.name ~= "" then
-    return info.name:upper()
+    return (info.rawName or info.name):upper()
+  end
+  if info and type(info.name) == "string" and info.name ~= "" and info.name ~= "PALLET TOWN" then
+    return (info.rawName or info.name):upper()
   end
   -- Not a map we can identify (a mod's map, or one with no header data): show
   -- a readable form of the id rather than getInfo's Pallet Town placeholder.
-  return tostring(mapId or "PALLET TOWN"):gsub("^FR_", ""):gsub("^SEVII_", ""):gsub("_", " ")
+  return tostring(mapId or "PALLET TOWN"):gsub("^FR_", ""):gsub("^SEVII_", ""):gsub("_", " "):upper()
+end
+
+-- pret prints every stat value at one x (56 px into the window, labels at 4).
+-- A translated label can be wider than the English one the column was placed
+-- for ("DUREE JEU", "SPIELZEIT"), so push the column past the widest label,
+-- keeping the English gap.
+local VALUE_X = 56
+local VALUE_GAP = VALUE_X - 4 - 42 -- 42 = width of "POKéDEX", the widest US label
+
+function SaveMenu.valueX(labels)
+  local x = VALUE_X
+  for _, label in ipairs(labels) do
+    x = math.max(x, 4 + FrlgFont.measure(label) + VALUE_GAP)
+  end
+  return x
 end
 
 function SaveMenu.draw()
   if not SaveMenu.open then return end
   local session = SaveMenu._session or {}
   local name = tostring(session.name or session.playerName or "RED")
-  local map = SaveMenu.locationName(session)
+  local map = Strings(SaveMenu.locationName(session))
+  local labels = { Strings("PLAYER"), Strings("BADGES"), Strings("POKéDEX"), Strings("TIME") }
+  local valueX = 1 * 8 + SaveMenu.valueX(labels)
   local badges = count_badges(session)
   local caught = count_caught(session.dex) or tonumber(session.caughtMonsCount) or 0
   local hours = tonumber(session.playTimeHours or session.hours) or 0
   local mins = tonumber(session.playTimeMinutes or session.minutes) or 0
 
   -- 1. Top-Left Save Stats Box (pret sSaveStatsWindowTemplate at (1, 1, 14, 9))
-  Window.stdFrame(Window.template(1, 1, 14, 9))
+  -- pokefirered/src/start_menu.c:971
+  Window.fixedStdFrame(Window.template(1, 1, 14, 9))
   -- Location Header.  pret start_menu.c PrintSaveStats centres it in the
   -- 14-tile window: x = (112 - GetStringWidth(FONT_NORMAL, text)) / 2.
   local headerW = 14 * 8
@@ -183,27 +239,30 @@ function SaveMenu.draw()
   local mapX = 1 * 8 + math.max(0, math.floor((headerW - mapW) / 2))
   FrlgFont.draw(map, mapX, 1 * 8 + 2, { maxWidth = headerW, colors = FrlgFont.COLOR.NORMAL })
   -- PLAYER
-  FrlgFont.draw("PLAYER", 1 * 8 + 4, 1 * 8 + 18, { colors = FrlgFont.COLOR.NORMAL })
-  FrlgFont.draw(name, 1 * 8 + 56, 1 * 8 + 18, { colors = FrlgFont.COLOR.NORMAL })
+  FrlgFont.draw(labels[1], 1 * 8 + 4, 1 * 8 + 18, { colors = FrlgFont.COLOR.NORMAL })
+  FrlgFont.draw(name, valueX, 1 * 8 + 18, { colors = FrlgFont.COLOR.NORMAL })
   -- BADGES
-  FrlgFont.draw("BADGES", 1 * 8 + 4, 1 * 8 + 32, { colors = FrlgFont.COLOR.NORMAL })
-  FrlgFont.draw(tostring(badges), 1 * 8 + 56, 1 * 8 + 32, { colors = FrlgFont.COLOR.NORMAL })
+  FrlgFont.draw(labels[2], 1 * 8 + 4, 1 * 8 + 32, { colors = FrlgFont.COLOR.NORMAL })
+  FrlgFont.draw(tostring(badges), valueX, 1 * 8 + 32, { colors = FrlgFont.COLOR.NORMAL })
   -- POKéDEX
-  FrlgFont.draw("POKéDEX", 1 * 8 + 4, 1 * 8 + 46, { colors = FrlgFont.COLOR.NORMAL })
-  FrlgFont.draw(tostring(caught), 1 * 8 + 56, 1 * 8 + 46, { colors = FrlgFont.COLOR.NORMAL })
+  FrlgFont.draw(labels[3], 1 * 8 + 4, 1 * 8 + 46, { colors = FrlgFont.COLOR.NORMAL })
+  FrlgFont.draw(tostring(caught), valueX, 1 * 8 + 46, { colors = FrlgFont.COLOR.NORMAL })
   -- TIME
-  FrlgFont.draw("TIME", 1 * 8 + 4, 1 * 8 + 60, { colors = FrlgFont.COLOR.NORMAL })
-  FrlgFont.draw(string.format("%d:%02d", hours, mins), 1 * 8 + 56, 1 * 8 + 60, { colors = FrlgFont.COLOR.NORMAL })
+  FrlgFont.draw(labels[4], 1 * 8 + 4, 1 * 8 + 60, { colors = FrlgFont.COLOR.NORMAL })
+  FrlgFont.draw(string.format("%d:%02d", hours, mins), valueX, 1 * 8 + 60, { colors = FrlgFont.COLOR.NORMAL })
 
   -- 2. Bottom Dialogue Window (pret WindowFunc_DrawDialogueFrame at (2, 15, 26, 4))
   Chrome.dialogueFrame()
-  local msg = "Would you like to SAVE\nthe game?"
+  local msg = Strings("Would you like to SAVE\nthe game?")
   if SaveMenu._phase == "overwrite" then
-    msg = "There is already a saved file.\nIs it okay to overwrite it?"
+    msg = Strings("There is already a saved file.\nIs it okay to overwrite it?")
   elseif SaveMenu._phase == "saving" then
-    msg = "SAVING…\nDON'T TURN OFF THE POWER."
+    msg = Strings("SAVING…\nDON'T TURN OFF THE POWER.")
   elseif SaveMenu._phase == "saved" then
-    msg = name .. " saved\nthe game."
+    msg = Strings("%s saved\nthe game.", name)
+  elseif SaveMenu._phase == "save_failed" then
+    -- do_save refused to report success; say so instead of claiming a save.
+    msg = Strings("The game could not be saved.")
   end
   FrlgFont.draw(msg, 2 * 8 + 4, 15 * 8 + 2, { linePitch = 15, colors = FrlgFont.COLOR.NORMAL })
 
@@ -218,8 +277,8 @@ function SaveMenu.draw()
     local rowY2 = popY * 8 + 18
     local curY = (SaveMenu.cursor == 1) and rowY1 or rowY2
     Window.cursorPx(popX * 8 + 1, curY)
-    FrlgFont.draw("YES", popX * 8 + 9, rowY1, { colors = FrlgFont.COLOR.NORMAL })
-    FrlgFont.draw("NO", popX * 8 + 9, rowY2, { colors = FrlgFont.COLOR.NORMAL })
+    FrlgFont.draw(Strings("YES"), popX * 8 + 9, rowY1, { colors = FrlgFont.COLOR.NORMAL })
+    FrlgFont.draw(Strings("NO"), popX * 8 + 9, rowY2, { colors = FrlgFont.COLOR.NORMAL })
   end
 end
 

@@ -8,6 +8,8 @@ local Display = require("src.core.game3.display")
 local Stack = require("src.ui.game3.stack")
 local FrlgFont = require("src.ui.game3.frlg_font")
 local Pokemon = require("src.core.game3.pokemon")
+local Dex = require("src.core.game3.dex")
+local PokedexData = require("src.core.game3.pokedex_data")
 local SummaryChrome = require("src.ui.game3.summary_chrome")
 local SummaryData = require("src.core.game3.summary_data")
 local Strings = require("src.core.Strings")
@@ -54,7 +56,7 @@ end
 -- pokefirered/src/pokemon_summary_screen.c:5180
 local function play_mon_cry()
   local mon = current_mon()
-  if not mon or mon.isEgg then return end
+  if not mon or Pokemon.isEgg(mon) then return end
   local species = Pokemon.speciesOf(mon)
   if not species then return end
   local okA, Audio = pcall(require, "src.core.game3.audio")
@@ -86,7 +88,7 @@ local function moves_for_mon(mon)
       if not pp then pp = maxPp end
       local name = Pokemon.moveName(moveId)
       if not name or name == "" or name:match("^MOVE ") then
-        name = (mdef and mdef.name) or name or ("MOVE " .. tostring(moveId))
+        name = (mdef and mdef.name) or name or Strings("MOVE %s", tostring(moveId))
       end
       local mType = (mdef and (mdef.type or mdef.kind)) or "NORMAL"
       local power = (mdef and mdef.power and mdef.power > 0) and tostring(mdef.power) or "---"
@@ -108,7 +110,7 @@ local function moves_for_mon(mon)
     local mdef = Pokemon.battleMove(newId)
     local name = Pokemon.moveName(newId)
     if not name or name == "" or name:match("^MOVE ") then
-      name = (mdef and mdef.name) or name or ("MOVE " .. tostring(newId))
+      name = (mdef and mdef.name) or name or Strings("MOVE %s", tostring(newId))
     end
     local maxPp = (mdef and mdef.pp) or 5
     local mType = (mdef and (mdef.type or mdef.kind)) or "NORMAL"
@@ -151,7 +153,7 @@ function SummaryMenu.openMenu(party, startIndex, opts)
   SummaryMenu._slide.active = false
 
   local mon = current_mon()
-  if mon and mon.isEgg then
+  if mon and Pokemon.isEgg(mon) then
     SummaryMenu._page = PAGE_EGG
   elseif SummaryMenu._mode == "select_move" then
     SummaryMenu._page = PAGE_MOVES_INFO
@@ -192,7 +194,7 @@ local function change_mon(delta)
   SummaryMenu._moveCursor = 1
   SummaryMenu._swapSlot = nil
   local mon = current_mon()
-  if mon and mon.isEgg then
+  if mon and Pokemon.isEgg(mon) then
     SummaryMenu._page = PAGE_EGG
   elseif SummaryMenu._page == PAGE_EGG then
     SummaryMenu._page = PAGE_INFO
@@ -259,8 +261,8 @@ function SummaryMenu.handleInput(input)
         local chosenMove = moves[SummaryMenu._moveCursor]
         local moveId = chosenMove and chosenMove.id
         if moveId and Pokemon.isHmMove(moveId) then
-          pcall(function() require("src.core.game3.audio").playSe(9) end)
-          -- pokefirered/src/pokemon_summary_screen.c:3897
+          pcall(function() require("src.core.game3.audio").playSe(26) end)
+          -- pokefirered/src/pokemon_summary_screen.c:3864
           SummaryMenu._hmNotice = true
         else
           pcall(function() require("src.core.game3.audio").playSe(5) end)
@@ -279,7 +281,7 @@ function SummaryMenu.handleInput(input)
         if cb then cb(nil) end
       end
     elseif input:wasPressed("b") then
-      pcall(function() require("src.core.game3.audio").playSe(9) end)
+      -- pokefirered/src/pokemon_summary_screen.c:3868
       local cb = SummaryMenu._onSelectMove
       SummaryMenu._onSelectMove = nil
       SummaryMenu.close()
@@ -403,6 +405,29 @@ local function species_name(mon)
   return Pokemon.displayName(mon)
 end
 
+-- pokefirered/src/pokemon.c:5834, :5210-5216
+function SummaryMenu.dexNumber(species, session)
+  local sp = tonumber(species) or 0
+  local nat = (sp ~= 0 and Pokemon.national and Pokemon.national(sp)) or 0
+  if nat > (Dex.KANTO_MAX or 151) and not PokedexData.isNationalUnlocked(session) then
+    return nil
+  end
+  return nat
+end
+
+-- pokefirered/src/pokemon_summary_screen.c:2088
+function SummaryMenu.dexNoText(mon, session)
+  local nat = SummaryMenu.dexNumber(Pokemon.speciesOf(mon), session)
+  if not nat then return Strings("???", "game3.summary.dexNo") end
+  return string.format("%03d", nat)
+end
+
+-- pokefirered/src/pokemon_summary_screen.c:4736
+function SummaryMenu.showsPokerusIcon(mon)
+  if not mon then return false end
+  return not Pokemon.hasPokerus(mon) and Pokemon.hasHadPokerus(mon)
+end
+
 local function draw_header(mon)
   local c = coords()
   local species = Pokemon.speciesOf(mon)
@@ -417,7 +442,7 @@ local function draw_header(mon)
   if SummaryMenu._page ~= PAGE_MOVES_INFO then
     local lv = tonumber(mon.level) or 1
     local lx, ly = cxy("level", 4, 18)
-    draw_text(string.format("Lv%d", lv), lx, ly, 36, "NORMAL")
+    draw_text(Strings("Lv%d", lv), lx, ly, 36, "NORMAL")
   end
 
   local gender = SummaryData.gender(mon)
@@ -437,6 +462,11 @@ local function draw_header(mon)
   if ailment > 0 then
     local ax, ay = isMovesPage and 16 or 16, isMovesPage and 44 or 38
     SummaryChrome.drawStatusIcon(ax, ay, ailment)
+  end
+
+  -- pokefirered/src/pokemon_summary_screen.c:4716
+  if SummaryMenu.showsPokerusIcon(mon) then
+    SummaryChrome.drawPokerus(110, 88)
   end
 
   -- In pret pokefirered (pokemon_summary_screen.c:1635, 1681, 1979-1984, 4139-4175):
@@ -487,9 +517,8 @@ local function draw_page_info(mon)
   local t1 = mon.type1 or (Pokemon.types and Pokemon.types(species) and Pokemon.types(species)[1]) or "NORMAL"
   local t2 = mon.type2 or (Pokemon.types and Pokemon.types(species) and Pokemon.types(species)[2])
 
-  local dexNo = tonumber(mon.dexNo or mon.species or species) or 0
   local dx, dy = cxy("dexNo", 167, 21)
-  draw_text(string.format("%03d", dexNo), dx, dy, 40, "NORMAL")
+  draw_text(SummaryMenu.dexNoText(mon, SummaryMenu._playerState), dx, dy, 40, "NORMAL")
 
   local sx, sy = cxy("species", 167, 35)
   draw_text(species_name(mon), sx, sy, 64, "NORMAL")
@@ -511,7 +540,7 @@ local function draw_page_info(mon)
   local ix, iy = cxy("otId", 167, 80)
   draw_text(string.format("%05d", bit.band(otId, 0xFFFF)), ix, iy, 48, "NORMAL")
 
-  local item = mon.item or mon.heldItem or "NONE"
+  local item = mon.item or mon.heldItem or Strings("NONE")
   local itx, ity = cxy("item", 167, 95)
   draw_text(tostring(item), itx, ity, 64, "NORMAL")
 
@@ -552,9 +581,9 @@ local function draw_page_skills(mon)
   end
 
   local lx, ly = cxy("expPointsLabel", 74, 103)
-  draw_text("EXP. POINTS", lx, ly, 96, "NORMAL")
+  draw_text(Strings("EXP. POINTS"), lx, ly, 96, "NORMAL")
   local nlx, nly = cxy("nextLvLabel", 74, 116)
-  draw_text("NEXT LV.", nlx, nly, 96, "NORMAL")
+  draw_text(Strings("NEXT LV."), nlx, nly, 96, "NORMAL")
 
   local prog = SummaryData.expProgress(mon)
   local ex, ey = cxy("expTotal", 175, 103)
@@ -583,12 +612,20 @@ local function draw_page_skills(mon)
   end
   ability = ability or "—"
   local ax, ay = cxy("abilityName", 74, 129)
-  draw_text(tostring(ability), ax, ay, 80, "NORMAL")
+  -- No registry renames abilities; a translation reaches the name through Strings().
+  draw_text(Strings(tostring(ability)), ax, ay, 80, "NORMAL")
   local desc = SummaryData.abilityDescription(abilityId, tostring(ability))
   local ad = coords().abilityDesc or { x = 10, y = 143, w = 232 }
   draw_text(desc, ad.x or 10, ad.y or 143, ad.w or 232, "NORMAL")
 end
 
+
+-- pret prints each move name at x 3 of POKESUM_WIN_MOVES_3, a 10-tile window
+-- starting at tile 20 (pokemon_summary_screen.c:857, :2543), so a name has up
+-- to that window's right edge -- the edge of the screen -- which is 77 px from
+-- the usual pen at 163.  The cart's own names reach 72 px (SKY UPPERCUT,
+-- FRENZY PLANT), and a translated one can use the rest.
+local MOVE_NAME_RIGHT = (20 + 10) * 8
 
 local function draw_page_moves(mon, isDetail)
   local moves = moves_for_mon(mon)
@@ -604,7 +641,7 @@ local function draw_page_moves(mon, isDetail)
     local m = moves[i]
     if m then
       SummaryChrome.drawTypeBadge(m.type, slot.typeX, slot.typeY)
-      draw_text(m.name, slot.nameX, slot.nameY, 64, "NORMAL")
+      draw_text(m.name, slot.nameX, slot.nameY, MOVE_NAME_RIGHT - slot.nameX, "NORMAL")
       draw_text(string.format("%d/%d", m.pp, m.maxPp), slot.ppX, slot.ppY, 40, "NORMAL")
     else
       draw_text("-", slot.typeX + 8, slot.typeY + 2, 16, "NORMAL")
@@ -639,9 +676,10 @@ local function draw_page_moves(mon, isDetail)
 end
 
 local function draw_page_egg(mon)
-  local species = Pokemon.speciesOf(mon)
+  -- pokefirered/src/pokemon_summary_screen.c:4016 MON_DATA_SPECIES_OR_EGG
+  local species = Pokemon.speciesOrEgg(mon)
   local nx, ny = cxy("name", 40, 18)
-  draw_text("EGG", nx, ny, 64, "NORMAL")
+  draw_text(Strings("EGG"), nx, ny, 64, "NORMAL")
 
   local pic = coords().monPic or { x = 60, y = 65 }
   local cx, cy = pic.x or 60, pic.y or 65
@@ -673,25 +711,25 @@ local PAGE_TITLES = {
 
 local function get_controls_str(page, isEgg)
   if SummaryMenu._mode == "select_move" then
-    return "{DPAD_UPDOWN}PICK"
+    return Strings("{DPAD_UPDOWN}PICK")
   end
   if isEgg then
-    return "{A_BUTTON}CANCEL"
+    return Strings("{A_BUTTON}CANCEL")
   end
   if page == PAGE_INFO then
-    return "{DPAD_RIGHT}PAGE {A_BUTTON}CANCEL"
+    return Strings("{DPAD_RIGHT}PAGE {A_BUTTON}CANCEL")
   elseif page == PAGE_SKILLS then
-    return "{DPAD_LEFTRIGHT}PAGE"
+    return Strings("{DPAD_LEFTRIGHT}PAGE")
   elseif page == PAGE_MOVES then
-    return "{DPAD_LEFT}PAGE {A_BUTTON}DETAIL"
+    return Strings("{DPAD_LEFT}PAGE {A_BUTTON}DETAIL")
   elseif page == PAGE_MOVES_INFO then
-    return "{DPAD_UPDOWN}PICK {A_BUTTON}SWITCH"
+    return Strings("{DPAD_UPDOWN}PICK {A_BUTTON}SWITCH")
   end
   return "{DPAD_LEFTRIGHT}PAGE"
 end
 
 local function draw_top_bar_text(page, isEgg)
-  local title = PAGE_TITLES[page] or "POKéMON INFO"
+  local title = Strings(PAGE_TITLES[page] or "POKéMON INFO")
   FrlgFont.draw(title, 4, 1, {
     colors = FrlgFont.COLOR.WHITE,
     small = false,
@@ -722,7 +760,7 @@ function SummaryMenu.draw()
   end
 
   -- 2. OVERLAY LAYER (Foreground elements anchored to screen coordinates)
-  draw_top_bar_text(SummaryMenu._page, mon.isEgg)
+  draw_top_bar_text(SummaryMenu._page, Pokemon.isEgg(mon))
   if SummaryMenu._page == PAGE_EGG then
     draw_page_egg(mon)
   else

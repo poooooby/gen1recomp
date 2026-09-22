@@ -9,6 +9,7 @@
 local BattleChrome = require("src.ui.game3.battle_chrome")
 local FrlgFont = require("src.ui.game3.frlg_font")
 local State = require("src.core.game3.battle.state")
+local Strings = require("src.core.Strings")
 
 local Healthbox = {}
 
@@ -198,6 +199,37 @@ local function erase_hp_window(boxX, boxY)
   love.graphics.setColor(CREAM)
   love.graphics.rectangle("fill", boxX + HP_WIN_X, boxY + HP_TEXT_Y, HP_WIN_W, HP_WIN_H)
   love.graphics.setColor(1, 1, 1, 1)
+end
+
+-- pokefirered/src/battle_interface.c:615
+local SAFARI_CAP_X, SAFARI_CAP_Y, SAFARI_CAP_W, SAFARI_CAP_H = 96, 17, 2, 7
+local SAFARI_STRIP_X, SAFARI_STRIP_Y, SAFARI_STRIP_W, SAFARI_STRIP_H = 18, 34, 78, 4
+local BOX_SHADOW_SRC_X, BOX_SHADOW_SRC_Y = 10, 35
+local _shadowImg, _shadowQuad
+local _ballsText, _ballsCount, _ballsW
+
+local function draw_safari_box(boxX, boxY)
+  love.graphics.setColor(CREAM)
+  love.graphics.rectangle("fill", boxX + SAFARI_CAP_X, boxY + SAFARI_CAP_Y, SAFARI_CAP_W, SAFARI_CAP_H)
+  love.graphics.setColor(1, 1, 1, 1)
+  local img = BattleChrome._playerBox
+  if not (img and love.graphics.newQuad) then return end
+  if _shadowImg ~= img then
+    _shadowImg = img
+    _shadowQuad = love.graphics.newQuad(BOX_SHADOW_SRC_X, BOX_SHADOW_SRC_Y, 1, 1, img:getDimensions())
+  end
+  love.graphics.draw(img, _shadowQuad, boxX + SAFARI_STRIP_X, boxY + SAFARI_STRIP_Y, 0,
+    SAFARI_STRIP_W, SAFARI_STRIP_H)
+end
+
+-- pokefirered/src/battle_interface.c:1743
+local function safari_balls_text(balls)
+  if _ballsCount ~= balls or not _ballsText then
+    _ballsCount = balls
+    _ballsText = Strings("Left: %d", balls)
+    _ballsW = FrlgFont.measure(_ballsText, { small = true })
+  end
+  return _ballsText, _ballsW
 end
 
 -- pokefirered/src/battle_interface.c:795
@@ -393,6 +425,21 @@ function Healthbox.draw(side, battler, opts)
     erase_placeholder_ink(tlX, tlY, ENEMY_PLACEHOLDER_INK)
   end
 
+  local bstSafari = live_st()
+  if isPlayer and bstSafari and bstSafari.safari then
+    -- pokefirered/src/battle_interface.c:1743
+    local balls = (bstSafari.safariState and tonumber(bstSafari.safariState.balls)) or 0
+    local sbx, sby = hp_bar_top_left(hp_bar_center(side, c.x + ox, c.y))
+    love.graphics.setColor(CREAM)
+    love.graphics.rectangle("fill", sbx, sby - 2, 64, 10)
+    love.graphics.setColor(1, 1, 1, 1)
+    draw_safari_box(tlX, tlY)
+    FrlgFont.draw(Strings("SAFARI BALLS"), tlX + 16, tlY + TEXT_Y, small_opts(HB_TEXT))
+    local left, w = safari_balls_text(math.max(0, math.floor(balls)))
+    FrlgFont.draw(left, tlX + HP_WIN_X + HP_WIN_W - w, tlY + HP_TEXT_Y, small_opts(HB_TEXT))
+    return
+  end
+
   local barCx, barCy = hp_bar_center(side, c.x + ox, c.y)
   local bx, by = hp_bar_top_left(barCx, barCy)
   local statusBorder = false
@@ -422,7 +469,7 @@ function Healthbox.draw(side, battler, opts)
   -- pokefirered/src/battle_interface.c:1506
   local Battle = package.loaded["src.core.game3.battle"]
   local bst = Battle and Battle._st
-  if not isPlayer and bst and bst.ghostBattle and name == "GHOST" then
+  if not isPlayer and bst and bst.ghostBattle and name == Strings("GHOST") then
     local okA, AnimG = pcall(require, "src.core.game3.battle.anim")
     local pg = okA and AnimG.present and AnimG.present("enemy")
     if pg and pg.ghostUnveiled then
@@ -469,8 +516,67 @@ function Healthbox.draw(side, battler, opts)
     if ailment >= 1 and ailment <= 6 then
       -- pokefirered/src/battle_interface.c:1614
       SummaryChrome.drawStatusIcon(tlX + 2, tlY + 16, ailment)
+    else
+      -- pokefirered/src/battle_interface.c:1551 TryAddPokeballIconToHealthbox
+      if Healthbox.shouldShowCaughtMarker(bst, battler) then
+        BattleChrome.drawPartyBall(tlX + 8, tlY + 16, "caught")
+      end
     end
   end
+end
+
+function Healthbox.shouldShowCaughtMarker(st, battler)
+  if not battler then return false end
+  if battler.isPlayer or battler.side == "player" then return false end
+
+  -- Must not be first battle / tutorial / pokedude
+  if st and (st.firstBattle or st.oldManTutorial or st.pokedude) then
+    return false
+  end
+
+  -- Must not be trainer battle (wild only, matching pokefirered BATTLE_TYPE_TRAINER check)
+  if st and (st.trainer or st.trainerId or st.isTrainerBattle or st.kind == "trainer") then
+    return false
+  end
+  if battler.isTrainer or (battler.trainer and true) then
+    return false
+  end
+
+  -- Ghost battles: un-identified ghosts (name == "GHOST") do not show caught ball
+  if st and st.ghostBattle and not st.ghostUnveiled then
+    return false
+  end
+  local name = State.displayName(battler)
+  if name == "GHOST" then
+    return false
+  end
+
+  local species = battler.species or (battler.mon and (battler.mon.species or battler.mon.speciesId))
+  if not species or species == 0 then return false end
+
+  local dex = (st and (st.dex or (st.session and st.session.dex)))
+  if not dex then
+    local Battle = package.loaded["src.core.game3.battle"]
+    local bst = Battle and Battle._st
+    dex = bst and (bst.dex or (bst.session and bst.session.dex))
+  end
+  if not dex then
+    local okR, Runtime = pcall(require, "src.core.game3.runtime")
+    if okR and Runtime and Runtime.getSession then
+      local s = Runtime.getSession()
+      dex = s and s.dex
+    end
+  end
+  if not dex then
+    local okF, Field = pcall(require, "src.core.game3.field")
+    if okF and Field and Field._session then
+      dex = Field._session.dex
+    end
+  end
+  if not dex then return false end
+
+  local Dex = require("src.core.game3.dex")
+  return Dex.isCaught(dex, species) == true
 end
 
 function Healthbox.syncOam(_st)

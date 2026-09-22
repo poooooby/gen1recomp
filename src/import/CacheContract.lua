@@ -20,7 +20,8 @@ CacheContract.VERSION_FORMAT = {
   -- engine/overworld/map_sprites.asm:181
   yellow = "rom-cache-v11-yellow1:",
   -- v8: M4A tracks retain reachable patterns and explicit entry offsets.
-  firered = "rom-cache-v14-firered:",
+  firered = "rom-cache-v15-firered:",
+  leafgreen = "rom-cache-v1-leafgreen:",
 }
 CacheContract.MARKER_PATH = "rom-cache.complete"
 
@@ -187,6 +188,32 @@ CacheContract.VERSION_REQUIRED_FILES_OVERRIDE = {
     "data/generated/gba/ow/7.rgba",
     "data/generated/gba/pokemon/manifest.lua",
     "data/generated/gba/pokemon/names.lua",
+    "data/generated/gba/pokemon/front/1.rgba",
+    "data/generated/gba/pokemon/front/200.rgba",
+    "data/generated/gba/pokemon/front/411.rgba",
+    "data/generated/gba/pokemon/back/1.rgba",
+    "data/generated/gba/pokemon/back/200.rgba",
+    "data/generated/gba/pokemon/back/411.rgba",
+    "data/generated/gba/pokemon/icons/1.rgba",
+    "data/generated/gba/pokemon/icons/200.rgba",
+    "data/generated/gba/pokemon/icons/411.rgba",
+    -- src/pokedex_screen.c:930
+    "data/generated/gba/pokemon/pokedex/paper_bg.rgba",
+    -- src/pokedex_screen.c:2901
+    "data/generated/gba/pokemon/pokedex/footprints/1.rgba",
+    "data/generated/gba/pokemon/pokedex/footprints/bulbasaur.rgba",
+    "data/generated/gba/pokemon/pokedex/footprints/question_mark.rgba",
+    "data/generated/gba/region_map/kanto_map.png",
+    "data/generated/gba/region_map/cursor.png",
+    "data/generated/gba/region_map/player_red.png",
+    -- src/region_map.c:425
+    "data/generated/gba/region_map/fly_icon.rgba",
+    "data/generated/gba/region_map/fly_icon.png",
+    "data/generated/gba/region_map/map_sections.lua",
+    -- src/heal_location.c:62, src/region_map.c:4023
+    "data/generated/gba/region_map/heal_locations.lua",
+    "data/generated/gba/region_map/fly_destinations.lua",
+    "data/generated/gba/scripts/multichoice.lua",
     "data/generated/gba/pokemon/stats.lua",
     "data/generated/gba/pokemon/learnsets.lua",
     "data/generated/gba/pokemon/move_names.lua",
@@ -197,6 +224,12 @@ CacheContract.VERSION_REQUIRED_FILES_OVERRIDE = {
     "data/generated/gba/pokemon/battle/healthbox_doubles_opponent.rgba",
     "data/generated/gba/pokemon/battle/hp_bold_digits.rgba",
     "data/generated/gba/pokemon/battle/terrain_building.rgba",
+    -- src/battle_bg.c:439
+    "data/generated/gba/pokemon/battle/terrain_grass.rgba",
+    "data/generated/gba/pokemon/battle/terrain_cave.rgba",
+    "data/generated/gba/pokemon/battle/terrain_water.rgba",
+    "data/generated/gba/pokemon/battle/terrain_champion.rgba",
+    "data/generated/gba/pokemon/battle/terrain_bg_cave.rgba",
     "data/generated/gba/pokemon/battle/ball_open/manifest.lua",
     "data/generated/gba/pokemon/battle/ball_open/particles.rgba",
     "data/generated/gba/pokemon/battle_transition/manifest.lua",
@@ -217,6 +250,11 @@ CacheContract.VERSION_REQUIRED_FILES_OVERRIDE = {
     "data/generated/gba/doors/manifest.lua",
     "data/generated/gba/doors/pallet.rgba",
     "data/generated/gba/native/manifest.lua",
+    -- src/scrcmd.c:711, include/constants/layouts.h:253,267,268,308
+    "data/generated/gba/native/layouts/alt_264.mid",
+    "data/generated/gba/native/layouts/alt_278.mid",
+    "data/generated/gba/native/layouts/alt_279.mid",
+    "data/generated/gba/native/layouts/alt_319.mid",
     "data/generated/gba/pokemon/summary/manifest.lua",
     "data/generated/gba/pokemon/summary/menu_info.rgba",
     "data/generated/gba/pokemon/storage/manifest.lua",
@@ -229,6 +267,19 @@ CacheContract.VERSION_REQUIRED_FILES_OVERRIDE = {
     "data/generated/gba/chrome/user_frame_9.rgba",
     "data/generated/gba/chrome/fonts/latin_normal_fg.rgba",
     "data/generated/gba/chrome/fonts/latin_widths.lua",
+    -- src/braille_text.c:15
+    "data/generated/gba/chrome/fonts/braille_fg.rgba",
+    "data/generated/gba/chrome/fonts/braille_shadow.rgba",
+    "data/generated/gba/chrome/fonts/braille.lua",
+    -- src/seagallop.c:41
+    "data/generated/gba/seagallop/manifest.lua",
+    "data/generated/gba/seagallop/water.4bpp",
+    "data/generated/gba/seagallop/ferry.4bpp",
+    "data/generated/gba/seagallop/wake.4bpp",
+    "data/generated/gba/seagallop/wb_tilemap.bin",
+    "data/generated/gba/seagallop/eb_tilemap.bin",
+    "data/generated/gba/seagallop/wb.rgba",
+    "data/generated/gba/seagallop/eb.rgba",
     "data/generated/gba/trainers.lua",
     "data/generated/gba/trainers/back_0.rgba",
     "data/generated/gba/trainers/back_1.rgba",
@@ -240,9 +291,115 @@ CacheContract.VERSION_REQUIRED_FILES_OVERRIDE = {
     "data/generated/gba/field_effects/surf_blob.rgba",
     "data/generated/gba/field_effects/fly_bird.rgba",
     "data/generated/gba/field_effects/ripple.rgba",
+    -- src/field_effect.c:3963 (Birth Island meteorite shatter shards)
+    "data/generated/gba/field_effects/deoxys_rock_fragments.rgba",
+    -- src/data/field_effects/field_effect_objects.h:565,1203
+    "data/generated/gba/field_effects/splash.rgba",
+    "data/generated/gba/field_effects/hot_springs_water.rgba",
     "data/generated/gba/field_effects/emoticons.rgba",
+    -- src/slot_machine.c:399, :739
+    "data/generated/gba/slot_machine/manifest.lua",
+    "data/generated/gba/slot_machine/reel_icons.rgba",
+    "data/generated/gba/slot_machine/clefairy.rgba",
+    "data/generated/gba/slot_machine/digits.rgba",
+    "data/generated/gba/slot_machine/bg.rgba",
+    "data/generated/gba/slot_machine/payout_lights.rgba",
+    "data/generated/gba/slot_machine/match_lines.rgba",
+    "data/generated/gba/slot_machine/button_pressed.rgba",
+    "data/generated/gba/slot_machine/combos_window.rgba",
+    -- src/trade_scene.c:151
+    "data/generated/gba/trade/manifest.lua",
+    "data/generated/gba/trade/gba_screen.rgba",
+    "data/generated/gba/trade/gba_screen_wireless.rgba",
+    "data/generated/gba/trade/gba_screen_flash.rgba",
+    "data/generated/gba/trade/cable_closeup.rgba",
+    "data/generated/gba/trade/cable_end.rgba",
+    "data/generated/gba/trade/link_mon_glow.rgba",
+    "data/generated/gba/trade/link_mon_shadow.rgba",
+    "data/generated/gba/trade/ball.rgba",
+    "data/generated/gba/trade/ball_spin.rgba",
+    -- src/link_rfu_3.c:34, src/union_room_chat_objects.c:30
+    "data/generated/gba/union_room/manifest.lua",
+    "data/generated/gba/union_room/wireless_icon.rgba",
+    "data/generated/gba/union_room/chat_bg.rgba",
+    "data/generated/gba/union_room/chat_panel.rgba",
+    "data/generated/gba/union_room/chat_icons.rgba",
+    "data/generated/gba/union_room/chat_selector_cursor.rgba",
+    -- src/wireless_communication_status_screen.c:50
+    "data/generated/gba/wireless_status/manifest.lua",
+    "data/generated/gba/wireless_status/bg.rgba",
+    "data/generated/gba/wireless_status/palettes.pal",
+    -- src/fame_checker.c:119, src/graphics.c:1230
+    "data/generated/gba/fame_checker/manifest.lua",
+    "data/generated/gba/fame_checker/bg.rgba",
+    "data/generated/gba/fame_checker/0.rgba",
+    "data/generated/gba/fame_checker/1.rgba",
+    "data/generated/gba/fame_checker/13.rgba",
+    "data/generated/gba/fame_checker/14.rgba",
+    "data/generated/gba/fame_checker/cursor.rgba",
+    "data/generated/gba/fame_checker/question_mark.rgba",
+    "data/generated/gba/fame_checker/silhouette.pal",
+    "data/generated/gba/fame_checker/pack.lua",
+    -- src/graphics.c:1117, src/teachy_tv.c:526
+    "data/generated/gba/teachy_tv/manifest.lua",
+    "data/generated/gba/teachy_tv/screen.rgba",
+    "data/generated/gba/teachy_tv/title.rgba",
+    "data/generated/gba/teachy_tv/end.rgba",
+    -- src/teachy_tv.c:637, :1218
+    "data/generated/gba/teachy_tv/static.rgba",
+    "data/generated/gba/teachy_tv/bg3.rgba",
+    -- src/mystery_gift_show_card.c:150, src/mystery_gift_show_news.c:99
+    "data/generated/gba/mystery_gift/manifest.lua",
+    "data/generated/gba/mystery_gift/card_bg0.rgba",
+    "data/generated/gba/mystery_gift/card_bg7.rgba",
+    "data/generated/gba/mystery_gift/news_bg0.rgba",
+    "data/generated/gba/mystery_gift/news_bg7.rgba",
+    -- src/trainer_tower_sets.c:8956
+    "data/generated/gba/trainer_tower.lua",
+    -- src/data/pokemon/tutor_learnsets.h:22
+    "data/generated/gba/pokemon/tutor.lua",
+    -- src/trainer_tower.c:554, include/constants/layouts.h:355, :363
+    "data/generated/gba/native/layouts/alt_366.mid",
+    "data/generated/gba/native/layouts/alt_373.mid",
+    "data/generated/gba/native/layouts/alt_374.mid",
+    "data/generated/gba/native/layouts/alt_381.mid",
+    -- src/script_menu.c:1161
+    "data/generated/gba/museum/manifest.lua",
+    "data/generated/gba/museum/kabutops.rgba",
+    "data/generated/gba/museum/aerodactyl.rgba",
+    -- src/region_map.c:790 sAnim_DungeonIconVisited
+    "data/generated/gba/region_map/dungeon_icon_visited.rgba",
+    "data/generated/gba/region_map/dungeon_icon_visited.png",
+    -- src/learn_move.c:403
+    "data/generated/gba/move_relearner/manifest.lua",
+    "data/generated/gba/move_relearner/bg.rgba",
+    -- src/daycare.c:137, :138, :139
+    "data/generated/gba/pokemon/egg/manifest.lua",
+    "data/generated/gba/pokemon/egg/hatch.rgba",
+    "data/generated/gba/pokemon/egg/shard.rgba",
+    "data/generated/gba/pokemon/front/412.rgba",
+    -- src/party_menu.c:2655
+    "data/generated/gba/pokemon/icons/412.rgba",
+    -- src/battle_records.c:563
+    "data/generated/gba/trainer_tower/manifest.lua",
+    "data/generated/gba/trainer_tower/records_bg.rgba",
+    -- src/trainer_card.c:265, :1454, :1560
+    "data/generated/gba/trainer_card/front_0.rgba",
+    "data/generated/gba/trainer_card/front_4_female.rgba",
+    "data/generated/gba/trainer_card/back_0.rgba",
+    "data/generated/gba/trainer_card/back_4_female.rgba",
+    "data/generated/gba/trainer_card/screen_0.rgba",
+    "data/generated/gba/trainer_card/screen_4_female.rgba",
+    "data/generated/gba/trainer_card/star.rgba",
+    "data/generated/gba/trainer_card/stickers.rgba",
   },
 }
+CacheContract.VERSION_REQUIRED_FILES_OVERRIDE.leafgreen = {}
+for i, path in ipairs(CacheContract.VERSION_REQUIRED_FILES_OVERRIDE.firered) do
+  CacheContract.VERSION_REQUIRED_FILES_OVERRIDE.leafgreen[i] = path
+end
+table.insert(CacheContract.VERSION_REQUIRED_FILES_OVERRIDE.leafgreen,
+  "data/generated/gba/intro/title_streak.png")
 CacheContract.VERSION_REQUIRED_FILES_OVERRIDE.silver =
   CacheContract.VERSION_REQUIRED_FILES_OVERRIDE.gold
 
@@ -373,11 +530,25 @@ function CacheContract.readMarker(version, fs)
   return marker
 end
 
+function CacheContract.cacheVersionCurrent(version, fs)
+  if GameVersion.generation(version) ~= 3 then return true end
+  fs = fs or require("src.import.CacheFs")
+  local okV, Versions = pcall(require, "src.import.gba.versions")
+  if not okV or not Versions or not Versions.CACHE_VERSION then return true end
+  local ok, raw = withVersionPrefix(version, fs, function()
+    return fs.read("data/generated/gba/meta.json")
+  end)
+  if not ok or type(raw) ~= "string" then return false end
+  local stamped = tonumber(raw:match('"cache_version"%s*:%s*(%d+)'))
+  return stamped == Versions.CACHE_VERSION
+end
+
 function CacheContract.isReady(version, fs)
   fs = fs or require("src.import.CacheFs")
   if CacheContract.sourceTreeHasData(version) then return true end
   local marker, readError = CacheContract.readMarker(version, fs)
   if readError or not CacheContract.markerMatches(version, marker) then return false end
+  if not CacheContract.cacheVersionCurrent(version, fs) then return false end
   return CacheContract.allRequiredFilesExist(version, fs)
 end
 

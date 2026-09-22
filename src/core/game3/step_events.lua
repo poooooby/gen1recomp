@@ -4,11 +4,12 @@
 -- 2. Happiness Step Counter (128 steps): +1 friendship to all party Pokémon.
 -- 3. VS Seeker Battery (100 steps): Increments while the VS SEEKER is in the bag.
 -- 4. Overworld Poison (4 steps): 4-frame reddish screen flash, SE_FIELD_POISON, lethal faint at 0 HP.
--- 5. Egg Cycles & Daycare (256 steps): Decrements egg cycles -> EggHatchScene; +1 EXP per step in Daycare.
+-- 5. Egg Cycles & Daycare (daycare stepCounter == 255): Decrements egg cycles -> EggHatch; +1 EXP per step in Daycare.
 -- 6. Repel Counter: Decrements steps -> "Repel's effect wore off..." on expiration.
 
 local Pokemon = require("src.core.game3.pokemon")
 local ModRuntime = require("src.mods.Runtime")
+local Strings = require("src.core.Strings")
 
 local StepEvents = {}
 
@@ -44,16 +45,18 @@ end
 
 local push_event = StepEvents.queueEvent
 
--- pokefirered/src/metatile_behavior.c:266
+-- pokefirered/src/field_control_avatar.c:658
 local function forced_step()
+  local ForcedMovement = package.loaded["src.core.game3.forced_movement"]
+    or require("src.core.game3.forced_movement")
+  if ForcedMovement.isForced() then return true end
   local Player = package.loaded["src.core.game3.player"]
   local Collision = package.loaded["src.core.game3.collision"]
   if not (Player and Collision and Collision.behavior) then return false end
   local ok, mb = pcall(Collision.behavior, Player.cellX, Player.cellY)
   mb = ok and tonumber(mb) or nil
   if not mb then return false end
-  return (mb >= 0x40 and mb <= 0x48) or (mb >= 0x50 and mb <= 0x53)
-    or mb == 0x13 or mb == 0x23 or (mb >= 0x54 and mb <= 0x57)
+  return ForcedMovement.isForcedMovementTile(mb)
 end
 
 local function party_is_wiped(party)
@@ -83,7 +86,7 @@ local function trigger_white_out(session, game)
   -- 1. Faint message
   local Hud = require("src.ui.game3.hud")
   local playerName = (session and (session.name or session.playerName)) or "PLAYER"
-  local msg = playerName .. " is out of usable\nPOKéMON!\n\n" .. playerName .. " whited out!"
+  local msg = Strings("%s is out of usable\nPOKéMON!\n\n%s whited out!", playerName, playerName)
 
   Hud.openMessage(game, msg, {
     done = function()
@@ -132,22 +135,31 @@ function StepEvents.onStepTaken(session, game)
   local hapSteps = (tonumber(session.vars[0x403F] or session.happinessSteps) or 0) + 1
   if hapSteps >= 128 then
     hapSteps = 0
+    -- pokefirered/src/field_control_avatar.c:699
+    local ctx = { mapSec = Pokemon.currentMapSec(session) }
     for _, mon in ipairs(party) do
-      if not (mon.isEgg or (type(mon.egg) == "boolean" and mon.egg)) then
-        local curHap = tonumber(mon.friendship or mon.happiness) or 70
-        if curHap < 255 then
-          mon.friendship = math.min(255, curHap + 1)
-          mon.happiness = mon.friendship
-        end
-      end
+      Pokemon.adjustFriendship(mon, Pokemon.FRIENDSHIP_EVENT_WALKING, ctx)
     end
   end
   session.vars[0x403F] = hapSteps
   session.happinessSteps = hapSteps
 
+  -- pokefirered/src/field_control_avatar.c:217
+  local MysteryGift = require("src.core.game3.mystery_gift")
+  MysteryGift.incrementNewsStepCounter(session)
+
+  -- pokefirered/src/field_specials.c:2068
+  local massage = tonumber(session.vars[0x4025]) or 0
+  if massage < 500 then session.vars[0x4025] = massage + 1 end
+
+  -- pokefirered/src/field_specials.c:2433 IncrementBirthIslandRockStepCount
+  require("src.core.game3.deoxys").incrementStepCount(session)
+
   -- pokefirered/src/field_control_avatar.c:658
+  local forced = forced_step()
+  local poisonFainted = false
   local vsChargeDone = false
-  if not forced_step() then
+  if not forced then
     local VsSeeker = require("src.core.game3.vs_seeker")
     if VsSeeker.onStep(session) then
       vsChargeDone = true
@@ -176,6 +188,9 @@ function StepEvents.onStepTaken(session, game)
         anyPoisonDamage = true
         mon.hp = math.max(0, hp - 1)
         if mon.hp == 0 then
+          -- pokefirered/src/field_poison.c:36
+          Pokemon.adjustFriendship(mon, Pokemon.FRIENDSHIP_EVENT_FAINT_OUTSIDE_BATTLE,
+            { mapSec = Pokemon.currentMapSec(session) })
           mon.status = nil
           mon.statusNum = 0
           faintedMons[#faintedMons + 1] = {
@@ -192,6 +207,8 @@ function StepEvents.onStepTaken(session, game)
       StepEvents._poisonFlashTimer = 4 / 60
       se(35) -- SE_FIELD_POISON
 
+      -- pokefirered/src/field_control_avatar.c:727 FLDPSN_FNT
+      poisonFainted = #faintedMons > 0
       for _, fainted in ipairs(faintedMons) do
         push_event({
           type = "poison_faint",
@@ -206,7 +223,7 @@ function StepEvents.onStepTaken(session, game)
             end)
 
             local Hud = require("src.ui.game3.hud")
-            Hud.openMessage(game, fainted.name .. " fainted...", {
+            Hud.openMessage(game, Strings("%s fainted...", fainted.name), {
               done = function()
                 if party_is_wiped(party) then
                   trigger_white_out(session, game)
@@ -223,42 +240,58 @@ function StepEvents.onStepTaken(session, game)
   session.vars[0x4040] = psnSteps
   session.poisonSteps = psnSteps
 
-  -- 4. Daycare EXP & Egg Hatching Cycles (every 256 steps)
-  local eggSteps = (tonumber(session.eggSteps) or 0) + 1
-  if eggSteps >= 256 then
-    eggSteps = 0
-    for slotIdx, mon in ipairs(party) do
-      local isEgg = mon.isEgg or (type(mon.egg) == "boolean" and mon.egg)
-      if isEgg then
-        local cycles = tonumber(mon.friendship or mon.eggCycles or mon.cycles) or 20
-        cycles = math.max(0, cycles - 1)
-        mon.friendship = cycles
-        mon.eggCycles = cycles
-        if cycles == 0 then
-          push_event({
-            type = "egg_hatch",
-            mon = mon,
-            slot = slotIdx,
-            run = function(onDone)
-              local EvolutionScene = require("src.ui.game3.evolution_scene")
-              local Audio = require("src.core.game3.audio")
-              mon.isEgg = false
-              mon.egg = false
-              mon.level = 5
-              Pokemon.applyStats(mon)
-              EvolutionScene.start(mon, mon.species or mon.speciesId, {
+  -- pokefirered/src/field_control_avatar.c:670 ShouldEggHatch
+  if not forced and not poisonFainted then
+    local Daycare = package.loaded["src.core.game3.daycare"]
+      or require("src.core.game3.daycare")
+    local _, hatchSlot = Daycare.step(session)
+    local hatching = hatchSlot and party[hatchSlot]
+    if hatching then
+      -- pokefirered/src/field_control_avatar.c:673 EventScript_EggHatch
+      push_event({
+        type = "egg_hatch",
+        mon = hatching,
+        slot = hatchSlot,
+        run = function(onDone)
+          local EggHatch = require("src.ui.game3.egg_hatch")
+          local Audio = require("src.core.game3.audio")
+          local Hud = require("src.ui.game3.hud")
+          -- pokefirered/data/scripts/day_care.inc:112 DayCare_Text_Huh
+          Hud.openMessage(game, Strings("Huh?"), {
+            done = function()
+              -- pokefirered/data/scripts/day_care.inc:113 special EggHatch
+              EggHatch.start(hatching, {
                 session = session,
-                isEggHatch = true,
+                slot = hatchSlot,
                 savedSong = Audio._mapSong,
                 onDone = onDone,
               })
             end,
           })
-        end
-      end
+        end,
+      })
+      -- pokefirered/src/field_control_avatar.c:672 IncrementGameStat(GAME_STAT_HATCHED_EGGS)
+      if type(session.gameStats) ~= "table" then session.gameStats = {} end
+      -- pokefirered/include/constants/game_stat.h:17
+      local hatched = math.floor(tonumber(session.gameStats[13]) or 0)
+      session.gameStats[13] = math.min(0xFFFFFF, hatched + 1)
+      -- pokefirered/src/field_control_avatar.c:674 return TRUE
+      StepEvents.onRepelStep(session, game)
+      return
     end
   end
-  session.eggSteps = eggSteps
+
+  -- pokefirered/src/safari_zone.c:60 CB2_EndSafariBattle
+  local Field = package.loaded["src.core.game3.field"]
+  if Field and Field.pollSafariBalls and Field.pollSafariBalls(game) then
+    return
+  end
+
+  -- pokefirered/src/field_control_avatar.c:677
+  local okSafari, Safari = pcall(require, "src.core.game3.safari")
+  if okSafari and Safari and Safari.takeStep and Safari.takeStep(session, game) then
+    return
+  end
 
   StepEvents.onRepelStep(session, game)
 end
@@ -277,7 +310,7 @@ function StepEvents.onRepelStep(session, game)
         run = function(onDone)
           se(67) -- SE_REPEL
           local Hud = require("src.ui.game3.hud")
-          Hud.openMessage(game, "Repel's effect wore off...", {
+          Hud.openMessage(game, Strings("Repel's effect wore off..."), {
             done = onDone,
           })
         end,
@@ -309,8 +342,22 @@ end
 --- Render screen flash if poison triggered.
 function StepEvents.draw()
   if StepEvents._poisonFlashTimer > 0 then
+    local okR, Renderer = pcall(require, "src.render.Renderer")
+    if okR and Renderer and Renderer.canvas then
+      Renderer.screenVeil = { 0.85, 0.15, 0.15, 0.45 }
+      return
+    end
     love.graphics.setColor(0.85, 0.15, 0.15, 0.45)
-    love.graphics.rectangle("fill", 0, 0, 240, 160)
+    local w, h = 240, 160
+    local curCanvas = love.graphics.getCanvas()
+    if curCanvas then
+      local okW, cw, ch = pcall(function() return curCanvas:getWidth(), curCanvas:getHeight() end)
+      if okW and cw and ch then w, h = cw, ch end
+    elseif love and love.graphics and love.graphics.getDimensions then
+      local gw, gh = love.graphics.getDimensions()
+      if gw and gh and gw > 0 and gh > 0 then w, h = gw, gh end
+    end
+    love.graphics.rectangle("fill", 0, 0, w, h)
     love.graphics.setColor(1, 1, 1, 1)
   end
 end

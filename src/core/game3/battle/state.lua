@@ -2,6 +2,7 @@
 
 local Damage = require("src.core.game3.battle.damage")
 local Pokemon = require("src.core.game3.pokemon")
+local bit = require("bit")
 
 local State = {}
 
@@ -38,7 +39,7 @@ function State.makeBattler(mon, side, opts)
   if not ability and Pokemon.abilityId then
     ability = Pokemon.abilityId(species, mon.personality or 0)
   end
-  return {
+  local battler = {
     mon = mon,
     id = id,
     side = side, -- "player" | "enemy"
@@ -58,6 +59,30 @@ function State.makeBattler(mon, side, opts)
     -- pokefirered/src/battle_main.c:2228
     isFirstTurn = 2,
   }
+  -- pokefirered/src/battle_script_commands.c:4489
+  if State.isKnockedOff(opts.state, battler) then battler.item = 0 end
+  return battler
+end
+
+-- pokefirered/src/battle_main.c:2565
+function State.zeroBattler(b)
+  if type(b) ~= "table" then return b end
+  b.mon = { species = 0, level = 0, hp = 0, maxHp = 0, moves = {}, pp = {} }
+  b.species = 0
+  b.type1, b.type2 = 0, nil
+  b.ability = nil
+  b.item = 0
+  b.status = nil
+  b.partyIndex = nil
+  b._partyMon = nil
+  b.participants = nil
+  b.stages = {
+    attack = 0, defense = 0, spAtk = 0, spDef = 0, speed = 0,
+    accuracy = 0, evasion = 0,
+  }
+  b.isFirstTurn = 0
+  b.zeroed = true
+  return b
 end
 
 function State.PARTNER(id) return (id + 2) % 4 end
@@ -231,13 +256,16 @@ State.firstUsable = first_usable
 function State.new(opts)
   opts = opts or {}
   local playerParty = opts.playerParty or {}
-  local pi = opts.playerIndex or 1
+  local pi = opts.playerIndex or first_usable(playerParty) or 1
   local foeMon = opts.foeMon
+  local foeParty = opts.foeParty or { foeMon }
+  local ei = opts.foeIndex or first_usable(foeParty) or 1
+  local eMon = foeMon or (foeParty and foeParty[ei]) or (foeParty and foeParty[1])
   local st = {
     kind = opts.wild and "wild" or "trainer",
     wild = opts.wild and true or false,
     playerParty = playerParty,
-    foeParty = opts.foeParty or { foeMon },
+    foeParty = foeParty,
     player = nil,
     enemy = nil,
     playerSide = { hazards = {}, id = "player" },
@@ -262,8 +290,7 @@ function State.new(opts)
   st.moveTarget = {}
   local pMon = playerParty[pi]
   st.player = State.makeBattler(pMon, "player", { partyIndex = pi, id = 0 })
-  local eMon = foeMon or st.foeParty[1]
-  st.enemy = State.makeBattler(eMon, "enemy", { partyIndex = 1, id = 1 })
+  st.enemy = State.makeBattler(eMon, "enemy", { partyIndex = ei, id = 1 })
   if not st.double then
     State.trackParticipant(st, st.enemy, pi)
     return st
@@ -391,6 +418,34 @@ function State.partyMon(battler)
   return battler._partyMon or battler.mon
 end
 
+-- pret pokefirered/src/battle_main.c gWishFutureKnock.knockedOffMons: one bit
+-- per party index per side.  A mon whose item was knocked off stays marked for
+-- the rest of the battle even after it switches out and back in -- the
+-- per-battler `expKnockedOff` volatile dies with the battler, so Thief and
+-- Trick would otherwise be allowed against it again.
+local function knocked_off_key(b)
+  local side = b and b.side
+  if side ~= "player" and side ~= "enemy" then return nil end
+  local idx = tonumber(b and b.partyIndex) or 1
+  if idx < 1 or idx > 6 then return nil end
+  return side, bit.lshift(1, idx - 1)
+end
+
+function State.markKnockedOff(st, b)
+  if not st then return end
+  local side, flag = knocked_off_key(b)
+  if not side then return end
+  st.knockedOff = st.knockedOff or { player = 0, enemy = 0 }
+  st.knockedOff[side] = bit.bor(st.knockedOff[side] or 0, flag)
+end
+
+function State.isKnockedOff(st, b)
+  if not st then return false end
+  local side, flag = knocked_off_key(b)
+  if not side then return false end
+  return bit.band((st.knockedOff and st.knockedOff[side]) or 0, flag) ~= 0
+end
+
 function State.wipeVolatilesAndStages(battler, opts)
   opts = opts or {}
   if not battler then return end
@@ -422,6 +477,8 @@ end
 
 function State.syncBattlerToParty(battler, party)
   if not battler or not party then return end
+  -- pokefirered/src/battle_main.c:2565
+  if battler.zeroed then return end
   local idx = battler.partyIndex or 1
   local mon = party[idx]
   if not mon then return end

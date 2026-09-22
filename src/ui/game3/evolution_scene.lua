@@ -13,6 +13,7 @@ local Audio = require("src.core.game3.audio")
 local LearnMove = require("src.core.game3.battle.learn_move")
 local SE = require("src.core.game3.se_ids")
 local Oam = require("src.core.game3.oam")
+local Strings = require("src.core.Strings")
 
 local EvolutionScene = {}
 
@@ -90,6 +91,8 @@ function EvolutionScene.start(mon, postSpecies, opts)
   if nick == "" then nick = clean_string(Pokemon.name(EvolutionScene._preSpecies)) end
   EvolutionScene._nick = nick ~= "" and nick or "POKéMON"
   EvolutionScene._canStop = opts.canStop ~= false
+  -- pokefirered/src/evolution_scene.c:641
+  EvolutionScene._autoCancel = opts.autoCancel and true or false
   EvolutionScene._session = opts.session
   EvolutionScene._bag = opts.bag
   EvolutionScene._via = opts.via
@@ -329,7 +332,7 @@ function EvolutionScene.handleInput(input)
       Audio.playSong(0)
       pcall(function() Audio.playSe(SE.SE_NOT_EFFECTIVE or 2) end)
       local fromName = Pokemon.displayMonName(EvolutionScene._mon)
-      Message.show("Huh? " .. fromName .. "\nstopped evolving!", { frame = "battle" })
+      Message.show(Strings("Huh? %s\nstopped evolving!", fromName), { frame = "battle" })
       return
     end
   end
@@ -409,6 +412,16 @@ function EvolutionScene.update(dt)
     end
   end
 
+  -- pokefirered/src/evolution_scene.c:641
+  if EvolutionScene._autoCancel and EvolutionScene._state == "cycle" then
+    EvolutionScene._state = "cancel"
+    EvolutionScene._timer = 0
+    Audio.playSong(0)
+    -- pokefirered/src/battle_message.c:1277 gText_EllipsisQuestionMark
+    Message.show(Strings("……?"), { frame = "battle" })
+    return
+  end
+
   local st = EvolutionScene._state
 
   if st == "fade_in" then
@@ -417,7 +430,7 @@ function EvolutionScene.update(dt)
       EvolutionScene._state = "intro_msg"
       EvolutionScene._timer = 0
       local fromName = Pokemon.displayMonName(EvolutionScene._mon)
-      Message.show("What?\n" .. fromName .. " is evolving!", { frame = "battle" })
+      Message.show(Strings("What?\n%s is evolving!", fromName), { frame = "battle" })
     end
 
   elseif st == "intro_msg" then
@@ -518,7 +531,7 @@ function EvolutionScene.update(dt)
 
       local fromName = EvolutionScene._nick or clean_string(Pokemon.name(EvolutionScene._preSpecies))
       local intoName = Pokemon.name(EvolutionScene._postSpecies) or "POKéMON"
-      Message.show("Congratulations! Your " .. fromName .. "\nevolved into " .. intoName .. "!", { frame = "battle" })
+      Message.show(Strings("Congratulations! Your %s\nevolved into %s!", fromName, intoName), { frame = "battle" })
     end
 
   elseif st == "cancel" then

@@ -4,13 +4,29 @@ local ItemsData = require("src.core.game3.items_data")
 local Bag = require("src.core.game3.bag")
 local Pokemon = require("src.core.game3.pokemon")
 local ModRuntime = require("src.mods.Runtime")
+local Strings = require("src.core.Strings")
 
 local ItemUse = {}
+
+-- pokefirered/src/data/pokemon/item_effects.h:80
+local HERB_HEAL = { [30] = 50, [31] = 200 }
+local ITEM_REVIVAL_HERB = 33
+
+-- pokefirered/src/data/pokemon/item_effects.h:81
+local BITTER_MEDICINE_FRIENDSHIP = {
+  [30] = { -5, -5, -10 },
+  [31] = { -10, -10, -15 },
+  [32] = { -5, -5, -10 },
+  [33] = { -15, -15, -20 },
+}
+ItemUse.BITTER_MEDICINE_FRIENDSHIP = BITTER_MEDICINE_FRIENDSHIP
+ItemUse.ITEM_REVIVAL_HERB = ITEM_REVIVAL_HERB
 
 local function heal_amount(id)
   local n = ItemsData.HEAL_AMOUNT[id]
   if n then return n end
   local num = ItemsData.toNumericId(id) or tonumber(id)
+  if num and HERB_HEAL[num] then return HERB_HEAL[num] end
   if num and ItemsData.HEAL_AMOUNT[num] then return ItemsData.HEAL_AMOUNT[num] end
   -- Pack holdEffectParam: Potion=20, Super=50, Hyper=200, Full Restore=255→full
   local info = ItemsData.info(id)
@@ -129,19 +145,19 @@ end
 function ItemUse.giveToMon(session, bag, id, partySlot)
   local party = session and session.party
   local mon = party and party[partySlot]
-  if not mon then return false, "noparty", "There's no POKéMON!" end
+  if not mon then return false, "noparty", Strings("There's no POKéMON!") end
   local pocket = ItemsData.pocketOf(id)
   if pocket == "KEY_ITEMS" or pocket == "TM_CASE" then
-    return false, "cant_hold", "This item can't be held."
+    return false, "cant_hold", Strings("This item can't be held.")
   end
   if not Bag.has(bag, id, 1) then
-    return false, "none", "You don't have that item."
+    return false, "none", Strings("You don't have that item.")
   end
   local prev = mon.item or mon.heldItem
   if prev and prev ~= 0 and prev ~= "" and prev ~= "NONE" then
     -- Swap: return previous to bag if possible
     if not Bag.canAdd(bag, prev, 1) then
-      return false, "bag_full", "The BAG is full."
+      return false, "bag_full", Strings("The BAG is full.")
     end
   end
   Bag.remove(bag, id, 1)
@@ -153,9 +169,9 @@ function ItemUse.giveToMon(session, bag, id, partySlot)
   local monName = Pokemon.displayMonName(mon)
   local text
   if prev and prev ~= 0 and prev ~= "" and prev ~= "NONE" then
-    text = string.format("Took the %s and\ngave the %s to\n%s.", ItemsData.displayName(prev), ItemsData.displayName(id), monName)
+    text = Strings("Took the %s and\ngave the %s to\n%s.", ItemsData.displayName(prev), ItemsData.displayName(id), monName)
   else
-    text = string.format("%s was given\nto %s.", ItemsData.displayName(id), monName)
+    text = Strings("%s was given\nto %s.", ItemsData.displayName(id), monName)
   end
   local Q=require("src.core.game3.quest_log_recorder")
   if prev and prev~=0 and prev~="" and prev~="NONE" then
@@ -168,31 +184,50 @@ end
 function ItemUse.takeFromMon(session, bag, partySlot)
   local party = session and session.party
   local mon = party and party[partySlot]
-  if not mon then return false, "noparty", "There's no POKéMON!" end
+  if not mon then return false, "noparty", Strings("There's no POKéMON!") end
   local held = mon.item or mon.heldItem
   local monName = Pokemon.displayMonName(mon)
   if not held or held == 0 or held == "" or held == "NONE" then
-    return false, "none", monName .. " isn't\nholding anything."
+    return false, "none", Strings("%s isn't\nholding anything.", monName)
   end
   if not Bag.canAdd(bag, held, 1) then
-    return false, "bag_full", "The BAG is full. The\nitem could not be removed."
+    return false, "bag_full", Strings("The BAG is full. The\nitem could not be removed.")
   end
   mon.item = nil
   mon.heldItem = nil
   Bag.add(bag, held, 1)
-  local text = string.format("Took the %s from\n%s and put it in the BAG.", ItemsData.displayName(held), monName)
+  local text = Strings("Took the %s from\n%s and put it in the BAG.", ItemsData.displayName(held), monName)
   require("src.core.game3.quest_log_recorder").event(session,"TookHeldItemFromMon",
     {monName,ItemsData.displayName(held)})
   return true, "take", text
 end
 
-local function is_outdoor(session)
+-- pokefirered/include/global.fieldmap.h:191 gMapHeader
+local function current_map_def(session)
   local mapId = session and session.map
-  if type(mapId) ~= "string" then return false end
+  if type(mapId) ~= "string" then return nil end
   local Runtime = package.loaded["src.core.game3.runtime"]
   local game = Runtime and Runtime._game
   local data = game and game.data and game.data.maps
   local def = data and data[mapId]
+  if def then return def end
+  local Map = package.loaded["src.core.game3.map"]
+  local cur = Map and Map.currentDef and Map.currentDef()
+  if type(cur) == "table" and cur.id == mapId then return cur end
+  return nil
+end
+
+-- pokefirered/src/overworld.c:948 Overworld_IsBikingAllowed
+local function map_header_flag(session, key)
+  local def = current_map_def(session)
+  if def == nil or def[key] == nil then return nil end
+  return (tonumber(def[key]) or 0) ~= 0
+end
+
+local function is_outdoor(session)
+  local mapId = session and session.map
+  if type(mapId) ~= "string" then return false end
+  local def = current_map_def(session)
   local pair = def and (def.pair or (def.midLayout and def.midLayout.pair))
   if type(pair) == "string" and pair:find("outdoor", 1, true) then
     return true
@@ -212,48 +247,81 @@ local function is_outdoor(session)
   return false
 end
 
+-- pokefirered/src/item_use.c:614 CanUseEscapeRopeOnCurrMap
 local function can_escape(session)
-  if not session or not session.healMap then return false end
-  if session.map == session.healMap then return false end
-  -- pret: caves / indoors that aren't the heal point. Deny pure outdoors.
-  return not is_outdoor(session)
+  if not session then return false end
+  return map_header_flag(session, "allowEscaping") == true
 end
 
 function ItemUse.useEscapeRope(session, bag, id)
   if not can_escape(session) then
-    return false, "escape", "OAK: This isn't the\ntime to use that!"
+    return false, "escape", Strings("OAK: This isn't the\ntime to use that!")
   end
   local Runtime = package.loaded["src.core.game3.runtime"]
   local mod = Runtime and Runtime._mod
   local game = Runtime and Runtime._game
   local Field = package.loaded["src.core.game3.field"]
   Bag.remove(bag, id, 1)
-  local t = tostring(session.name or "RED") .. " used\nESCAPE ROPE."
+  local t = Strings("%s used\nESCAPE ROPE.", tostring(session.name or "RED"))
   local hx = session.healX or 8
   local hy = session.healY or 5
-  local mapId = session.healMap
-  local Warp = require("src.core.game3.warp")
-  if mod and game then
-    Warp.request(mod, game, mapId, hx, hy, "down", { fade = true })
-  elseif Field and Field.respawnAtHeal then
-    -- Fallback: heal warp without consuming party heal intent
-    local Map = require("src.core.game3.map")
-    Map.load(mod, game, mapId, { x = hx, y = hy, facing = "down" })
+  local mapId = session.healMap or "FR_PLAYERS_HOUSE_1F"
+  -- pokefirered/src/field_effect.c:2126 SetWarpDestinationToEscapeWarp
+  local esc = session.escapeWarp
+  if type(esc) == "table" and type(esc.map) == "string" then
+    mapId = esc.map
+    hx = tonumber(esc.x) or hx
+    hy = tonumber(esc.y) or hy
   end
+  local Warp = require("src.core.game3.warp")
+  -- pokefirered/src/item_use.c:642 Task_UseDigEscapeRopeOnField
+  local function leave()
+    if mod and game then
+      Warp.request(mod, game, mapId, hx, hy, "down", { fade = true })
+    elseif Field and Field.respawnAtHeal then
+      local Map = require("src.core.game3.map")
+      Map.load(mod, game, mapId, { x = hx, y = hy, facing = "down" })
+    end
+  end
+  -- pokefirered/src/item_use.c:634 ItemUseOnFieldCB_EscapeRope
+  local function onField()
+    local okM, Message = pcall(require, "src.ui.game3.message")
+    if okM and Message and Message.show then
+      -- pokefirered/src/new_menu_helpers.c:641 DisplayItemMessageOnField
+      Message.show(t, { done = leave })
+    else
+      leave()
+    end
+  end
+  -- pokefirered/src/item_use.c:159 SetUpItemUseOnFieldCallback
+  if not ItemUse.setUpOnFieldCallback(onField) then onField() end
   return true, "escape", t
 end
 
+-- pokefirered/src/item_use.c:253 FieldUseFunc_Bike
 function ItemUse.useBike(session)
-  if not is_outdoor(session) then
-    return false, "bike", "OAK: This isn't the\ntime to use that!"
+  -- pokefirered/src/overworld.c:948 Overworld_IsBikingAllowed
+  local biking = map_header_flag(session, "bikingAllowed")
+  if biking == nil then biking = is_outdoor(session) end
+  if not biking then
+    local t = Strings("OAK: This isn't the\ntime to use that!")
+    return false, "bike", t
   end
   local Player = require("src.core.game3.player")
+  -- pokefirered/src/item_use.c:276 ItemUseOnFieldCB_Bicycle
+  if not Player.biking then
+    pcall(function()
+      local Audio = require("src.core.game3.audio")
+      local SE = require("src.core.game3.se_ids")
+      if Audio and Audio.playSe then Audio.playSe(SE.SE_BIKE_BELL) end
+    end)
+  end
   Player.biking = not Player.biking
   local t
   if Player.biking then
-    t = tostring(session.name or "RED") .. " got on the\nBICYCLE."
+    t = Strings("%s got on the\nBICYCLE.", tostring(session.name or "RED"))
   else
-    t = tostring(session.name or "RED") .. " got off the\nBICYCLE."
+    t = Strings("%s got off the\nBICYCLE.", tostring(session.name or "RED"))
   end
   return true, "bike", t
 end
@@ -261,21 +329,21 @@ end
 --- Check TM pre-flight compatibility and known moves matching retail FRLG.
 -- Returns status ("knows" | "incompatible" | "ok"), messageText, moveId, moveName
 function ItemUse.checkTmPreflight(mon, tmId)
-  if not mon then return "none", "There's no POKéMON!", nil, nil end
+  if not mon then return "none", Strings("There's no POKéMON!"), nil, nil end
   local moveId = Pokemon.moveFromTmItem(tmId)
   local monName = Pokemon.displayMonName(mon)
   local moveName = Pokemon.moveName(moveId) or "MOVE"
   if not moveId then
-    return "invalid", "This isn't the time to use\nthat!", nil, nil
+    return "invalid", Strings("This isn't the time to use\nthat!"), nil, nil
   end
   if Pokemon.knowsMove(mon, moveId) then
-    return "knows", string.format("%s already knows\n%s.", monName, moveName), moveId, moveName
+    return "knows", Strings("%s already knows\n%s.", monName, moveName), moveId, moveName
   end
   local species = tonumber(mon.species or mon.speciesId)
   if not Pokemon.canLearnTmItem(species, tmId) then
-    return "incompatible", string.format("%s can't learn\n%s.", monName, moveName), moveId, moveName
+    return "incompatible", Strings("%s can't learn\n%s.", monName, moveName), moveId, moveName
   end
-  local prompt = string.format("Booted up a TM.\nIt contained %s.\nTeach %s to %s?", moveName, moveName, monName)
+  local prompt = Strings("Booted up a TM.\nIt contained %s.\nTeach %s to %s?", moveName, moveName, monName)
   return "ok", prompt, moveId, moveName
 end
 
@@ -284,7 +352,7 @@ function ItemUse.useTm(session, bag, id, partySlot)
   local party = session and session.party
   local mon = party and party[partySlot]
   if not mon then
-    return false, "noparty", "There's no POKéMON!"
+    return false, "noparty", Strings("There's no POKéMON!")
   end
   local status, preflightMsg, moveId, moveName = ItemUse.checkTmPreflight(mon, id)
   if status ~= "ok" then
@@ -297,6 +365,9 @@ function ItemUse.useTm(session, bag, id, partySlot)
 
   local function finish_consume(learned)
     if learned then
+      -- pokefirered/src/party_menu.c:4287
+      Pokemon.adjustFriendship(mon, Pokemon.FRIENDSHIP_EVENT_LEARN_TMHM,
+        { mapSec = Pokemon.currentMapSec(session) })
       require("src.core.game3.quest_log_recorder").event(session,
         isHm and "MonLearnedMoveFromHM" or "MonLearnedMoveFromTM",{monName,moveName})
     end
@@ -310,7 +381,7 @@ function ItemUse.useTm(session, bag, id, partySlot)
     local ok = Pokemon.teachMove(mon, moveId)
     if ok then
       finish_consume(true)
-      return true, "tm", string.format("%s learned\n%s!", monName, moveName)
+      return true, "tm", Strings("%s learned\n%s!", monName, moveName)
     end
   end
 
@@ -325,9 +396,9 @@ function ItemUse.useTm(session, bag, id, partySlot)
     end,
   })
   if Pokemon.moveSlotCount(mon) >= 4 then
-    return false, "full", monName .. " can't learn\nmore than four moves."
+    return false, "full", Strings("%s can't learn\nmore than four moves.", monName)
   end
-  return true, "tm", string.format("%s learned\n%s!", monName, moveName)
+  return true, "tm", Strings("%s learned\n%s!", monName, moveName)
 end
 
 --- Check if using this item requires selecting a party Pokémon target.
@@ -360,11 +431,11 @@ function ItemUse.levelUpEvent(mon, level)
 end
 
 function ItemUse.useRareCandy(session, mon)
-  if not mon then return false, "none", "There's no POKéMON!" end
+  if not mon then return false, "none", Strings("There's no POKéMON!") end
   local lvl = tonumber(mon.level) or 1
   local hp = tonumber(mon.hp) or 0
   if lvl >= 100 or hp <= 0 then
-    return false, "no_effect", "It won't have any effect."
+    return false, "no_effect", Strings("It won't have any effect.")
   end
   local oldMax = tonumber(mon.maxHp) or tonumber(mon.maxhp) or 1
   local oldHp = hp
@@ -372,16 +443,58 @@ function ItemUse.useRareCandy(session, mon)
   Pokemon.applyStats(mon)
   local newMax = tonumber(mon.maxHp) or tonumber(mon.maxhp) or oldMax
   mon.hp = math.min(newMax, oldHp + math.max(0, newMax - oldMax))
+  -- pokefirered/src/data/pokemon/item_effects.h:200 sItemEffect_RareCandy
+  Pokemon.itemFriendship(mon, Pokemon.VITAMIN_FRIENDSHIP_CHANGE,
+    { mapSec = Pokemon.currentMapSec(session) })
   ItemUse.levelUpEvent(mon, mon.level)
-  local t = string.format("%s grew to\nLv. %d!", Pokemon.displayMonName(mon), mon.level)
+  local t = Strings("%s grew to\nLv. %d!", Pokemon.displayMonName(mon), mon.level)
   return true, "level", t
+end
+
+-- pokefirered/src/data/pokemon/item_effects.h:168
+local VITAMIN_STAT = {
+  [63] = "hp", [64] = "atk", [65] = "def", [66] = "spe", [67] = "spa", [70] = "spd",
+}
+local VITAMIN_ADD_EV = 10
+
+local function vitamin_stat_name(key)
+  -- pokefirered/src/strings.c:248
+  if key == "hp" then return Strings("HP") end
+  if key == "atk" then return Strings("ATTACK") end
+  if key == "def" then return Strings("DEFENSE") end
+  if key == "spe" then return Strings("SPEED") end
+  if key == "spa" then return Strings("SP. ATK") end
+  return Strings("SP. DEF")
+end
+
+function ItemUse.useVitamin(session, mon, itemId)
+  if not mon then return false, "none", Strings("There's no POKéMON!") end
+  local num = ItemsData.toNumericId(itemId) or tonumber(itemId)
+  local key = VITAMIN_STAT[num]
+  if not key then
+    return false, "no_effect", Strings("It won't have any effect.")
+  end
+  -- pokefirered/src/party_menu.c:4405 NotUsingHPEVItemOnShedinja
+  if key == "hp" and (tonumber(mon.species or mon.speciesId) or 0) == 303 then
+    return false, "no_effect", Strings("It won't have any effect.")
+  end
+  local gained = Pokemon.raiseEvFromItem(mon, key, VITAMIN_ADD_EV)
+  if not gained or gained <= 0 then
+    return false, "no_effect", Strings("It won't have any effect.")
+  end
+  Pokemon.itemFriendship(mon, Pokemon.VITAMIN_FRIENDSHIP_CHANGE,
+    { mapSec = Pokemon.currentMapSec(session) })
+  -- pokefirered/src/strings.c:298 gText_PkmnBaseVar2StatIncreased
+  local t = Strings("%s's base %s\nstat was raised.",
+    Pokemon.displayMonName(mon), vitamin_stat_name(key))
+  return true, "vitamin", t
 end
 
 function ItemUse.useEvolutionStone(session, mon, itemId, bag)
   local Evolution = require("src.core.game3.evolution")
   local target = Evolution.itemTarget and Evolution.itemTarget(mon, itemId, session)
   if not target then
-    return false, "no_evo", "It won't have any effect."
+    return false, "no_evo", Strings("It won't have any effect.")
   end
   local oldName = Pokemon.displayMonName(mon)
   local newName = Pokemon.name(target) or "POKéMON"
@@ -396,33 +509,225 @@ function ItemUse.useEvolutionStone(session, mon, itemId, bag)
       savedSong = Audio._mapSong,
       via = "item",
     })
-    return true, "evo", "Evolving..."
+    return true, "evo", Strings("Evolving...")
   else
     Evolution.apply(mon, target, session, bag, "item")
-    local t = string.format("%s evolved into\n%s!", oldName, newName)
+    local t = Strings("%s evolved into\n%s!", oldName, newName)
     return true, "evo", t
   end
+end
+
+-- pokefirered/include/constants/items.h:273
+local ROD_ITEMS = { [262] = true, [263] = true, [264] = true }
+local ITEM_BLACK_FLUTE = 42
+local ITEM_WHITE_FLUTE = 43
+local ITEM_POKE_FLUTE = 350
+-- pokefirered/include/constants/items.h:432 ITEM_BICYCLE
+local ITEM_BICYCLE = 360
+-- pokefirered/include/constants/items.h:438 ITEM_TEACHY_TV
+local ITEM_TEACHY_TV = 366
+-- pokefirered/include/constants/items.h:435 ITEM_FAME_CHECKER
+local ITEM_FAME_CHECKER = 363
+local ITEM_AWAKENING = 17
+-- pokefirered/include/constants/flags.h:1330
+local FLAG_SYS_WHITE_FLUTE_ACTIVE = 0x803
+local FLAG_SYS_BLACK_FLUTE_ACTIVE = 0x804
+-- pokefirered/include/constants/songs.h:114
+local SE_GLASS_FLUTE = 110
+-- pokefirered/include/constants/songs.h:346 MUS_POKE_FLUTE
+local MUS_POKE_FLUTE = 338
+
+local function sys_flag(session, flagId, value)
+  local Space = package.loaded["src.core.game3.scripting.space"]
+  local Flags = require("src.core.game3.scripting.flags")
+  if Space and Space.store then
+    Flags.setFlag(Space.store, Space.vm and Space.vm.ctx or nil, flagId, value)
+  end
+  if session then
+    session.flags = session.flags or {}
+    session.flags[flagId] = value or nil
+  end
+end
+
+local function play_se(id)
+  pcall(function()
+    local Audio = require("src.core.game3.audio")
+    if Audio and Audio.playSe then Audio.playSe(id) end
+  end)
+end
+
+local function not_the_time(session)
+  -- pokefirered/src/strings.c:188 gText_OakForbidsUseOfItemHere
+  return Strings("OAK: %s!\nThis isn't the time to use that!",
+    tostring((session and session.name) or "RED"))
+end
+
+-- pokefirered/src/item_use.c:159 SetUpItemUseOnFieldCallback
+function ItemUse.exitMenusToField()
+  local closed = false
+  local BagMenu = package.loaded["src.ui.game3.bag_menu"]
+  if BagMenu and BagMenu.isOpen and BagMenu.isOpen() and BagMenu.close then
+    BagMenu.close()
+    closed = true
+  end
+  local StartMenu = package.loaded["src.ui.game3.start_menu"]
+  if StartMenu and StartMenu.isOpen and StartMenu.isOpen() then
+    StartMenu.open = false
+    StartMenu._onClose = nil
+    local okS, Stack = pcall(require, "src.ui.game3.stack")
+    if okS and Stack and Stack.pop then Stack.pop("start") end
+    closed = true
+  end
+  if closed then
+    local okF, Fade = pcall(require, "src.ui.game3.fade")
+    if okF and Fade and Fade.begin and Fade.MODE then
+      Fade.begin(Fade.MODE.FROM_BLACK, 1)
+    end
+  end
+  return closed
+end
+
+-- pokefirered/src/item_use.c:159 SetUpItemUseOnFieldCallback
+function ItemUse.setUpOnFieldCallback(cb)
+  local BagMenu = package.loaded["src.ui.game3.bag_menu"]
+  if not (BagMenu and BagMenu.isOpen and BagMenu.isOpen()) then return false end
+  ItemUse._onFieldCB = cb
+  return true
+end
+
+-- pokefirered/src/item_use.c:176 Task_WaitFadeIn_CallItemUseOnFieldCB
+function ItemUse.runOnFieldCallback()
+  local cb = ItemUse._onFieldCB
+  ItemUse._onFieldCB = nil
+  if cb then cb() end
+  return cb ~= nil
+end
+
+-- pokefirered/src/item_use.c:182 DisplayItemMessageInCurrentContext
+function ItemUse.showFieldMessage(text, onDone)
+  if not text then return false end
+  -- pokefirered/src/item_menu.c:1018 DisplayItemMessageInBag
+  local BagMenu = package.loaded["src.ui.game3.bag_menu"]
+  if BagMenu and BagMenu.isOpen and BagMenu.isOpen() and BagMenu.showMessage then
+    BagMenu.showMessage(text, onDone)
+    return true
+  end
+  -- pokefirered/src/new_menu_helpers.c:641 DisplayItemMessageOnField
+  local okM, Message = pcall(require, "src.ui.game3.message")
+  if not (okM and Message and Message.show) then return false end
+  Message.show(text, { done = onDone })
+  return true
+end
+
+-- pokefirered/src/item_use.c:296 CanFish
+function ItemUse.canFish()
+  local P = package.loaded["src.core.game3.player"] or require("src.core.game3.player")
+  local Collision = require("src.core.game3.collision")
+  local FieldMoves = require("src.core.game3.field_moves")
+  local DELTA = { up = { 0, -1 }, down = { 0, 1 }, left = { -1, 0 }, right = { 1, 0 } }
+  local d = DELTA[P.facing or "down"] or DELTA.down
+  local fx, fy = P.cellX + d[1], P.cellY + d[2]
+  local beh = Collision.behavior and Collision.behavior(fx, fy)
+  if FieldMoves.isWaterfallBehavior(beh) then return false end
+  if not P.surfing then
+    -- pokefirered/src/field_player_avatar.c:1209 IsPlayerFacingSurfableFishableWater
+    return (Collision.isWater and Collision.isWater(fx, fy)) == true
+  end
+  return (Collision.isSurfable and Collision.isSurfable(beh)) == true
+    and (tonumber(Collision.cell(fx, fy)) or 0xff) == 0
+end
+
+-- pokefirered/src/item_use.c:286 FieldUseFunc_Rod
+function ItemUse.useRod(session, id)
+  if not ItemUse.canFish() then
+    -- pokefirered/src/item_use.c:294 PrintNotTheTimeToUseThat
+    local text = not_the_time(session)
+    return false, "rod", text
+  end
+  local info = ItemsData.info(id)
+  local Field = require("src.core.game3.field")
+  -- pokefirered/src/item_use.c:326 ItemUseOnFieldCB_Rod
+  Field.startFishing(tonumber(info and info.secondaryId) or 0)
+  return true, "rod", nil
+end
+
+-- pokefirered/src/item_use.c:359 FieldUseFunc_PokeFlute
+function ItemUse.usePokeFlute(session)
+  local woke = false
+  for _, mon in ipairs((session and session.party) or {}) do
+    local isEgg = mon.isEgg or (type(mon.egg) == "boolean" and mon.egg)
+    if not isEgg and ItemUse.clearStatus(mon, ITEM_AWAKENING) then woke = true end
+  end
+  if not woke then
+    -- pokefirered/src/strings.c:204 gText_PlayedPokeFluteCatchy
+    local text = Strings("Played the POKé FLUTE.\\pNow, that's a catchy tune!")
+    return true, "flute", text
+  end
+  pcall(function()
+    local Audio = require("src.core.game3.audio")
+    if Audio and Audio.playFanfare then Audio.playFanfare(MUS_POKE_FLUTE) end
+  end)
+  -- pokefirered/src/strings.c:205 gText_PlayedPokeFlute, :206 gText_PokeFluteAwakenedMon
+  local text =
+    Strings("Played the POKé FLUTE.\\pThe POKé FLUTE awakened sleeping\nPOKéMON.")
+  return true, "flute", text
+end
+
+-- pokefirered/src/item_use.c:582 FieldUseFunc_BlackWhiteFlute
+function ItemUse.useBlackWhiteFlute(session, num)
+  local name = ItemsData.displayName(num)
+  local player = tostring((session and session.name) or "RED")
+  play_se(SE_GLASS_FLUTE)
+  local text
+  if num == ITEM_WHITE_FLUTE then
+    sys_flag(session, FLAG_SYS_WHITE_FLUTE_ACTIVE, true)
+    sys_flag(session, FLAG_SYS_BLACK_FLUTE_ACTIVE, false)
+    -- pokefirered/src/strings.c:199 gText_UsedVar2WildLured
+    text = Strings("%s used the\n%s.\\pWild POKéMON will be lured.", player, name)
+  else
+    sys_flag(session, FLAG_SYS_BLACK_FLUTE_ACTIVE, true)
+    sys_flag(session, FLAG_SYS_WHITE_FLUTE_ACTIVE, false)
+    -- pokefirered/src/strings.c:200 gText_UsedVar2WildRepelled
+    text = Strings("%s used the\n%s.\\pWild POKéMON will be repelled.", player, name)
+  end
+  return true, "flute", text
 end
 
 --- Try field use. partySlot optional for heal/status/revive/tm/give.
 -- Returns ok, reason, messageText
 local function useField(session, bag, id, partySlot)
   local info = ItemsData.info(id)
-  if not info then return false, "unknown", "Unknown item." end
+  if not info then return false, "unknown", Strings("Unknown item.") end
   local use = ItemsData.fieldUseKind(id)
 
   if use == "battle" then
-    return false, "battle", "This can't be used outside\nof battle."
+    return false, "battle", Strings("This can't be used outside\nof battle.")
   end
 
   if use == "map" then
     local RegionMap = require("src.ui.game3.region_map")
     RegionMap.show({ session = session })
-    return true, "map", "Used TOWN MAP."
+    return true, "map", Strings("Used TOWN MAP.")
   end
 
   if use == "bike" then
     return ItemUse.useBike(session)
+  end
+
+  -- pokefirered/src/item_use.c:337 FieldUseFunc_CoinCase
+  if use == "coin_case" then
+    local coins = Bag.Coins and Bag.Coins.get and Bag.Coins.get(session) or 0
+    -- pokefirered/src/strings.c:193 gText_CoinCase
+    return true, "coin_case", Strings("Your COINS:\n%d", coins)
+  end
+
+  -- pokefirered/src/item_use.c:348 FieldUseFunc_PowderJar
+  if use == "powder_jar" then
+    -- pokefirered/src/berry_powder.c:90 GetBerryPowder
+    local powder = math.floor(tonumber(session and session.berryPowder) or 0)
+    if powder < 0 then powder = 0 end
+    -- pokefirered/src/strings.c:202 gText_PowderQty
+    return true, "powder_jar", Strings("POWDER QTY: %d", powder)
   end
 
   if use == "escape" then
@@ -435,7 +740,7 @@ local function useField(session, bag, id, partySlot)
       or 100
     session.repelSteps = steps
     Bag.remove(bag, id, 1)
-    local t = "The repelling effect wore\non for a while."
+    local t = Strings("The repelling effect wore\non for a while.")
     return true, "repel", t
   end
 
@@ -448,23 +753,66 @@ local function useField(session, bag, id, partySlot)
     return true, "vs_seeker", nil
   end
 
+  if use == "itemfinder" or id == ItemsData.ITEM_ITEMFINDER or id == "ITEMFINDER"
+      or ItemsData.toNumericId(id) == ItemsData.ITEM_ITEMFINDER then
+    local Field = require("src.core.game3.field")
+    local ok, kind, text = Field.useItemfinder(session)
+    return ok, kind or "itemfinder", text
+  end
+
   if id == ItemsData.ITEM_TM_CASE or id == "TM_CASE"
       or ItemsData.toNumericId(id) == ItemsData.ITEM_TM_CASE then
     local TmCase = require("src.ui.game3.tm_case")
     TmCase.show(session, bag)
-    return true, "tm_case", "Opened TM CASE."
+    return true, "tm_case", Strings("Opened TM CASE.")
   end
 
   if id == ItemsData.ITEM_BERRY_POUCH or id == "BERRY_POUCH"
       or ItemsData.toNumericId(id) == ItemsData.ITEM_BERRY_POUCH then
     local BerryPouch = require("src.ui.game3.berry_pouch")
     BerryPouch.show(session, bag)
-    return true, "berry_pouch", "Opened BERRY POUCH."
+    return true, "berry_pouch", Strings("Opened BERRY POUCH.")
+  end
+
+  -- pokefirered/src/item_use.c:518 FieldUseFunc_TeachyTv
+  if id == ITEM_TEACHY_TV or id == "TEACHY_TV"
+      or ItemsData.toNumericId(id) == ITEM_TEACHY_TV then
+    local TeachyTv = require("src.core.game3.teachy_tv")
+    TeachyTv.show(session, bag)
+    return true, "teachy_tv", nil
+  end
+
+  -- pokefirered/src/item_use.c:680 FieldUseFunc_FameChecker
+  if id == ITEM_FAME_CHECKER or id == "FAME_CHECKER"
+      or ItemsData.toNumericId(id) == ITEM_FAME_CHECKER then
+    local FameCheckerUi = require("src.ui.game3.fame_checker")
+    -- pokefirered/src/item_use.c:696 UseFameCheckerFromBag
+    local okBag, BagMenu = pcall(require, "src.ui.game3.bag_menu")
+    local fromBag = okBag and BagMenu and BagMenu.open and true or false
+    FameCheckerUi.show(session, { fromBag = fromBag })
+    return true, "fame_checker", nil
+  end
+
+  do
+    local num = ItemsData.toNumericId(id) or tonumber(id)
+    if ROD_ITEMS[num] then
+      return ItemUse.useRod(session, id)
+    end
+    if num == ITEM_POKE_FLUTE then
+      return ItemUse.usePokeFlute(session)
+    end
+    if num == ITEM_WHITE_FLUTE or num == ITEM_BLACK_FLUTE then
+      return ItemUse.useBlackWhiteFlute(session, num)
+    end
+    -- pokefirered/src/item_use.c:253 FieldUseFunc_Bike
+    if num == ITEM_BICYCLE then
+      return ItemUse.useBike(session)
+    end
   end
 
   if use == "key" or use == "rod" or use == "berry" or use == "mail"
       or use == "flute" or use == "none" then
-    local t = "OAK: This isn't the\ntime to use that!"
+    local t = Strings("OAK: This isn't the\ntime to use that!")
     return false, use, t
   end
 
@@ -472,14 +820,14 @@ local function useField(session, bag, id, partySlot)
       or use == "pp" or use == "level" or use == "evo" or use == "vitamin" then
     local party = session and session.party
     if not party or #party < 1 then
-      return false, "noparty", "There is no POKéMON."
+      return false, "noparty", Strings("There is no POKéMON.")
     end
     if not partySlot then
-      return false, "need_slot", "Select a POKéMON."
+      return false, "need_slot", Strings("Select a POKéMON.")
     end
     local mon = party[partySlot]
     if not mon then
-      return false, "noparty", "There is no POKéMON."
+      return false, "noparty", Strings("There is no POKéMON.")
     end
     local ok = false
     local text = nil
@@ -493,53 +841,59 @@ local function useField(session, bag, id, partySlot)
       ok, _, text = ItemUse.useEvolutionStone(session, mon, id, bag)
     elseif use == "level" then
       ok, _, text = ItemUse.useRareCandy(session, mon)
-    elseif use == "revive" then
+    -- pokefirered/src/pokemon.c:4258
+    elseif use == "revive" or num == ITEM_REVIVAL_HERB then
       if num == 45 then -- Sacred Ash
         ok = ItemUse.reviveAll(party)
-        text = "All POKéMON's HP was\nfully restored!"
+        text = Strings("All POKéMON's HP was\nfully restored!")
       else
-        local max = num == 25 or tostring(id) == "MAX_REVIVE"
+        local max = num == 25 or num == ITEM_REVIVAL_HERB or tostring(id) == "MAX_REVIVE"
         ok = ItemUse.revive(mon, max)
-        text = string.format("%s's HP was\nrestored!", monName)
+        text = Strings("%s's HP was\nrestored!", monName)
       end
     elseif use == "status" then
       local stOk, cured = ItemUse.clearStatus(mon, id)
       ok = stOk
       if cured == "poison" then
-        text = string.format("%s was\ncured of poison.", monName)
+        text = Strings("%s was\ncured of poison.", monName)
       elseif cured == "paralysis" then
-        text = string.format("%s was\ncured of paralysis.", monName)
+        text = Strings("%s was\ncured of paralysis.", monName)
       elseif cured == "burn" then
-        text = string.format("%s's burn\nwas healed.", monName)
+        text = Strings("%s's burn\nwas healed.", monName)
       elseif cured == "freeze" then
-        text = string.format("%s was\ndefrosted.", monName)
+        text = Strings("%s was\ndefrosted.", monName)
       elseif cured == "sleep" then
-        text = string.format("%s woke up.", monName)
+        text = Strings("%s woke up.", monName)
       else
-        text = string.format("%s recovered\nfrom illness!", monName)
+        text = Strings("%s recovered\nfrom illness!", monName)
       end
     elseif use == "pp" then
-      return false, "pp", "It won't have any effect."
+      return false, "pp", Strings("It won't have any effect.")
     elseif use == "vitamin" then
-      return false, "vitamin", "It won't have any effect."
+      ok, _, text = ItemUse.useVitamin(session, mon, id)
     else
       local healOk, restored = ItemUse.healMon(session, mon, id)
       ok = healOk
       if restored and restored > 0 then
-        text = string.format("%s's HP was\nrestored by %d points.", monName, restored)
+        text = Strings("%s's HP was\nrestored by %d points.", monName, restored)
       else
-        text = string.format("%s's HP was\nrestored!", monName)
+        text = Strings("%s's HP was\nrestored!", monName)
       end
     end
 
     if ok then
+      -- pokefirered/src/pokemon.c:4481
+      if BITTER_MEDICINE_FRIENDSHIP[num] then
+        Pokemon.itemFriendship(mon, BITTER_MEDICINE_FRIENDSHIP[num],
+          { mapSec = Pokemon.currentMapSec(session) })
+      end
       Bag.remove(bag, id, 1)
-      return true, use, text or "It restored health!"
+      return true, use, text or Strings("It restored health!")
     end
-    return false, "noeffect", text or "It won't have any effect."
+    return false, "noeffect", text or Strings("It won't have any effect.")
   end
 
-  return false, "none", "OAK: This isn't the\ntime to use that!"
+  return false, "none", Strings("OAK: This isn't the\ntime to use that!")
 end
 
 function ItemUse.useField(session,bag,id,partySlot)

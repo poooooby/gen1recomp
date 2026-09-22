@@ -90,6 +90,8 @@ local function pad_even(grid)
   }
 end
 
+Extract.padEven = pad_even
+
 -- Exact-black 8×8 quads are FRLG void / silhouette (mid 0, mid 8, chamfer
 -- corners). They must not enter the material codebook or steal shade slots.
 local function is_exact_black_quad(buf)
@@ -114,7 +116,16 @@ local DYNAMIC_MIDS_BY_PAIR = {
   },
 }
 
-local function unique_mids_by_pair(grids)
+local function script_mids_by_pair(scriptBundle, grids)
+  local NativePack = require("src.import.gba.native_pack")
+  if not scriptBundle then return {} end
+  return NativePack.scriptMidsByPair(scriptBundle.scripts, scriptBundle.events, function(mapId)
+    local grid = grids[mapId]
+    return grid and (grid.pair or "sevii_outdoor") or nil
+  end)
+end
+
+local function unique_mids_by_pair(grids, scriptMids)
   local byPair = {}
   for _, grid in pairs(grids) do
     local pair = grid.pair or "sevii_outdoor"
@@ -125,6 +136,12 @@ local function unique_mids_by_pair(grids)
     end
     for _, cell in ipairs(grid.cells) do
       seen[cell.mid] = true
+    end
+  end
+  for pair, mids in pairs(scriptMids or {}) do
+    local seen = byPair[pair]
+    if seen then
+      for mid in pairs(mids) do seen[mid] = true end
     end
   end
   for pair, extraMids in pairs(DYNAMIC_MIDS_BY_PAIR) do
@@ -315,9 +332,12 @@ function Extract.run(imports, cache, progressCb)
       borders[mapId] = Maps.loadBorder(rom, version, mapId)
     end
   end
+  require("src.import.gba.alt_layouts").build(rom, version, grids, borders, pad_even)
+  local extractedScripts = require("src.import.gba.extract_scripts").extractFromRom(rom, version)
+  local scriptMids = script_mids_by_pair(extractedScripts, grids)
   rom:clearCache()
 
-  local midsByPair = unique_mids_by_pair(grids)
+  local midsByPair = unique_mids_by_pair(grids, scriptMids)
   local totalMids = 0
   for _, list in pairs(midsByPair) do totalMids = totalMids + #list end
 
@@ -371,121 +391,6 @@ function Extract.run(imports, cache, progressCb)
     maps = mapOrder,
   })
 
-  -- Native FRLG mid atlas + pret palettes (game3 live path).
-  progress(progressCb, 6, "native_pack", 0, 1)
-  local NativePack = require("src.import.gba.native_pack")
-  NativePack.writeExtract(
-    cache, Extract.CACHE_ROOT, bundles, grids, borders, pairNames, midIndex,
-    Tileset.behaviorOf, Collision.fromCell)
-
-  -- OW sprites + tileset anims + encounters + audio + chrome from ROM
-  do
-    local rom2 = assert(Rom.open(imports, importId))
-    require("src.import.gba.help_extract").writeExtract(rom2, cache)
-    require("src.import.gba.quest_log_extract").writeExtract(rom2, cache)
-    require("src.import.gba.object_interactions_extract").writeExtract(rom2, cache, Extract.CACHE_ROOT, version)
-    local midLists = {}
-    for _, pairName in ipairs(pairNames) do
-      midLists[pairName] = NativePack.collectMidsForPair(grids, borders, pairName)
-    end
-    local AnimPack = require("src.import.gba.tileset_anim_pack")
-    AnimPack.writeExtract(rom2, cache, Extract.CACHE_ROOT, bundles, midLists, version)
-    local OwExtract = require("src.import.gba.ow_extract")
-    OwExtract.writeExtract(rom2, cache, Extract.CACHE_ROOT, version)
-    local EncExtract = require("src.import.gba.encounters_extract")
-    EncExtract.writeExtract(rom2, cache, Extract.CACHE_ROOT, version)
-    local FxExtract = require("src.import.gba.field_effect_extract")
-    FxExtract.writeExtract(rom2, cache, Extract.CACHE_ROOT, version)
-    do
-      local MartsExtract = require("src.import.gba.marts_extract")
-      local okM, detailM = pcall(MartsExtract.run, rom2, cache, {
-        cacheRoot = Extract.CACHE_ROOT,
-      })
-      if okM and detailM then
-        print(string.format("[marts] %d lists → %s",
-          detailM.listCount or 0, tostring(detailM.path)))
-      end
-    end
-    do
-      local BagChromeExtract = require("src.import.gba.bag_chrome_extract")
-      local okB, detailB = pcall(BagChromeExtract.run, rom2, cache, {
-        cacheRoot = Extract.CACHE_ROOT,
-      })
-      if okB and detailB then
-        print(string.format("[bag_chrome] icons=%d → %s",
-          detailB.iconsBaked or 0, tostring(detailB.root)))
-      elseif not okB then
-        print("[bag_chrome] warn: " .. tostring(detailB))
-      end
-    end
-    do
-      local ShopChromeExtract = require("src.import.gba.shop_chrome_extract")
-      local okS, detailS = pcall(ShopChromeExtract.run, rom2, cache, {
-        cacheRoot = Extract.CACHE_ROOT,
-      })
-      if okS and detailS then
-        print(string.format("[shop_chrome] → %s", tostring(detailS.root)))
-      elseif not okS then
-        print("[shop_chrome] warn: " .. tostring(detailS))
-      end
-    end
-    do
-      local TmCaseExtract = require("src.import.gba.tm_case_extract")
-      local okT, detailT = pcall(TmCaseExtract.run, rom2, cache, {
-        cacheRoot = Extract.CACHE_ROOT,
-      })
-      if okT and detailT then
-        print(string.format("[tm_case_extract] → %s", tostring(detailT.root)))
-      elseif not okT then
-        print("[tm_case_extract] warn: " .. tostring(detailT))
-      end
-    end
-    do
-      local BerryPouchExtract = require("src.import.gba.berry_pouch_extract")
-      local okP, detailP = pcall(BerryPouchExtract.run, rom2, cache, {
-        cacheRoot = Extract.CACHE_ROOT,
-      })
-      if okP and detailP then
-        print(string.format("[berry_pouch_extract] → %s", tostring(detailP.root)))
-      elseif not okP then
-        print("[berry_pouch_extract] warn: " .. tostring(detailP))
-      end
-    end
-    do
-      local AnimExtract = require("src.import.gba.battle_anim_extract")
-      local animCache = {
-        write = function(_, rel, bytes)
-          local path = rel
-          if not path:match("^data/") then path = Extract.CACHE_ROOT .. "/" .. path end
-          return cache:write(path, bytes)
-        end,
-        exists = function(_, rel) return (cache.exists and cache:exists(rel)) or false end,
-        read   = function(_, rel) return (cache.read and cache:read(rel)) or nil end,
-      }
-      pcall(AnimExtract.run, rom2, animCache, { cacheRoot = Extract.CACHE_ROOT, force = true })
-    end
-    do
-      local BattleAiExtract = require("src.import.gba.battle_ai_extract")
-      pcall(BattleAiExtract.run, {
-        cache = cache,
-        cacheRoot = Extract.CACHE_ROOT,
-        pretRoot = os.getenv("POKEFIRERED"),
-      })
-    end
-    do
-      local DoorAnimExtract = require("src.import.gba.door_anim_extract")
-      local okD, errD = pcall(DoorAnimExtract.run, rom2, cache, {
-        cacheRoot = Extract.CACHE_ROOT,
-      })
-      if okD then
-        print("[door_extract] door sheets extracted from ROM")
-      else
-        print("[door_extract] warn: " .. tostring(errD))
-      end
-    end
-    rom2:clearCache()
-  end
-
   local warps = Versions.WARPS
   local connections = {}
   do
@@ -526,6 +431,53 @@ function Extract.run(imports, cache, progressCb)
     end
   end
 
+  -- Native FRLG mid atlas + pret palettes (game3 live path).
+  progress(progressCb, 6, "native_pack", 0, 1)
+  local NativePack = require("src.import.gba.native_pack")
+  local warpCells = {}
+  for mapId, list in pairs(warps or {}) do
+    local set = {}
+    for _, w in ipairs(list) do
+      local x, y = tonumber(w.x), tonumber(w.y)
+      if x and y then set[NativePack.warpKey(x, y)] = true end
+    end
+    warpCells[mapId] = set
+  end
+  NativePack.writeExtract(
+    cache, Extract.CACHE_ROOT, bundles, grids, borders, pairNames, midIndex,
+    Tileset.behaviorOf, Collision.fromCell, scriptMids, warpCells)
+
+  -- OW sprites + tileset anims + encounters + audio + chrome from ROM
+  do
+    local rom2 = assert(Rom.open(imports, importId))
+    require("src.import.gba.help_extract").writeExtract(rom2, cache)
+    require("src.import.gba.quest_log_extract").writeExtract(rom2, cache)
+    require("src.import.gba.object_interactions_extract").writeExtract(rom2, cache, Extract.CACHE_ROOT, version)
+    local midLists = {}
+    for _, pairName in ipairs(pairNames) do
+      midLists[pairName] = NativePack.collectMidsForPair(grids, borders, pairName, scriptMids)
+    end
+    local AnimPack = require("src.import.gba.tileset_anim_pack")
+    AnimPack.writeExtract(rom2, cache, Extract.CACHE_ROOT, bundles, midLists, version)
+    local OwExtract = require("src.import.gba.ow_extract")
+    OwExtract.writeExtract(rom2, cache, Extract.CACHE_ROOT, version)
+    local EncExtract = require("src.import.gba.encounters_extract")
+    EncExtract.writeExtract(rom2, cache, Extract.CACHE_ROOT, version)
+    local FxExtract = require("src.import.gba.field_effect_extract")
+    FxExtract.writeExtract(rom2, cache, Extract.CACHE_ROOT, version)
+    do
+      local MartsExtract = require("src.import.gba.marts_extract")
+      local okM, detailM = pcall(MartsExtract.run, rom2, cache, {
+        cacheRoot = Extract.CACHE_ROOT,
+      })
+      if okM and detailM then
+        print(string.format("[marts] %d lists → %s",
+          detailM.listCount or 0, tostring(detailM.path)))
+      end
+    end
+    rom2:clearCache()
+  end
+
   local wl = { "return {\n" }
   for _, mapId in ipairs(mapOrder) do
     local list = warps[mapId] or {}
@@ -563,7 +515,8 @@ function Extract.run(imports, cache, progressCb)
   -- game3 scripts/events/text/movements from ROM MapEvents + BFS
   local ExtractScripts = require("src.import.gba.extract_scripts")
   rom = assert(Rom.open(imports, importId))
-  local scriptBundle = ExtractScripts.writeBundleFromRom(rom, cache, Extract.CACHE_ROOT, version)
+  local scriptBundle = ExtractScripts.writeBundleFromRom(
+    rom, cache, Extract.CACHE_ROOT, version, extractedScripts)
 
   -- Extract full trainer parties, AI flags, dialogs, and sprites
   do
@@ -1803,9 +1756,18 @@ local function _dormant_quantize_run(imports, cache, progressCb)
       local MapSectionsExtract = require("src.import.gba.map_sections_extract")
       local okMs, errMs = pcall(MapSectionsExtract.run, rom2, cache, { cacheRoot = Extract.CACHE_ROOT })
       if not okMs then print("[map_sections] warn: " .. tostring(errMs)) end
+      local EasyChatExtract = require("src.import.gba.easy_chat_extract")
+      local okEc, errEc = pcall(EasyChatExtract.run, rom2, cache, { cacheRoot = Extract.CACHE_ROOT })
+      if not okEc then print("[easy_chat] warn: " .. tostring(errEc)) end
       local MapPreviewExtract = require("src.import.gba.map_preview_extract")
       local okMp, errMp = pcall(MapPreviewExtract.run, rom2, cache, { cacheRoot = Extract.CACHE_ROOT })
       if not okMp then print("[map_preview] warn: " .. tostring(errMp)) end
+      local RegionMapExtract = require("src.import.gba.region_map_extract")
+      local okRm, errRm = pcall(RegionMapExtract.run, rom2, cache, { cacheRoot = Extract.CACHE_ROOT })
+      if not okRm then print("[region_map] warn: " .. tostring(errRm)) end
+      local HealLocationsExtract = require("src.import.gba.heal_locations_extract")
+      local okHl, errHl = pcall(HealLocationsExtract.run, rom2, cache, { cacheRoot = Extract.CACHE_ROOT })
+      if not okHl then print("[heal_locations] warn: " .. tostring(errHl)) end
     end
     rom2:clearCache()
   end
@@ -2016,6 +1978,9 @@ function Extract.runNativeOnly(imports, cache, progressCb)
       borders[mapId] = Maps.loadBorder(rom, version, mapId)
     end
   end
+  require("src.import.gba.alt_layouts").build(rom, version, grids, borders, pad_even)
+  local scriptMids = script_mids_by_pair(
+    require("src.import.gba.extract_scripts").extractFromRom(rom, version), grids)
   rom:clearCache()
 
   local midIndex = {}
@@ -2031,7 +1996,7 @@ function Extract.runNativeOnly(imports, cache, progressCb)
   local NativePack = require("src.import.gba.native_pack")
   NativePack.writeExtract(
     cache, Extract.CACHE_ROOT, bundles, grids, borders, pairNames, midIndex,
-    Tileset.behaviorOf, Collision.fromCell)
+    Tileset.behaviorOf, Collision.fromCell, scriptMids)
 
   do
     local rom2 = assert(Rom.open(imports, importId))
@@ -2040,7 +2005,7 @@ function Extract.runNativeOnly(imports, cache, progressCb)
     require("src.import.gba.object_interactions_extract").writeExtract(rom2, cache, Extract.CACHE_ROOT, version)
     local midLists = {}
     for _, pairName in ipairs(pairNames) do
-      midLists[pairName] = NativePack.collectMidsForPair(grids, borders, pairName)
+      midLists[pairName] = NativePack.collectMidsForPair(grids, borders, pairName, scriptMids)
     end
     local AnimPack = require("src.import.gba.tileset_anim_pack")
     AnimPack.writeExtract(rom2, cache, Extract.CACHE_ROOT, bundles, midLists, version)

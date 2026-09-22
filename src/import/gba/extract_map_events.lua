@@ -77,6 +77,8 @@ local function parse_objects(rom, ptr, count)
   return objects
 end
 
+local FLAG_HIDDEN_ITEMS_START = 0x3E8
+
 local function parse_bg_events(rom, ptr, count)
   local off = gba_off(rom, ptr)
   if not off or count <= 0 then return {} end
@@ -84,23 +86,47 @@ local function parse_bg_events(rom, ptr, count)
   for i = 0, count - 1 do
     local base = off + i * BG_SIZE
     local x = rom:u16(base)
+    if x >= 0x8000 then x = x - 0x10000 end
     local y = rom:u16(base + 2)
+    if y >= 0x8000 then y = y - 0x10000 end
     local elev = rom:get(base + 4)
     local kind = rom:get(base + 5)
-    local scriptPtr = rom:u32(base + 8)
-    local row = {
-      type = "sign",
-      x = x,
-      y = y,
-      elevation = elev,
-      kind = kind,
-      scriptPtr = scriptPtr,
-    }
-    -- Hidden items store item data in the union, not a script pointer.
-    if kind ~= BG_EVENT_HIDDEN_ITEM and scriptPtr ~= 0 and gba_off(rom, scriptPtr) then
-      row.scriptKey = Opcodes.key(scriptPtr)
+    if kind == BG_EVENT_HIDDEN_ITEM then
+      local item = rom:u16(base + 8)
+      local info = rom:u16(base + 10)
+      local hiddenItemId = info % 256
+      local quantity = math.floor(info / 256) % 128
+      if quantity == 0 then quantity = 1 end
+      local underfoot = info >= 32768
+      local flag = FLAG_HIDDEN_ITEMS_START + hiddenItemId
+      bgs[#bgs + 1] = {
+        type = "hidden_item",
+        x = x,
+        y = y,
+        elevation = elev,
+        kind = kind,
+        item = item,
+        hiddenItemId = hiddenItemId,
+        quantity = quantity,
+        underfoot = underfoot,
+        flag = flag,
+      }
+    else
+      local scriptPtr = rom:u32(base + 8)
+      local row = {
+        type = "sign",
+        x = x,
+        y = y,
+        elevation = elev,
+        kind = kind,
+        scriptPtr = scriptPtr,
+      }
+      -- Hidden items store item data in the union, not a script pointer.
+      if scriptPtr ~= 0 and gba_off(rom, scriptPtr) then
+        row.scriptKey = Opcodes.key(scriptPtr)
+      end
+      bgs[#bgs + 1] = row
     end
-    bgs[#bgs + 1] = row
   end
   return bgs
 end
@@ -132,16 +158,23 @@ end
 
 --- Parse mapScripts table → seeds + mapScripts summary for game3.
 local function parse_map_scripts(rom, scriptsPtr)
+  local function empty()
+    return {
+      onLoad = nil,
+      onTransition = nil,
+      onResume = nil,
+      onReturnToField = nil,
+      onFrame = {},
+      onWarpIntoMap = {},
+      onDiveWarp = {},
+    }
+  end
   local off = gba_off(rom, scriptsPtr)
   if not off then
-    return { onTransition = nil, onResume = {}, onFrame = {} }, {}
+    return empty(), {}
   end
   local seeds = {}
-  local mapScripts = {
-    onTransition = nil,
-    onResume = {},
-    onFrame = {},
-  }
+  local mapScripts = empty()
   local i = off
   local guard = 0
   while guard < 32 do
@@ -158,8 +191,13 @@ local function parse_map_scripts(rom, scriptsPtr)
       seeds[#seeds + 1] = ptr
       if typ == MAP_SCRIPT_ON_TRANSITION then
         mapScripts.onTransition = key
+      elseif typ == MAP_SCRIPT_ON_LOAD then
+        -- pokefirered/src/fieldmap.c:93
+        mapScripts.onLoad = key
       elseif typ == MAP_SCRIPT_ON_RESUME then
-        mapScripts.onResume[#mapScripts.onResume + 1] = key
+        mapScripts.onResume = key
+      elseif typ == MAP_SCRIPT_ON_RETURN_TO_FIELD then
+        mapScripts.onReturnToField = key
       end
     elseif typ == MAP_SCRIPT_ON_FRAME_TABLE
         or typ == MAP_SCRIPT_ON_WARP_INTO_MAP_TABLE
@@ -175,10 +213,13 @@ local function parse_map_scripts(rom, scriptsPtr)
         if gba_off(rom, sp) then
           local key = Opcodes.key(sp)
           seeds[#seeds + 1] = sp
+          local row = { var = var, value = value, script = key }
           if typ == MAP_SCRIPT_ON_FRAME_TABLE then
-            mapScripts.onFrame[#mapScripts.onFrame + 1] = {
-              var = var, value = value, script = key,
-            }
+            mapScripts.onFrame[#mapScripts.onFrame + 1] = row
+          elseif typ == MAP_SCRIPT_ON_WARP_INTO_MAP_TABLE then
+            mapScripts.onWarpIntoMap[#mapScripts.onWarpIntoMap + 1] = row
+          else
+            mapScripts.onDiveWarp[#mapScripts.onDiveWarp + 1] = row
           end
         end
       end
@@ -331,7 +372,7 @@ function ExtractMapEvents.extractIsland1(rom, version)
     if not ev then
       events[mapId] = {
         objects = {}, bgEvents = {}, coordEvents = {},
-        mapScripts = { onTransition = nil, onResume = {}, onFrame = {} },
+        mapScripts = { onFrame = {}, onWarpIntoMap = {}, onDiveWarp = {} },
         music = hdr.music,
       }
     else

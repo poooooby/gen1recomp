@@ -1,5 +1,6 @@
--- Known clean US FireRed dumps → extract pointers (ROM file offsets).
--- Pointers are for FireRed USA 1.0 (SHA-1 41cb23d8…). Identity is SHA-1 only.
+-- Known clean US FRLG dumps → extract pointers (ROM file offsets).
+-- Baseline pointers are FireRed USA 1.0; select() applies the LeafGreen profile.
+-- Both 1.1 revisions normalize to their own edition 1.0 before extraction.
 
 local Versions = {}
 
@@ -27,9 +28,22 @@ Versions.ROM_SIZE = 16777216
 -- v99: gEggMoves → pokemon/egg_moves.lua (hidden-mon egg moves were inert).
 -- v100: location preview screens (sMapPreviewScreenData artwork) + ROM-derived
 --       mapsec names and sDungeonInfo dungeon descriptions.
-Versions.CACHE_VERSION = 100
-Versions.NATIVE_VERSION = 5
-Versions.OW_VERSION = 1
+-- v111: hidden-item bitfield fix in extract_map_events (id % 256, qty % 128).
+-- v112: deoxys_rock_fragments field effect — the Birth Island meteorite shatter
+--       had no artwork, so the rock simply vanished instead of breaking apart.
+--       Both branches had taken 111 for unrelated cache layouts, so this merge
+--       moves the Deoxys artwork onto its own number instead of sharing one.
+-- v113: script opcode layouts corrected against pret asm/macros/event.inc —
+--       comparestat is {byte,word} (was {byte,half}), setptr / loadbytefromptr /
+--       setptrbyte each carry a leading byte plus a word (were shorter).  The
+--       old sizes mis-decoded every instruction after one, so every cached
+--       script is stale.
+-- v114: pokemon/icons/412.rgba, the SPECIES_EGG menu icon — eggs were drawn
+--       with the icon of the species they hatch into.
+-- v115: LeafGreen profiles, edition-specific title assets and Deoxys stats.
+Versions.CACHE_VERSION = 116
+Versions.NATIVE_VERSION = 6
+Versions.OW_VERSION = 2
 Versions.ANIM_VERSION = 1
 -- Audio pack (M4A banks / DirectSound samples / cries).
 Versions.AUDIO_VERSION = 6
@@ -80,6 +94,7 @@ Versions.SPECIES_NAMES = 0x245EE0         -- gSpeciesNames
 Versions.SPECIES_NAME_LENGTH = 11         -- 10 chars + 0xFF
 Versions.SPECIES_INFO = 0x254784          -- gSpeciesInfo / BaseStats (28 bytes)
 Versions.SPECIES_INFO_SIZE = 28
+Versions.DEOXYS_BASE_STATS = 0x25E026 -- sDeoxysBaseStats, u16[6]
 Versions.MON_ICON_TABLE = 0x3D37A0       -- gMonIconTable
 Versions.MON_ICON_PAL_INDICES = 0x3D3E80  -- gMonIconPaletteIndices
 Versions.MON_ICON_PALETTES = 0x3D3740     -- gMonIconPalettes (16 colors × N)
@@ -120,11 +135,129 @@ Versions.POKEDEX_ENTRY_SIZE = 36
 Versions.NATIONAL_DEX_COUNT = 386         -- Deoxys; entries are 0..386 inclusive → 387
 Versions.SPECIES_TO_KANTO = 0x251EE0      -- sSpeciesToKantoPokedexNum (411 u16s)
 Versions.DEX_CATEGORIES = 0x452C4C        -- gDexCategories (9 categories)
+Versions.EASY_CHAT_GROUPS = 0x3ECED4       -- sEasyChatGroups (22 entries × 8 bytes)
+Versions.EASY_CHAT_GROUP_COUNT = 22
 Versions.POKEDEX_ORDERS = {
   alphabetical = 0x443FF2,
   weight = 0x4442F6,
   height = 0x4445FA,
   type = 0x4448FE,
+}
+-- src/pokedex_screen.c:144
+Versions.POKEDEX_BG_TILES = {
+  kanto = { gfx = 0x440274, pal = 0x4404C8 },
+  national = { gfx = 0x4403AC, pal = 0x4406E0 },
+}
+
+-- src/pokedex_screen.c:143
+Versions.POKEDEX_CHROME_GFX = {
+  { file = "mini_page.rgba", gfx = 0x440124, lz = true, w = 64, h = 40 },
+  { file = "map_kanto.rgba", gfx = 0x443620, lz = true, w = 96, h = 72 },
+  { file = "map_one_island.rgba", gfx = 0x443910, lz = true, w = 32, h = 24 },
+  { file = "map_two_island.rgba", gfx = 0x443988, lz = true, w = 32, h = 24 },
+  { file = "map_three_island.rgba", gfx = 0x4439FC, lz = true, w = 32, h = 24 },
+  { file = "map_four_island.rgba", gfx = 0x443A78, lz = true, w = 32, h = 32 },
+  { file = "map_five_island.rgba", gfx = 0x443AF8, lz = true, w = 32, h = 32 },
+  { file = "map_six_island.rgba", gfx = 0x443BB0, lz = true, w = 32, h = 32 },
+  { file = "map_seven_island.rgba", gfx = 0x443C54, lz = true, w = 32, h = 32 },
+  { file = "caught_marker.rgba", gfx = 0x443600, w = 8, h = 8 },
+  { file = "blit_wide_ellipse.rgba", gfx = 0x443D00, w = 88, h = 16 },
+}
+
+-- src/pokedex_screen.c:158
+Versions.POKEDEX_CATEGORY_ICONS = {
+  { file = "cat_icon_cave.rgba", gfx = 0x4408E0, pal = 0x443420 },
+  { file = "cat_icon_urban.rgba", gfx = 0x440BD8, pal = 0x443440 },
+  { file = "cat_icon_cancel.rgba", gfx = 0x440EF0, pal = 0x443460 },
+  { file = "cat_icon_forest.rgba", gfx = 0x44112C, pal = 0x443480 },
+  { file = "cat_icon_grassland.rgba", gfx = 0x4414BC, pal = 0x4434A0 },
+  { file = "cat_icon_qmark.rgba", gfx = 0x441808, pal = 0x4434C0 },
+  { file = "cat_icon_mountain.rgba", gfx = 0x441A40, pal = 0x4434E0 },
+  { file = "cat_icon_rare.rgba", gfx = 0x441D54, pal = 0x443500 },
+  { file = "cat_icon_sea.rgba", gfx = 0x442004, pal = 0x443520 },
+  { file = "cat_icon_numerical.rgba", gfx = 0x44223C, pal = 0x443540 },
+  { file = "cat_icon_rough_terrain.rgba", gfx = 0x4424E4, pal = 0x443560 },
+  { file = "cat_icon_waters_edge.rgba", gfx = 0x442838, pal = 0x443580 },
+  { file = "cat_icon_type.rgba", gfx = 0x442BC0, pal = 0x4435A0 },
+  { file = "cat_icon_lightest.rgba", gfx = 0x442EF8, pal = 0x4435C0 },
+  { file = "cat_icon_smallest.rgba", gfx = 0x44318C, pal = 0x4435E0 },
+  -- src/graphics.c:1211
+  { file = "cat_icon_abc.rgba", gfx = 0xE9C16C, pal = 0xE9C14C },
+}
+Versions.POKEDEX_CATEGORY_ICON_W = 64
+Versions.POKEDEX_CATEGORY_ICON_H = 48
+
+-- src/pokedex_area_markers.c:39
+Versions.POKEDEX_AREA_MARKER_GFX = 0x46343C
+-- src/pokedex_area_markers.c:41
+Versions.POKEDEX_AREA_MARKER_SHAPES = {
+  { file = "marker_0.rgba", tile = 0, w = 8, h = 8 },
+  { file = "marker_1.rgba", tile = 1, w = 16, h = 8 },
+  { file = "marker_2.rgba", tile = 3, w = 8, h = 16 },
+  { file = "marker_3.rgba", tile = 5, w = 32, h = 16 },
+  { file = "marker_4.rgba", tile = 13, w = 16, h = 32 },
+  { file = "marker_5.rgba", tile = 21, w = 32, h = 16 },
+  { file = "marker_6.rgba", tile = 29, w = 16, h = 32 },
+}
+-- src/pokedex_screen.c:815
+Versions.POKEDEX_SILHOUETTE_PAL = 0x452368
+-- src/pokedex_area_markers.c:237
+Versions.POKEDEX_MARKER_BLEND_TILE = 15
+-- src/pokedex_area_markers.c:219
+Versions.POKEDEX_MARKER_BLEND_EVA = 12
+Versions.POKEDEX_MARKER_BLEND_EVB = 8
+
+-- src/pokedex_area_markers.c:101
+Versions.DEX_AREA_MARKERS = 0x463580
+Versions.DEX_AREA_MARKER_ENTRY_SIZE = 4
+Versions.DEX_AREA_COUNT = 80
+-- src/pokemon_storage_system_data.c:51
+-- src/pokemon_storage_system_tasks.c:169
+-- src/pokemon_storage_system_graphics.c:79
+-- src/graphics.c:1214
+Versions.STORAGE_PALETTES = {
+  misc1 = 0x3D2BCC,
+  misc2 = 0x3CE7F0,
+  menu = 0x3CE5DC,
+  scrollingBg = 0x3CE738,
+  interface = 0xE9C3F8,
+  partyMenu = 0xE9C3D8,
+  interfaceNoMon = 0xE9C418,
+}
+-- src/pokemon_storage_system_tasks.c:219
+Versions.STORAGE_BG1_BASE_TILE = 0x100
+Versions.STORAGE_SHEETS = {
+  handCursor = { off = 0x3D2BEC, size = 2048 },
+  handCursorShadow = { off = 0x3D33EC, size = 128 },
+  boxScrollArrow = { off = 0x3D2AD0, size = 128 },
+  waveform = { off = 0x3CE810, size = 448 },
+  scrollingBg = { off = 0x3CE438, lz = true },
+  menu = { off = 0xE9C438, lz = true },
+}
+Versions.STORAGE_TILEMAPS = {
+  menu = { off = 0x3CE5FC, lz = true, w = 32, h = 20 },
+  pkmnData = { off = 0x3CE6F8, w = 8, h = 4 },
+  closeBoxButton = { off = 0x3CE778, w = 9, h = 4 },
+  partySlotFilled = { off = 0x3CE7C0, w = 4, h = 3 },
+  partySlotEmpty = { off = 0x3CE7D8, w = 4, h = 3 },
+  partyMenu = { off = 0xE9CAEC, lz = true, w = 12, h = 22 },
+}
+-- src/pokemon_storage_system_graphics.c:168
+Versions.STORAGE_WALLPAPERS = 0x3D2A10
+Versions.STORAGE_WALLPAPER_COUNT = 16
+Versions.STORAGE_WALLPAPER_W = 20
+Versions.STORAGE_WALLPAPER_H = 18
+
+-- src/wild_pokemon_area.c:25
+Versions.DEX_AREA_MAPSEC_TABLES = {
+  { off = 0x464148, count = 55 },
+  { off = 0x464224, count = 4 },
+  { off = 0x464234, count = 2 },
+  { off = 0x46423C, count = 5 },
+  { off = 0x464250, count = 2 },
+  { off = 0x464258, count = 7 },
+  { off = 0x464274, count = 7 },
+  { off = 0x464290, count = 11 },
 }
 
 -- Region map & location preview screens (pokefirered src/region_map.c,
@@ -164,6 +297,42 @@ Versions.DUNGEON_INFO = 0x3F1B3C
 Versions.DUNGEON_INFO_COUNT = 19
 Versions.DUNGEON_INFO_ENTRY_SIZE = 12
 
+-- Region map graphics & palettes (pokefirered src/region_map.c)
+Versions.REGION_MAP_TOP_BAR_PAL = 0x3EF23C
+Versions.REGION_MAP_CURSOR_PAL = 0x3EF25C
+Versions.REGION_MAP_PLAYER_RED_PAL = 0x3EF27C
+Versions.REGION_MAP_PLAYER_LEAF_PAL = 0x3EF29C
+Versions.REGION_MAP_MISC_ICON_PAL = 0x3EF2BC
+Versions.REGION_MAP_BG_PAL = 0x3EF2DC
+Versions.REGION_MAP_SWITCH_CURSOR_PAL = 0x3EF384
+Versions.REGION_MAP_EDGE_PAL = 0x3EF3A4
+Versions.REGION_MAP_SWITCH_CURSOR_LEFT_GFX = 0x3EF3C4
+Versions.REGION_MAP_SWITCH_CURSOR_RIGHT_GFX = 0x3EF450
+Versions.REGION_MAP_CURSOR_GFX = 0x3EF4E0
+Versions.REGION_MAP_PLAYER_RED_GFX = 0x3EF524
+Versions.REGION_MAP_PLAYER_LEAF_GFX = 0x3EF59C
+Versions.REGION_MAP_BG_GFX = 0x3EF61C
+Versions.REGION_MAP_EDGE_GFX = 0x3F0330
+Versions.REGION_MAP_SWITCH_MENU_GFX = 0x3F0580
+Versions.REGION_MAP_KANTO_TILEMAP = 0x3F089C
+Versions.REGION_MAP_SEVII123_TILEMAP = 0x3F0AFC
+Versions.REGION_MAP_SEVII45_TILEMAP = 0x3F0C0C
+Versions.REGION_MAP_SEVII67_TILEMAP = 0x3F0CF0
+Versions.REGION_MAP_EDGE_TILEMAP = 0x3F0E0C
+Versions.REGION_MAP_DUNGEON_ICON_GFX = 0x3F18D8
+Versions.REGION_MAP_FLY_ICON_GFX = 0x3F1908
+Versions.REGION_MAP_BG_SECONDARY_GFX = 0x3F1978
+Versions.REGION_MAP_BG_SECONDARY_TILEMAP = 0x3F19A0
+
+-- pokefirered/src/heal_location.c:28
+Versions.S_HEAL_LOCATIONS = 0x3EEBF8
+Versions.S_WHITEOUT_RESPAWN_MAP_IDXS = 0x3EEC98
+Versions.S_WHITEOUT_RESPAWN_HEALER_NPC_IDS = 0x3EECE8
+Versions.NUM_HEAL_LOCATIONS = 20
+-- pokefirered/src/region_map.c:828
+Versions.S_MAP_FLY_DESTINATIONS = 0x3F2EE0
+Versions.NUM_MAP_FLY_DESTINATIONS = 108
+
 -- Multichoice list table (FireRed USA 1.0). gMultichoiceLists (65 lists).
 Versions.MULTICHOICE_LISTS = 0x3E04B0
 Versions.MULTICHOICE_COUNT = 65
@@ -172,6 +341,10 @@ Versions.MULTICHOICE_COUNT = 65
 Versions.ITEMS = 0x3DB028
 Versions.ITEMS_COUNT = 375
 Versions.ITEM_STRIDE = 44
+
+-- Region map section names table (FireRed USA 1.0).
+Versions.KANTO_MAPSEC_START = 88   -- 0x58 (MAPSEC_PALLET_TOWN)
+Versions.KANTO_MAPSEC_COUNT = 109  -- 88..196 (MAPSEC_PALLET_TOWN .. MAPSEC_SPECIAL_AREA)
 
 -- gBattleMoves (FireRed USA 1.0). Rows are 12 bytes (9-byte BattleMove + pad).
 Versions.BATTLE_MOVES_VERSION = 1
@@ -1206,10 +1379,17 @@ Versions.FIELD_EFFECT_PAL_PLAYER = 0x35B968    -- gObjectEventPal_Player (surf b
 Versions.FIELD_EFFECTS = {
   tall_grass   = { pic = 0x39A008, pal = 0x398FC8, w = 16, h = 16, frames = 5 },
   cut_grass    = { pic = 0x398648, pal = 0x398FC8, w = 8,  h = 8,  frames = 1 },
-  rock_smash   = { pic = 0x398928, pal = 0x398FA8, w = 16, h = 16, frames = 4 },
+  -- pokefirered/src/fldeff_rocksmash.c:108 (gObjectEventPic_RockSmashRock)
+  rock_smash   = { pic = 0x3947A8, pal = 0x36D888, w = 16, h = 16, frames = 4 },
   surf_blob    = { pic = 0x396B08, pal = 0x35B968, w = 32, h = 32, frames = 6 },
-  fly_bird     = { pic = 0x398048, pal = 0x398FA8, w = 32, h = 32, frames = 4 },
-  ripple       = { pic = 0x398BA8, pal = 0x398FA8, w = 16, h = 16, frames = 8 },
+  -- pokefirered/src/data/field_effects/field_effect_objects.h:1099
+  fly_bird     = { pic = 0x39D3C8, pal = 0x35B968, w = 64, h = 64, frames = 5 },
+  -- pokefirered/src/data/field_effects/field_effect_objects.h:99
+  ripple       = { pic = 0x3986A8, pal = 0x398FC8, w = 16, h = 16, frames = 5 },
+  -- pokefirered/src/data/field_effects/field_effect_objects.h:565
+  splash       = { pic = 0x39AC48, pal = 0x398FA8, w = 16, h = 8,  frames = 2 },
+  -- pokefirered/src/data/field_effects/field_effect_objects.h:1203
+  hot_springs_water = { pic = 0x39C508, pal = 0x398FC8, w = 16, h = 16, frames = 1 },
   emoticons    = { pic = 0x3C6AC8, pal = 0x35B968, w = 16, h = 16, frames = 15 },
   -- pokefirered/src/field_effect.c:326
   pokeball_glow = {
@@ -1218,6 +1398,14 @@ Versions.FIELD_EFFECTS = {
   -- pokefirered/src/field_effect.c:336
   pokemoncenter_monitor = {
     pic = 0x3CAFD0, pal = 0x3CAFB0, w = 32, h = 16, frames = 4,
+  },
+  -- pokefirered/src/field_effect.c:3963 sImages_DeoxysRockFragment
+  -- (graphics/field_effects/pics/deoxys_rock_fragment_*.png, 4x 8x8 4bpp).
+  -- The palette is sDeoxysObjectPals[10] (0x3F6206 + 10*32), the fully
+  -- awakened red ramp step — the puzzle is always solved by the time the rock
+  -- shatters, so the shards are always red.
+  deoxys_rock_fragments = {
+    pic = 0x3CBDB0, pal = 0x3F6346, w = 8, h = 8, frames = 4,
   },
 }
 
@@ -1231,6 +1419,7 @@ Versions.BATTLE_UI = {
   healthbox_elements = 0xD11BC4,    -- uncompressed 320×24 4bpp
   healthbox_player = 0xD1F340,      -- gHealthboxSinglesPlayerGfx LZ → 4096
   healthbox_enemy = 0xD1F604,       -- gHealthboxSinglesOpponentGfx LZ → 2048
+  healthbox_safari = 0xD1FABC,      -- src/graphics.c:620
   healthbox_doubles_player = 0xD1F794,   -- gHealthboxDoublesPlayerGfx LZ → 2048
   healthbox_doubles_opponent = 0xD1F928, -- gHealthboxDoublesOpponentGfx LZ → 2048
   healthbox_pal = 0xD11B84,         -- uncompressed 32 (gBattleInterface_Healthbox_Pal)
@@ -1376,7 +1565,20 @@ Versions.TRAINER_CARD_BG_MAP = 0x3CCEC8         -- sKantoTrainerCardBg_Tilemap (
 Versions.TRAINER_CARD_PAL = 0xE99198            -- gKantoTrainerCardBlue_Pal (3 banks, 96 bytes)
 Versions.TRAINER_CARD_FEMALE_PAL = 0x3CD2A0     -- sKantoTrainerCardFemaleBg_Pal (1 bank, 32 bytes)
 Versions.TRAINER_CARD_BADGES_TILES = 0x3CD5E8   -- sKantoTrainerCardBadges_Gfx (LZ 4bpp, 1024 bytes)
-Versions.TRAINER_CARD_BADGES_PAL = 0x3CD2C0     -- sKantoTrainerCardBadges_Pal (1 bank, 32 bytes)
+Versions.TRAINER_CARD_BADGES_PAL = 0x3CD2E0
+Versions.TRAINER_CARD_BACK_MAP = 0x3CC984
+Versions.TRAINER_CARD_FRONT_LINK_MAP = 0x3CCCA4
+Versions.TRAINER_CARD_GREEN_PAL = 0x3CCFE0
+Versions.TRAINER_CARD_BRONZE_PAL = 0x3CD0A0
+Versions.TRAINER_CARD_SILVER_PAL = 0x3CD160
+Versions.TRAINER_CARD_GOLD_PAL = 0x3CD220
+Versions.TRAINER_CARD_STAR_PAL = 0x3CD300
+Versions.TRAINER_CARD_STICKERS_TILES = 0x3CC368
+Versions.TRAINER_CARD_STICKER_PAL1 = 0x3CD320
+Versions.TRAINER_CARD_STICKER_PAL2 = 0x3CD340
+Versions.TRAINER_CARD_STICKER_PAL3 = 0x3CD360
+Versions.TRAINER_CARD_STICKER_PAL4 = 0x3CD380
+Versions.TRAINER_CARD_STAR_TILE = 143           -- src/trainer_card.c:1553
 Versions.TRAINER_PIC_RED = 135
 Versions.TRAINER_PIC_LEAF = 136
 Versions.SHOP_BG_GFX = 0xE85DC8                 -- gBuyMenuFrame_Gfx
@@ -1391,6 +1593,152 @@ Versions.ITEMS_COUNT = 375                      -- pret ITEMS_COUNT (table rows 
 -- Verified by matching known metatile-ID sequence from DOOR_ENTRIES (0x03D/0x062/0x15B...).
 Versions.DOOR_GRAPHICS_TABLE = 0x35B5D8         -- sDoorGraphics[32]
 Versions.DOOR_GRAPHICS_COUNT = 32               -- entries in the table
+
+-- src/slot_machine.c:399, :739
+Versions.SLOT_REEL_ICONS_PAL = 0x464974
+Versions.SLOT_REEL_ICONS_GFX = 0x464A14
+Versions.SLOT_CLEFAIRY_PAL = 0x46504C
+Versions.SLOT_CLEFAIRY_GFX = 0x46506C
+Versions.SLOT_DIGITS_PAL = 0x465524
+Versions.SLOT_DIGITS_GFX = 0x465544
+Versions.SLOT_BG_PAL = 0x465930
+Versions.SLOT_BG_GFX = 0x4659D0
+Versions.SLOT_BG_TILEMAP = 0x4661D4
+Versions.SLOT_MATCH_LINES_PAL = 0x4664BC
+Versions.SLOT_PAYOUT_LIGHTS_PAL = 0x4664DC
+Versions.SLOT_BUTTON_PRESSED_GFX = 0x46653C
+Versions.SLOT_COMBOS_WINDOW_PAL = 0x4665C0
+Versions.SLOT_COMBOS_WINDOW_GFX = 0x466620
+Versions.SLOT_COMBOS_WINDOW_TILEMAP = 0x466998
+-- src/slot_machine.c:429, :857
+Versions.SLOT_REEL_ICON_PAL_TAGS = 0x465608
+Versions.SLOT_REEL_BUTTON_MAP_IDXS = 0x466C40
+Versions.SLOT_REELS = 3
+Versions.SLOT_BUTTON_TILES = 4
+
+-- src/trade_scene.c:151
+Versions.TRADE_POKEBALL_PAL = 0x26205C
+Versions.TRADE_POKEBALL_GFX = 0x26207C
+Versions.TRADE_CABLE_CLOSEUP_MAP = 0x26407C
+Versions.TRADE_GBA_PAL = 0x26499C
+Versions.TRADE_LINK_MON_PAL = 0x2649FC
+Versions.TRADE_LINK_MON_GLOW_GFX = 0x264A1C
+Versions.TRADE_LINK_MON_SHADOW_GFX = 0x264C1C
+Versions.TRADE_CABLE_END_GFX = 0x264E1C
+Versions.TRADE_GBA_SCREEN_GFX = 0x26501C
+Versions.TRADE_GBA_MAP_WIRELESS = 0x269A5C
+Versions.TRADE_GBA_MAP_CABLE = 0x26AA5C
+Versions.TRADE_GBA_GFX = 0xEAEA80
+Versions.TRADE_GBA_PAL2 = 0xEAEA20
+-- src/trade_scene.c:398
+Versions.TRADE_GBA_SCREEN_ANIM = 0x26CED8
+
+-- src/link_rfu_3.c:34
+Versions.WIRELESS_ICON_PAL = 0x43EEC0
+Versions.WIRELESS_ICON_GFX = 0x43EEE0
+-- src/wireless_communication_status_screen.c:50
+Versions.WIRELESS_STATUS_PALS = 0x46F4D0
+Versions.WIRELESS_STATUS_GFX = 0x46F6D0
+Versions.WIRELESS_STATUS_TILEMAP = 0x46F8E0
+-- src/union_room_chat_display.c:1262, src/union_room_chat_objects.c:30
+Versions.UR_CHAT_BG_PAL = 0xEA1700
+Versions.UR_CHAT_BG_GFX = 0xEA1720
+Versions.UR_CHAT_BG_TILEMAP = 0xEA1958
+Versions.UR_CHAT_ICONS_GFX = 0xEA1A50
+Versions.UR_CHAT_PANEL_PAL = 0xEAA9F0
+Versions.UR_CHAT_PANEL_GFX = 0xEAAA10
+Versions.UR_CHAT_PANEL_TILEMAP = 0xEAAA6C
+Versions.UR_CHAT_OBJECTS_PAL = 0x45AC14
+Versions.UR_CHAT_SELECTOR_GFX = 0x45AC34
+Versions.UR_CHAT_TEXT_CURSOR_GFX = 0x45AEB8
+Versions.UR_CHAT_CHAR_CURSOR_GFX = 0x45AED8
+Versions.UR_CHAT_R_BUTTON_GFX = 0x45AF04
+
+-- src/graphics.c:1230, src/fame_checker.c:119
+Versions.FAME_BG_PAL = 0xE9F220
+Versions.FAME_BG_GFX = 0xE9F260
+Versions.FAME_BG3_TILEMAP = 0xEA0700
+Versions.FAME_BG2_TILEMAP = 0xEA0F00
+Versions.FAME_QUESTION_GFX = 0x45CE00
+Versions.FAME_CURSOR_GFX = 0x45D100
+Versions.FAME_CURSOR_PAL = 0x45D500
+Versions.FAME_FUJI_GFX = 0x45D520
+Versions.FAME_FUJI_PAL = 0x45DD20
+Versions.FAME_BILL_GFX = 0x45DD40
+Versions.FAME_BILL_PAL = 0x45E540
+Versions.FAME_DAISY_GFX = 0x45E560
+Versions.FAME_DAISY_PAL = 0x45ED60
+Versions.FAME_OAK_GFX = 0x45ED80
+Versions.FAME_OAK_PAL = 0x45F580
+Versions.FAME_SILHOUETTE_PAL = 0x45F5C0
+Versions.FAME_TRAINER_PIC_IDXS = 0x45F61C
+-- src/fame_checker.c:209, :246, :380, :399
+Versions.FAME_NAME_QUOTE_PTRS = 0x45F63C
+Versions.FAME_FLAVOR_TEXT_PTRS = 0x45F6BC
+Versions.FAME_ORIGIN_LOCATION_PTRS = 0x45F89C
+Versions.FAME_ORIGIN_OBJECT_PTRS = 0x45FA1C
+Versions.FAME_NONTRAINER_NAME_PTRS = { 0x41E5E9, 0x41E5ED, 0x41E5F3, 0x41E5F8 }
+Versions.FAME_PERSON_COUNT = 16
+Versions.FAME_FLAVOR_TEXT_COUNT = 6
+
+-- src/graphics.c:1117
+Versions.TEACHY_TV_GFX = 0xE86240
+Versions.TEACHY_TV_SCREEN_TILEMAP = 0xE86BE8
+Versions.TEACHY_TV_TITLE_TILEMAP = 0xE86D6C
+Versions.TEACHY_TV_PAL = 0xE86F98
+-- src/teachy_tv.c:869
+Versions.TEACHY_TV_END_TILES = 0x479590
+
+-- src/mystery_gift_show_card.c:150, src/mystery_gift_show_news.c:99
+Versions.WONDER_CARD_GRAPHICS = 0x467FB8
+Versions.WONDER_NEWS_GRAPHICS = 0x468720
+Versions.WONDER_BG_COUNT = 8
+Versions.WONDER_BG_TILE_OFFSET = 8
+
+-- src/trainer_tower.c:105, :191, :204, :382; src/trainer_tower_sets.c:8951
+Versions.TRAINER_TOWER_HEADER = 0x4827AC
+Versions.TRAINER_TOWER_FLOORS = 0x4827B4
+Versions.TRAINER_TOWER_CHALLENGE_TYPES = 4
+Versions.TRAINER_TOWER_MAX_FLOORS = 8
+Versions.TRAINER_TOWER_TRAINERS_PER_FLOOR = 3
+Versions.TT_SINGLES_INFO = 0x479ED8
+Versions.TT_SINGLES_INFO_COUNT = 83
+Versions.TT_DOUBLES_INFO = 0x47A024
+Versions.TT_DOUBLES_INFO_COUNT = 10
+Versions.TT_ENCOUNTER_MUSIC_LUT = 0x47A074
+Versions.TT_ENCOUNTER_MUSIC_LUT_COUNT = 105
+Versions.TT_ENCOUNTER_MUSIC = 0x47A2D2
+Versions.TT_ENCOUNTER_MUSIC_COUNT = 14
+Versions.FACILITY_CLASS_TO_PIC = 0x2538A8
+Versions.FACILITY_CLASS_TO_TRAINER_CLASS = 0x25393E
+Versions.FACILITY_CLASS_COUNT = 150
+
+-- src/data/pokemon/tutor_learnsets.h:1, :22
+Versions.TUTOR_MOVES = 0x459B60
+Versions.TUTOR_LEARNSETS = 0x459B7E
+Versions.TUTOR_MOVE_COUNT = 15
+
+-- src/script_menu.c:647, :1161
+Versions.MUSEUM_AERODACTYL_GFX = 0x3E0780
+Versions.MUSEUM_AERODACTYL_PAL = 0x3E0F80
+Versions.MUSEUM_KABUTOPS_GFX = 0x3E0FA0
+Versions.MUSEUM_KABUTOPS_PAL = 0x3E17A0
+Versions.MUSEUM_FOSSIL_SIZE = 64                 -- SPRITE_SIZE(64x64), src/script_menu.c:634
+
+-- src/daycare.c:137, :138, :139
+Versions.EGG_PALETTE = 0x25F842
+Versions.EGG_HATCH_GFX = 0x25F862
+Versions.EGG_SHARD_GFX = 0x260062
+
+-- src/learn_move.c:384 MoveRelearnerLoadBgGfx
+Versions.MOVE_RELEARNER_PAL = 0xE97DDC
+Versions.MOVE_RELEARNER_GFX = 0xE97DFC
+Versions.MOVE_RELEARNER_TILEMAP = 0xE97EC4
+
+-- src/battle_records.c:37, :563 LoadFrameGfxOnBg
+Versions.BATTLE_RECORDS_GFX = 0x3F6388
+Versions.BATTLE_RECORDS_PAL = 0x3F6448
+Versions.BATTLE_RECORDS_TILEMAP = 0x3F6468
 
 -- Title screen + Oak speech graphics (FireRed USA 1.0 file offsets).
 -- Verified by matching pret .gbapal bytes + LZ sizes in local dump.
@@ -1852,6 +2200,9 @@ Versions.MAPS = {
 Versions.G_MAP_GROUPS = 0x3526A8
 Versions.NUM_MAP_GROUPS = 43 -- pret map_groups.json group_order length
 
+-- pokefirered/src/overworld.c:494
+Versions.G_MAP_LAYOUTS = 0x34EB8C
+
 -- FireRed USA 1.0 MapHeader file offsets (verified against local dump).
 -- Legacy hand list — prefer MapTree.walk(gMapGroups) for new extract.
 -- Shared layouts (House3 / Harbor / PC 2F) disambiguated by header proximity
@@ -1973,15 +2324,23 @@ local FIRERED_10 = {
   layouts = FIRERED_10_LAYOUTS,
   map_headers = Versions.MAP_HEADERS,
   g_map_groups = Versions.G_MAP_GROUPS,
+  g_map_layouts = Versions.G_MAP_LAYOUTS,
   num_map_groups = Versions.NUM_MAP_GROUPS,
   ow_gfx_pointers = Versions.OW_GFX_POINTERS,
   ow_sprite_palettes = Versions.OW_SPRITE_PALETTES,
   num_obj_event_gfx = Versions.NUM_OBJ_EVENT_GFX,
 }
 
+local LEAFGREEN_10 = {}
+for key, value in pairs(FIRERED_10) do LEAFGREEN_10[key] = value end
+LEAFGREEN_10.id, LEAFGREEN_10.game = "leafgreen_1_0", "leafgreen"
+
 -- SHA-1 (lowercase) → version table. Engine identity is SHA-1 only.
 Versions.BY_SHA1 = {
+  ["574fa542ffebb14be69902d1d36f1ec0a4afd71e"] = LEAFGREEN_10,
+  ["7862c67bdecbe21d1d69ce082ce34327e1c6ed5e"] = LEAFGREEN_10,
   ["41cb23d8dccc8ebd7c649cd8fbb58eeace6e2fdc"] = FIRERED_10,
+  ["dd5945db9b930750cb39d00c84da8571feebf417"] = FIRERED_10,
 }
 -- Legacy MD5 keys retained only for error messages / migration hints.
 Versions.BY_MD5 = {
@@ -2074,13 +2433,56 @@ function Versions.lookup(sha1)
   if not key or key == "" then return nil, "missing sha1" end
   local ver = Versions.BY_SHA1[key]
   if not ver then
-    return nil, "unsupported or unknown FireRed dump SHA-1"
+    return nil, "unsupported or unknown FRLG dump SHA-1"
   end
   return ver
 end
 
 function Versions.lookupSha1(sha1)
   return Versions.lookup(sha1)
+end
+
+-- Retain table identities: extractors and runtime modules hold references to
+-- nested tables. Rebuild from immutable baseline entries when editions change,
+-- never remap an already remapped value or mutate data read from the ROM.
+local baseline, seen = {}, {}
+local function capture(t)
+  if seen[t] then return end
+  seen[t] = true
+  local entries = {}
+  baseline[#baseline + 1] = { target = t, entries = entries }
+  for k, v in pairs(t) do
+    entries[#entries + 1] = { k, v }
+    if type(v) == "table" then capture(v) end
+  end
+end
+capture(Versions)
+local edition, addresses = "firered", nil
+
+function Versions.address(base)
+  if not addresses then return base end
+  return assert(addresses[base], string.format("Missing LeafGreen address 0x%X", base))
+end
+
+function Versions.select(identity)
+  local game = identity
+  if Versions.BY_SHA1[identity] then game = Versions.BY_SHA1[identity].game end
+  game = game == "leafgreen" and "leafgreen" or "firered"
+  if game == edition then return end
+  addresses = game == "leafgreen" and require("src.import.gba.editions.leafgreen_1_0") or nil
+  for _, record in ipairs(baseline) do
+    local t = record.target
+    -- Root functions added below capture() are retained.
+    for _, entry in ipairs(record.entries) do
+      t[entry[1]] = nil
+    end
+    if t ~= Versions then for k in pairs(t) do t[k] = nil end end
+    for _, entry in ipairs(record.entries) do
+      local k, v = entry[1], entry[2]
+      t[addresses and addresses[k] or k] = addresses and addresses[v] or v
+    end
+  end
+  edition = game
 end
 
 return Versions

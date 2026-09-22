@@ -3,6 +3,7 @@
 -- Choices open only after the message queue is idle (see LearnMove.pump).
 
 local Pokemon = require("src.core.game3.pokemon")
+local Strings = require("src.core.Strings")
 
 local LearnMove = {}
 
@@ -32,6 +33,7 @@ function LearnMove.reset()
   LearnMove._waitingChoice = false
   LearnMove._forgetSlots = nil
   LearnMove._battleText = false
+  LearnMove._relearner = false
   LearnMove._queue = nil
   LearnMove._queueIdx = 0
   LearnMove._queueOpts = nil
@@ -73,29 +75,39 @@ local open_stop_prompt
 local open_forget_list
 local ask_to_learn
 
-local function T(battle, field)
+local function T(battle, field, relearner)
+  if LearnMove._relearner then return relearner or field end
   if LearnMove._battleText then return battle end
   return field
 end
 
 local function did_not_learn_text()
   -- pokefirered/src/battle_message.c:63
-  return T(LearnMove._name .. " did not learn\n" .. LearnMove._moveName .. ".",
-    LearnMove._name .. " did not learn the\nmove " .. LearnMove._moveName .. ".")
+  return T(Strings("%s did not learn\n%s.", LearnMove._name, LearnMove._moveName),
+    Strings("%s did not learn the\nmove %s.", LearnMove._name, LearnMove._moveName))
 end
 
 function ask_to_learn()
-  if LearnMove._battleText then
-    -- pokefirered/data/battle_scripts_1.s:3124
-    say(LearnMove._name .. " is trying to\nlearn " .. LearnMove._moveName .. ".", function()
-      say("But, " .. LearnMove._name .. " can't learn\nmore than four moves.", function()
+  if LearnMove._relearner then
+    -- pokefirered/src/strings.c:1259
+    say(Strings("%s is trying to learn\n%s.", LearnMove._name, LearnMove._moveName), function()
+      say(Strings("But %s can't learn more\nthan four moves.", LearnMove._name), function()
         open_delete_prompt()
       end)
     end)
     return
   end
-  say(LearnMove._name .. " wants to learn the\nmove " .. LearnMove._moveName .. ".", function()
-    say("However, " .. LearnMove._name .. " already\nknows four moves.", function()
+  if LearnMove._battleText then
+    -- pokefirered/data/battle_scripts_1.s:3124
+    say(Strings("%s is trying to\nlearn %s.", LearnMove._name, LearnMove._moveName), function()
+      say(Strings("But, %s can't learn\nmore than four moves.", LearnMove._name), function()
+        open_delete_prompt()
+      end)
+    end)
+    return
+  end
+  say(Strings("%s wants to learn the\nmove %s.", LearnMove._name, LearnMove._moveName), function()
+    say(Strings("However, %s already\nknows four moves.", LearnMove._name), function()
       open_delete_prompt()
     end)
   end)
@@ -103,18 +115,26 @@ end
 
 function open_delete_prompt()
   if LearnMove._headless or not LearnMove._askYesNo then
-    say(LearnMove._name .. " did not learn\n" .. LearnMove._moveName .. ".", function()
+    say(Strings("%s did not learn\n%s.", LearnMove._name, LearnMove._moveName), function()
       finish(false)
     end)
     return
   end
   LearnMove._waitingChoice = true
   -- pokefirered/src/battle_message.c:60
-  LearnMove._askYesNo(T("Delete a move to make\nroom for " .. LearnMove._moveName .. "?",
-    "Should a move be deleted and\nreplaced with " .. LearnMove._moveName .. "?"), function(yes)
+  LearnMove._askYesNo(T(Strings("Delete a move to make\nroom for %s?", LearnMove._moveName),
+    Strings("Should a move be deleted and\nreplaced with %s?", LearnMove._moveName),
+    Strings("Delete an older move to make\nroom for %s?", LearnMove._moveName)), function(yes)
     LearnMove._waitingChoice = false
     if not yes then
       open_stop_prompt()
+      return
+    end
+    if LearnMove._relearner then
+      -- pokefirered/src/learn_move.c:562
+      say(Strings("Which move should be forgotten?"), function()
+        open_forget_list()
+      end)
       return
     end
     open_forget_list()
@@ -130,14 +150,20 @@ function open_stop_prompt()
   end
   LearnMove._waitingChoice = true
   -- pokefirered/src/battle_message.c:62
-  LearnMove._askYesNo(T("Stop learning\n" .. LearnMove._moveName .. "?",
-    "Stop trying to teach\n" .. LearnMove._moveName .. "?"), function(stop)
+  LearnMove._askYesNo(T(Strings("Stop learning\n%s?", LearnMove._moveName),
+    Strings("Stop trying to teach\n%s?", LearnMove._moveName),
+    Strings("Stop learning %s?", LearnMove._moveName)), function(stop)
     LearnMove._waitingChoice = false
     if stop then
+      if LearnMove._relearner then
+        -- pokefirered/src/learn_move.c:583
+        finish(false)
+        return
+      end
       say(did_not_learn_text(), function()
         finish(false)
       end)
-    elseif LearnMove._battleText then
+    elseif LearnMove._battleText or LearnMove._relearner then
       -- pokefirered/data/battle_scripts_1.s:3133
       ask_to_learn()
     else
@@ -158,7 +184,7 @@ function open_forget_list()
     local id = Pokemon.moveIdAt(LearnMove._mon, i)
     if id and id > 0 then
       local label = move_name(id)
-      if Pokemon.isHmMove(id) then label = label .. " (HM)" end
+      if Pokemon.isHmMove(id) then label = Strings("%s (HM)", label) end
       opts[#opts + 1] = label
       slots[#slots + 1] = i
     end
@@ -174,9 +200,10 @@ function open_forget_list()
     local slot = slots[idx + 1]
     local oldId = Pokemon.moveIdAt(LearnMove._mon, slot)
     if Pokemon.isHmMove(oldId) then
-      say("HM moves can't be\nforgotten now.", function()
-        if LearnMove._battleText then
+      say(Strings("HM moves can't be\nforgotten now."), function()
+        if LearnMove._battleText or LearnMove._relearner then
           -- pokefirered/src/battle_script_commands.c:5246
+          -- pokefirered/src/pokemon_summary_screen.c:3899
           open_forget_list()
         else
           open_delete_prompt()
@@ -192,12 +219,18 @@ function open_forget_list()
       end
       if not battle then fanfare() end
       -- pokefirered/src/battle_message.c:315
-      local poof = T("1, 2, and… … … Poof!", "1, 2, and… Poof!")
+      -- pokefirered/src/strings.c:1261
+      local poof = T(Strings("1, 2, and… … … Poof!"), Strings("1, 2, and… Poof!"),
+        Strings("1, 2, and… … … Poof!"))
       -- pokefirered/src/battle_message.c:61
-      local forgot = T(LearnMove._name .. " forgot\n" .. move_name(forgotten) .. ".",
-        LearnMove._name .. " forgot how to\nuse " .. move_name(forgotten) .. ".")
-      local andText = T("And…", "And...")
-      local learned = LearnMove._name .. " learned\n" .. LearnMove._moveName .. "!"
+      -- pokefirered/src/strings.c:1262
+      local forgot = T(Strings("%s forgot\n%s.", LearnMove._name, move_name(forgotten)),
+        Strings("%s forgot how to\nuse %s.", LearnMove._name, move_name(forgotten)),
+        Strings("%s forgot %s.", LearnMove._name, move_name(forgotten)))
+      local andText = T(Strings("And…"), Strings("And..."), Strings("And…"))
+      local learned = T(Strings("%s learned\n%s!", LearnMove._name, LearnMove._moveName),
+        Strings("%s learned\n%s!", LearnMove._name, LearnMove._moveName),
+        Strings("%s\nlearned %s.", LearnMove._name, LearnMove._moveName))
       if LearnMove._headless then
         say(poof)
         say(forgot)
@@ -254,17 +287,22 @@ function LearnMove.begin(opts)
   LearnMove._onDone = opts.onDone
   LearnMove._headless = opts.headless and true or false
   LearnMove._battleText = opts.battleText and true or false
+  LearnMove._relearner = opts.relearner and true or false
   LearnMove._waitingChoice = false
 
   if Pokemon.moveSlotCount(mon) < 4 then
     local ok = Pokemon.teachMove(mon, moveId)
     if ok then
       pcall(function() require("src.core.game3.audio").playFanfare(257) end)
+      -- pokefirered/src/strings.c:1258
+      local learned = T(Strings("%s learned\n%s!", LearnMove._name, LearnMove._moveName),
+        Strings("%s learned\n%s!", LearnMove._name, LearnMove._moveName),
+        Strings("%s learned\n%s.", LearnMove._name, LearnMove._moveName))
       if LearnMove._headless then
-        say(LearnMove._name .. " learned\n" .. LearnMove._moveName .. "!")
+        say(learned)
         finish(ok)
       else
-        say(LearnMove._name .. " learned\n" .. LearnMove._moveName .. "!", function()
+        say(learned, function()
           finish(ok)
         end)
       end
@@ -275,7 +313,7 @@ function LearnMove.begin(opts)
   end
 
   if LearnMove._headless then
-    say(LearnMove._name .. " did not learn\n" .. LearnMove._moveName .. ".")
+    say(Strings("%s did not learn\n%s.", LearnMove._name, LearnMove._moveName))
     finish(false)
     return
   end
