@@ -6,6 +6,7 @@ local Movement = require("src.core.game3.scripting.movement")
 local Opcodes = require("src.core.game3.scripting.opcodes")
 local GfxIds = require("src.core.game3.scripting.gfx_ids")
 local ModRuntime = require("src.mods.Runtime")
+local VirtualObjects = require("src.core.game3.virtual_objects")
 
 local Objects = {}
 
@@ -17,6 +18,9 @@ local WALK_FRAMES = 16
 local RUN_FRAMES = 8
 -- pokefirered/src/event_object_movement.c:9029 UpdateRunSlowAnim
 local RUN_SLOW_FRAMES = 11
+-- include/constants/event_object_movement.h:81
+local MOVEMENT_TYPE_INVISIBLE = 0x4C
+Objects.MOVEMENT_TYPE_INVISIBLE = MOVEMENT_TYPE_INVISIBLE
 local DELTA = {
   up = { 0, -1 },
   down = { 0, 1 },
@@ -114,7 +118,7 @@ local function objectVisible(def)
   return true
 end
 
-local function newEventObject(def)
+local function newEventObject(def, neighbor)
   -- Shallow-copy template so setobjectxy / removeobject cannot poison the
   -- shared events.lua / mapDef.objects tables for the rest of the session.
   local src = def or {}
@@ -125,21 +129,26 @@ local function newEventObject(def)
   local lid = tonumber(def.localId or def.index) or 0
   local x = tonumber(def.x) or 0
   local y = tonumber(def.y) or 0
-  local mt = tonumber(def.movementType) or 0
-  local hostMv = GfxIds.hostMovement
-    and GfxIds.hostMovement(mt, def.radius and def.radius.x, def.radius and def.radius.y)
-    or nil
-  local movement = def.movement
-    or (hostMv and hostMv.movement)
-    or "STAY"
-  local range = def.range or (hostMv and hostMv.range) or "DOWN"
-  local radius = def.radius or (hostMv and hostMv.radius)
+  local rawMt = tonumber(def.movementType)
+  local mt = rawMt or 0
+  local spec
+  if rawMt then
+    spec = GfxIds.hostMovement(rawMt, def.rangeX, def.rangeY)
+  else
+    local r = def.radius or { x = 1, y = 1 }
+    spec = {
+      movement = def.movement or "STAY", range = def.range or "DOWN",
+      rangeX = r.x, rangeY = r.y, radius = r,
+    }
+  end
+  local facing = (def.facing and facingFromDef(def))
+    or (rawMt and spec.face) or facingFromDef(def)
   local sprite = def.sprite
   local resolvedGfx = def.graphicsId or def.graphics
   do
     local okS, Space = pcall(require, "src.core.game3.scripting.space")
     if okS and Space and Space.resolveObjectGraphicsId then
-      local gid = Space.resolveObjectGraphicsId(def)
+      local gid = Space.resolveObjectGraphicsId(def, neighbor)
       if gid then resolvedGfx = gid end
     end
   end
@@ -158,20 +167,27 @@ local function newEventObject(def)
     py = y * CELL,
     homeX = x,
     homeY = y,
-    facing = facingFromDef(def),
+    facing = facing,
     sprite = sprite or "SPRITE_YOUNGSTER",
     graphicsId = resolvedGfx,
     elevation = elev,
+    currentElevation = tonumber(def.elevation) or 0,
     movementType = mt,
-    movement = movement,
-    range = range,
-    radius = radius or { x = 1, y = 1 },
+    movement = spec.movement,
+    range = spec.range,
+    radius = spec.radius or { x = spec.rangeX, y = spec.rangeY },
+    rangeX = spec.rangeX,
+    rangeY = spec.rangeY,
+    spec = spec,
+    seqIndex = 0,
     sight = tonumber(def.sight or def.trainerRange) or 0,
     trainerType = tonumber(def.trainerType) or 0,
     scriptKey = def.scriptKey,
     flag = def.flag,
     visible = objectVisible(def),
     hidden = not objectVisible(def),
+    -- src/event_object_movement.c:1569
+    invisible = mt == MOVEMENT_TYPE_INVISIBLE,
     frozen = false,
     passable = def.passable and true or false,
     moving = false,
@@ -181,7 +197,6 @@ local function newEventObject(def)
     targetY = y,
     stepFlip = false,
     animClock = 0,
-    idleTimer = 30 + (lid * 17) % 60,
     scriptBusy = false,
   }
 end
@@ -193,6 +208,8 @@ function Objects.clear()
   Objects._mapId = nil
   Objects._defs = nil
   Objects._bounds = nil
+  -- src/event_object_movement.c:9225
+  VirtualObjects.clear()
 end
 
 -- pokefirered/src/overworld.c:405
@@ -201,6 +218,7 @@ function Objects.reset()
   Objects._perm = {}
   Objects._templateMt = {}
   Objects._logged = false
+  VirtualObjects.reset()
 end
 
 function Objects.hasMap()
@@ -255,6 +273,23 @@ local function rememberPerm(mapId, localId, fields)
   end
 end
 
+Objects.rememberPerm = rememberPerm
+
+-- src/event_object_movement.c:4806
+local function setSpec(eo, mt)
+  local spec = GfxIds.hostMovement(mt, eo.rangeX, eo.rangeY)
+  spec.rangeX = tonumber(eo.rangeX) or 0
+  spec.rangeY = tonumber(eo.rangeY) or 0
+  spec.radius = { x = spec.rangeX, y = spec.rangeY }
+  eo.movementType = tonumber(mt) or 0
+  eo.spec = spec
+  eo.movement = spec.movement
+  eo.range = spec.range
+  eo.radius = spec.radius
+  eo.seqIndex = 0
+  eo.idleTimer = nil
+end
+
 local function applyPerm(eo, mapId)
   local bucket = Objects._perm[mapId]
   local row = bucket and bucket[eo.localId]
@@ -274,15 +309,11 @@ local function applyPerm(eo, mapId)
     if eo.def then eo.def.y = row.y end
   end
   if row.movementType ~= nil then
-    eo.movementType = row.movementType
-    local hostMv = GfxIds.hostMovement and GfxIds.hostMovement(row.movementType)
-    if hostMv then
-      eo.movement = hostMv.movement
-      eo.range = hostMv.range
-      if hostMv.radius then eo.radius = hostMv.radius end
-    end
-    local face = ({ [7] = "up", [8] = "down", [9] = "left", [10] = "right" })[row.movementType]
-    if face then eo.facing = face end
+    setSpec(eo, row.movementType)
+    -- src/event_object_movement.c:1378
+    eo.facing = eo.spec.face
+    -- src/event_object_movement.c:1569
+    eo.invisible = tonumber(row.movementType) == MOVEMENT_TYPE_INVISIBLE
     if eo.def then eo.def.movementType = row.movementType end
   end
   if row.facing ~= nil then
@@ -389,6 +420,48 @@ local function resolveContextualMapObjects(mapId)
   end
 end
 
+-- src/event_object_movement.c:1312
+local function spawnFromTemplate(def, mapId)
+  local eo = newEventObject(def)
+  if eo.localId > 0 then
+    applyPerm(eo, mapId)
+    local tmt = Objects._templateMt[eo.localId]
+    if tmt then
+      Objects.setTrainerMovementType(eo, tmt)
+      -- src/event_object_movement.c:1569
+      eo.invisible = tmt == MOVEMENT_TYPE_INVISIBLE
+      local face = ({ [7] = "up", [8] = "down", [9] = "left", [10] = "right" })[tmt]
+      if face then eo.facing = face end
+    end
+  end
+  return eo
+end
+
+-- src/event_object_movement.c:1651
+local function respawnFromTemplate(lid)
+  local tpl
+  for _, def in ipairs(Objects._defs or {}) do
+    if tonumber(def.localId or def.index) == lid then tpl = def end
+  end
+  if not tpl then return nil end
+  local eo = spawnFromTemplate(tpl, Objects._mapId)
+  eo.hidden, eo.visible = false, true
+  if eo.def then eo.def.hidden = false end
+  local present = Objects._byId[lid] ~= nil
+  if not present then
+    for _, id in ipairs(Objects._order) do
+      if id == lid then present = true break end
+    end
+  end
+  Objects._byId[lid] = eo
+  Objects._tracks[lid] = nil
+  if not present then Objects._order[#Objects._order + 1] = lid end
+  if ModRuntime.wants("world.npc_spawned") then
+    ModRuntime.emit("world.npc_spawned", { mapId = Objects._mapId, npcId = lid, runtime = eo })
+  end
+  return eo
+end
+
 --- Spawn EventObjects from mapDef.objects (extract / content).
 function Objects.loadMap(game, mapId, mapDef)
   local sameMap = Objects._mapId == mapId
@@ -425,15 +498,8 @@ function Objects.loadMap(game, mapId, mapDef)
   resolveContextualMapObjects(mapId)
   local announce = ModRuntime.wants("world.npc_spawned")
   for _, def in ipairs(Objects._defs) do
-    local eo = newEventObject(def)
+    local eo = spawnFromTemplate(def, mapId)
     if eo.localId > 0 then
-      applyPerm(eo, mapId)
-      local tmt = Objects._templateMt[eo.localId]
-      if tmt then
-        Objects.setTrainerMovementType(eo, tmt)
-        local face = ({ [7] = "up", [8] = "down", [9] = "left", [10] = "right" })[tmt]
-        if face then eo.facing = face end
-      end
       Objects._byId[eo.localId] = eo
       Objects._order[#Objects._order + 1] = eo.localId
       if announce then
@@ -459,6 +525,38 @@ function Objects.find(localId)
   return Objects._byId[localId]
 end
 
+-- src/event_object_movement.c:2089-2116
+local function on_named_map(mapGroup, mapNum)
+  if mapGroup == nil or mapNum == nil then return true end
+  local ok, MapCatalog = pcall(require, "src.import.gba.map_catalog")
+  if not (ok and type(MapCatalog) == "table" and MapCatalog.mapIdFor) then return true end
+  local engineId = MapCatalog.mapIdFor(tonumber(mapGroup), tonumber(mapNum))
+  if engineId == nil then return false end
+  return engineId == Objects._mapId
+end
+
+-- src/event_object_movement.c:2089-2101, scrcmd.c:1130
+function Objects.setSubpriority(localId, mapGroup, mapNum, subpriority)
+  local eo = Objects._byId[tonumber(localId) or -1]
+  if not eo then return false end
+  if not on_named_map(mapGroup, mapNum) then return false end
+  eo.fixedPriority = true
+  eo.subpriority = tonumber(subpriority) or 0
+  eo.fixedClass = nil
+  return true
+end
+
+-- src/event_object_movement.c:2104-2116
+function Objects.resetSubpriority(localId, mapGroup, mapNum)
+  local eo = Objects._byId[tonumber(localId) or -1]
+  if not eo then return false end
+  if not on_named_map(mapGroup, mapNum) then return false end
+  eo.fixedPriority = nil
+  eo.subpriority = nil
+  eo.fixedClass = nil
+  return true
+end
+
 function Objects.listActive(_mod, _game, _mapId)
   local ids = {}
   for _, lid in ipairs(Objects._order) do
@@ -470,15 +568,47 @@ function Objects.listActive(_mod, _game, _mapId)
   return ids
 end
 
+local VIRT_DIR_FACE = { [1] = "down", [2] = "up", [3] = "left", [4] = "right" }
+
+local drawList = {}
+local vrecs = {}
+
 function Objects.forDraw()
-  local list = {}
+  local list = drawList
+  local n = 0
   for _, lid in ipairs(Objects._order) do
     local eo = Objects._byId[lid]
-    if eo and eo.visible and not eo.hidden
+    -- src/event_object_movement.c:8014
+    if eo and eo.visible and not eo.hidden and not eo.invisible
         and not offMap(Objects._bounds, eo) then
-      list[#list + 1] = eo
+      n = n + 1
+      list[n] = eo
     end
   end
+  -- src/event_object_movement.c:1719
+  for i = 1, VirtualObjects.slots() do
+    local vo = VirtualObjects.nth(i)
+    if vo then
+      local vrec = vrecs[vo.id]
+      if not vrec then
+        vrec = { virtualId = vo.id, visible = true, hidden = false }
+        vrecs[vo.id] = vrec
+      end
+      local gid = tonumber(vo.graphicsId) or 0
+      vrec.cellX = tonumber(vo.x) or 0
+      vrec.cellY = tonumber(vo.y) or 0
+      vrec.elevation = tonumber(vo.elevation) or 3
+      vrec.facing = VIRT_DIR_FACE[tonumber(vo.direction)] or "down"
+      vrec.sprite = GfxIds.spriteFor(gid)
+      vrec.graphicsId = gid
+      vrec.raiseY = tonumber(vo.y2) or 0
+      if not offMap(Objects._bounds, vrec) then
+        n = n + 1
+        list[n] = vrec
+      end
+    end
+  end
+  for i = #list, n + 1, -1 do list[i] = nil end
   return list
 end
 
@@ -489,8 +619,10 @@ function Objects.at(tx, ty)
   for _, lid in ipairs(Objects._order) do
     local eo = Objects._byId[lid]
     if eo and eo.visible and not eo.hidden then
-      if eo.cellX == tx and eo.cellY == ty then
-        if eo.moving then return nil end
+      -- src/event_object_movement.c:1281
+      local cx = eo.moving and eo.targetX or eo.cellX
+      local cy = eo.moving and eo.targetY or eo.cellY
+      if cx == tx and cy == ty then
         return eo
       end
     end
@@ -498,13 +630,20 @@ function Objects.at(tx, ty)
   return nil
 end
 
+-- pokefirered/src/event_object_movement.c:8432 AreElevationsCompatible
+function Objects.elevationsCompatible(a, b)
+  a, b = tonumber(a) or 0, tonumber(b) or 0
+  return a == 0 or b == 0 or a == b
+end
+
 --- True if any non-passable EO occupies (tx,ty) or is stepping onto it.
-function Objects.blocks(tx, ty, exceptLocalId)
+function Objects.blocks(tx, ty, exceptLocalId, elevation)
   exceptLocalId = tonumber(exceptLocalId)
   for _, lid in ipairs(Objects._order) do
     if lid ~= exceptLocalId then
       local eo = Objects._byId[lid]
-      if eo and eo.visible and not eo.hidden and not eo.passable then
+      if eo and eo.visible and not eo.hidden and not eo.passable
+          and Objects.elevationsCompatible(elevation, eo.currentElevation) then
         if eo.cellX == tx and eo.cellY == ty then return true end
         if eo.moving and eo.targetX == tx and eo.targetY == ty then
           return true
@@ -512,13 +651,19 @@ function Objects.blocks(tx, ty, exceptLocalId)
       end
     end
   end
+  -- pokefirered/src/union_room_player_avatar.c:475
+  for i = 1, VirtualObjects.slots() do
+    local vo = VirtualObjects.nth(i)
+    if vo and vo.solid == true and tonumber(vo.x) == tx and tonumber(vo.y) == ty then return true end
+  end
   return false
 end
 
 -- pokefirered/src/event_object_movement.c:4899
-function Objects.playerBlocks(tx, ty)
+function Objects.playerBlocks(tx, ty, elevation)
   local P = Player()
   if not P then return false end
+  if not Objects.elevationsCompatible(elevation, P.currentElevation) then return false end
   if P.cellX == tx and P.cellY == ty then return true end
   if P.moving and P.targetX == tx and P.targetY == ty then return true end
   return false
@@ -538,16 +683,28 @@ function Objects.walkPhase(eo)
   return walkPhaseOf(eo)
 end
 
+-- pokefirered/src/event_object_movement.c:8400
+function Objects.updateElevation(eo)
+  local Coll = Collision()
+  if not (eo and Coll and Coll.nextElevation) then return end
+  local mapDef = eo.mapDef or Coll._mapDef
+  local cx, cy = eo.cellX, eo.cellY
+  if eo.moving then cx, cy = eo.targetX, eo.targetY end
+  eo.currentElevation = Coll.nextElevation(mapDef, eo.currentElevation or 0,
+    cx, cy, eo.cellX, eo.cellY)
+end
+
 local function beginStep(eo, tx, ty)
   eo.moving = true
   eo.progress = 0
   eo.targetX = tx
   eo.targetY = ty
+  Objects.updateElevation(eo)
   eo.stepFrames = WALK_FRAMES
   eo.animClock = 0
 end
 
-local function finishStep(eo)
+local function finishStep(eo, game, ctx)
   eo.cellX = eo.targetX
   eo.cellY = eo.targetY
   eo.px = eo.cellX * CELL
@@ -558,25 +715,64 @@ local function finishStep(eo)
   if eo.def then
     eo.def.x, eo.def.y = eo.cellX, eo.cellY
   end
+  if ctx then return end
   local Coll = Collision()
   local curElev = Coll and Coll.elevationAt and Coll.elevationAt(eo.cellX, eo.cellY)
   if curElev and curElev ~= 0 and curElev ~= 15 then
     eo.elevation = curElev
   end
+  -- src/trainer_see.c:94
+  if eo.sight and eo.sight > 0 and not eo.scriptBusy and not eo.frozen then
+    local okTs, TrainerSight = pcall(require, "src.core.game3.trainer_sight")
+    if okTs and TrainerSight and TrainerSight.check then
+      TrainerSight.check(game, eo)
+    end
+  end
 end
 
-local function tickMotion(eo)
+-- src/event_object_movement.c:8866
+local STEP_PIXELS = {
+  [16] = { 1 },
+  [8] = { 2 },
+  [6] = { 2, 3, 3 },
+  [4] = { 4 },
+  [2] = { 8 },
+  -- src/event_object_movement.c:9029
+  [11] = { 1, 2 },
+  -- src/event_object_movement.c:8984
+  [24] = { 1, 1, 0 },
+  -- src/event_object_movement.c:8959
+  [32] = { 1, 0 },
+}
+local STEP_OFFSETS = {}
+for frames, pat in pairs(STEP_PIXELS) do
+  local cum, n = {}, 0
+  for k = 1, frames do
+    n = math.min(CELL, n + pat[(k - 1) % #pat + 1])
+    cum[k] = n
+  end
+  STEP_OFFSETS[frames] = cum
+end
+
+local function stepOffset(frames, progress, cells)
+  local cum = cells == 1 and STEP_OFFSETS[frames]
+  if cum then return cum[math.min(progress, frames)] end
+  return math.floor(cells * CELL * math.min(progress, frames) / frames)
+end
+
+local function tickMotion(eo, game, ctx)
+  Objects.updateElevation(eo)
   if not eo.moving then return false end
   eo.progress = eo.progress + 1
   eo.animClock = eo.animClock + 1
   local frames = eo.stepFrames or WALK_FRAMES
   local dx = eo.targetX - eo.cellX
   local dy = eo.targetY - eo.cellY
-  local t = math.min(1, eo.progress / frames)
-  eo.px = eo.cellX * CELL + dx * CELL * t
-  eo.py = eo.cellY * CELL + dy * CELL * t
+  local off = stepOffset(frames, eo.progress, math.abs(dx) + math.abs(dy))
+  eo.px = eo.cellX * CELL + (dx > 0 and off or dx < 0 and -off or 0)
+  eo.py = eo.cellY * CELL + (dy > 0 and off or dy < 0 and -off or 0)
   if eo.progress >= frames then
-    finishStep(eo)
+    finishStep(eo, game, ctx)
     return true
   end
   return false
@@ -616,6 +812,16 @@ function Objects.scriptJump(eo, dir, distance)
   beginStep(eo, eo.cellX + d[1] * distance, eo.cellY + d[2] * distance)
   eo.frozen = true
   eo.scriptBusy = true
+  return true
+end
+
+-- pokefirered/src/event_object_movement.c:5351 InitNpcForWalkSlower
+function Objects.pushStep(eo, dir, frames)
+  local d = DELTA[dir]
+  if not eo or not d or eo.moving then return false end
+  eo.facing = dir
+  beginStep(eo, eo.cellX + d[1], eo.cellY + d[2])
+  eo.stepFrames = frames or WALK_FRAMES * 2
   return true
 end
 
@@ -721,7 +927,9 @@ local function advanceTrack(lid, tr, game)
       tr.sleep = act.frames or 32
     elseif act.kind == "face_original" then
       if eo and eo ~= Player() and eo.def then
-        local origFace = facingFromDef(eo.def)
+        -- src/event_object_movement.c:7016
+        local origFace = eo.def.movementType ~= nil and GfxIds.initialFacing(eo.movementType)
+          or facingFromDef(eo.def)
         Objects.scriptFace(eo, origFace)
       end
     elseif act.kind == "bow" then
@@ -745,12 +953,18 @@ local function advanceTrack(lid, tr, game)
     elseif act.kind == "sleep" then
       tr.sleep = act.frames or 1
     elseif act.kind == "hide" then
-      if eo and eo ~= Player() then
+      -- pokefirered/src/event_object_movement.c:7054
+      if eo == Player() then
+        Player().setVisible(false)
+      elseif eo then
         eo.hidden = true
         eo.visible = false
       end
     elseif act.kind == "show" then
-      if eo and eo ~= Player() then
+      -- pokefirered/src/event_object_movement.c:7061
+      if eo == Player() then
+        Player().setVisible(true)
+      elseif eo then
         eo.hidden = false
         eo.visible = true
       end
@@ -865,6 +1079,148 @@ local function raiseHandTick(eo)
   end
 end
 
+local function checkSight(game, eo)
+  local okTs, TrainerSight = pcall(require, "src.core.game3.trainer_sight")
+  if okTs and TrainerSight and TrainerSight.check then
+    TrainerSight.check(game, eo)
+  end
+end
+
+-- src/event_object_movement.c:4830
+local function stepCollision(eo, game, ctx, dir)
+  local d = DELTA[dir]
+  local tx, ty = eo.cellX + d[1], eo.cellY + d[2]
+  -- src/event_object_movement.c:4861
+  local rx = tonumber(eo.rangeX or (eo.radius and eo.radius.x)) or 0
+  local ry = tonumber(eo.rangeY or (eo.radius and eo.radius.y)) or 0
+  if (rx ~= 0 and math.abs(tx - eo.homeX) > rx) or (ry ~= 0 and math.abs(ty - eo.homeY) > ry) then
+    return "range"
+  end
+  local ok
+  if ctx then
+    local Coll = Collision()
+    ok = ctx.canEnter(tx, ty, eo.cellX, eo.cellY, dir)
+      and not ctx.blocks(tx, ty, eo.localId)
+    if ok and eo.mapDef and Coll.directionallyImpassableOn(
+        eo.mapDef, eo.cellX, eo.cellY, tx, ty, dir) then
+      ok = false
+    end
+    -- pokefirered/src/event_object_movement.c:4839
+    if ok and eo.mapDef and Coll.elevationMismatchOn(eo.mapDef, eo.currentElevation, tx, ty) then
+      ok = false
+    end
+  else
+    local Coll = Collision()
+    -- pokefirered/src/event_object_movement.c:8346 IsElevationMismatchAt
+    local onWater = Coll.isWater(eo.cellX, eo.cellY)
+    ok = Coll.canEnter(game, tx, ty,
+      { fromX = eo.cellX, fromY = eo.cellY, dir = dir, surfing = onWater,
+        elevation = eo.currentElevation })
+    if ok and Coll.isWater(tx, ty) ~= onWater then ok = false end
+    -- pokefirered/src/event_object_movement.c:4841 DoesObjectCollideWithObjectAt
+    if Objects.playerBlocks(tx, ty, eo.currentElevation) then ok = false end
+    if Objects.blocks(tx, ty, eo.localId, eo.currentElevation) then ok = false end
+  end
+  if not ok then return "blocked" end
+  return nil
+end
+
+-- src/event_object_movement.c:3884
+local function walkOrInPlace(eo, dir, collision)
+  eo.facing = dir
+  if collision then
+    beginStep(eo, eo.cellX, eo.cellY)
+  else
+    local d = DELTA[dir]
+    beginStep(eo, eo.cellX + d[1], eo.cellY + d[2])
+  end
+end
+
+-- src/event_object_movement.c:2770
+local function playerCellFor(ctx)
+  local P = Player()
+  local px = P.moving and P.targetX or P.cellX
+  local py = P.moving and P.targetY or P.cellY
+  return px - (ctx and ctx.ox or 0), py - (ctx and ctx.oy or 0)
+end
+
+local function trainerCloseToRunningPlayer(eo, ctx)
+  local P = Player()
+  if not (P and P.running) or P.biking or P.surfing then return false end
+  local tt = tonumber(eo.trainerType) or 0
+  if tt ~= 1 and tt ~= 3 then return false end
+  local r = tonumber(eo.sight) or 0
+  local px, py = playerCellFor(ctx)
+  return math.abs(px - eo.cellX) <= r and math.abs(py - eo.cellY) <= r
+end
+
+-- src/event_object_movement.c:2801
+local function vectorDirection(dx, dy)
+  if math.abs(dx) > math.abs(dy) then return dx < 0 and "left" or "right" end
+  return dy < 0 and "up" or "down"
+end
+
+local function southNorth(dy) return dy < 0 and "up" or "down" end
+local function westEast(dx) return dx < 0 and "left" or "right" end
+
+-- src/data/object_events/movement_type_func_tables.h:185
+local FOLLOW = {
+  [0] = vectorDirection,
+  [1] = function(_, dy) return southNorth(dy) end,
+  [2] = function(dx) return westEast(dx) end,
+  [3] = function(dx, dy)
+    local d = vectorDirection(dx, dy)
+    if d == "down" then d = westEast(dx); if d == "right" then d = "up" end
+    elseif d == "right" then d = southNorth(dy); if d == "down" then d = "up" end end
+    return d
+  end,
+  [4] = function(dx, dy)
+    local d = vectorDirection(dx, dy)
+    if d == "down" then d = westEast(dx); if d == "left" then d = "up" end
+    elseif d == "left" then d = southNorth(dy); if d == "down" then d = "up" end end
+    return d
+  end,
+  [5] = function(dx, dy)
+    local d = vectorDirection(dx, dy)
+    if d == "up" then d = westEast(dx); if d == "right" then d = "down" end
+    elseif d == "right" then d = southNorth(dy); if d == "up" then d = "down" end end
+    return d
+  end,
+  [6] = function(dx, dy)
+    local d = vectorDirection(dx, dy)
+    if d == "up" then d = westEast(dx); if d == "left" then d = "down" end
+    elseif d == "left" then d = southNorth(dy); if d == "up" then d = "down" end end
+    return d
+  end,
+  [7] = function(dx, dy)
+    local d = vectorDirection(dx, dy)
+    if d == "right" then d = southNorth(dy) end
+    return d
+  end,
+  [8] = function(dx, dy)
+    local d = vectorDirection(dx, dy)
+    if d == "left" then d = southNorth(dy) end
+    return d
+  end,
+  [9] = function(dx, dy)
+    local d = vectorDirection(dx, dy)
+    if d == "down" then d = westEast(dx) end
+    return d
+  end,
+  [10] = function(dx, dy)
+    local d = vectorDirection(dx, dy)
+    if d == "up" then d = westEast(dx) end
+    return d
+  end,
+}
+
+-- src/event_object_movement.c:2992
+local function followDirection(eo, follow, ctx)
+  local px, py = playerCellFor(ctx)
+  local fn = FOLLOW[follow] or FOLLOW[0]
+  return fn(px - eo.cellX, py - eo.cellY)
+end
+
 local function idleTick(eo, game, ctx)
   if eo.frozen or eo.scriptBusy or eo.moving or eo.hidden or not eo.visible then
     return
@@ -877,69 +1233,94 @@ local function idleTick(eo, game, ctx)
     raiseHandTick(eo)
     return
   end
-  eo.idleTimer = (eo.idleTimer or 0) - 1
-  if eo.idleTimer > 0 then return end
 
   local mv = tostring(eo.movement or "STAY"):upper()
-  if mv == "STAY" then
-    eo.idleTimer = 120
+  if mv == "STAY" then return end
+  local spec = eo.spec
+  if not spec or spec.movement ~= mv then
+    spec = { movement = mv, dirs = dirsForRange(eo.range), delays = "MEDIUM", follow = 0 }
+  end
+
+  if mv == "BACK_FORTH" then
+    -- src/event_object_movement.c:3849
+    local dir = (eo.seqIndex or 0) ~= 0 and OPPOSITE_DIR[spec.face] or spec.face
+    if (eo.seqIndex or 0) ~= 0 and eo.cellX == eo.homeX and eo.cellY == eo.homeY then
+      eo.seqIndex = 0
+      dir = OPPOSITE_DIR[dir]
+    end
+    local c = stepCollision(eo, game, ctx, dir)
+    if c == "range" then
+      eo.seqIndex = (eo.seqIndex or 0) + 1
+      dir = OPPOSITE_DIR[dir]
+      c = stepCollision(eo, game, ctx, dir)
+    end
+    walkOrInPlace(eo, dir, c)
+    return
+  end
+
+  if mv == "SEQUENCE" then
+    -- src/event_object_movement.c:3949
+    local idx = eo.seqIndex or 0
+    if idx == spec.skipFrom and ((spec.skipAxis == "x" and eo.cellX == eo.homeX)
+        or (spec.skipAxis == "y" and eo.cellY == eo.homeY)) then
+      idx = spec.skipFrom + 1
+    end
+    -- src/event_object_movement.c:3914
+    if idx == 3 and eo.cellX == eo.homeX and eo.cellY == eo.homeY then idx = 0 end
+    local dir = spec.route[idx + 1]
+    local c = stepCollision(eo, game, ctx, dir)
+    if c == "range" then
+      idx = (idx + 1) % 4
+      dir = spec.route[idx + 1]
+      c = stepCollision(eo, game, ctx, dir)
+    end
+    eo.seqIndex = idx
+    walkOrInPlace(eo, dir, c)
     return
   end
 
   local Rng = require("src.core.game3.rng")
-  local dirs = dirsForRange(eo.range)
-  if mv == "LOOK" or mv == "LOOK_AROUND" then
+  local function pick(t) return t[(Rng.Random() % #t) + 1] end
+
+  if mv == "LOOK" or mv == "LOOK_AROUND" or mv == "ROTATE" then
+    -- src/event_object_movement.c:3044
+    local close = trainerCloseToRunningPlayer(eo, ctx)
+    if eo.idleTimer == nil then
+      eo.idleTimer = mv == "ROTATE" and 48 or pick(GfxIds.DELAYS[spec.delays or "MEDIUM"])
+    end
+    eo.idleTimer = eo.idleTimer - 1
+    if eo.idleTimer > 0 and not close then return end
     local oldFacing = eo.facing
-    local pickIdx = Rng.compat(1, #dirs)
-    eo.facing = dirs[pickIdx] or dirs[1]
-    eo.idleTimer = 48 + Rng.compat(0, 47)
+    -- src/event_object_movement.c:2992
+    local dir = close and followDirection(eo, spec.follow or 0, ctx)
+    if not dir then
+      dir = mv == "ROTATE" and spec.next[eo.facing] or pick(spec.dirs)
+    end
+    eo.facing = dir
+    eo.idleTimer = mv == "ROTATE" and 48 or pick(GfxIds.DELAYS[spec.delays or "MEDIUM"])
     if not ctx and eo.facing ~= oldFacing and eo.sight and eo.sight > 0 then
-      local okTs, TrainerSight = pcall(require, "src.core.game3.trainer_sight")
-      if okTs and TrainerSight and TrainerSight.check then
-        TrainerSight.check(game, eo)
-      end
+      checkSight(game, eo)
     end
     return
   end
 
   if mv == "WALK" then
-    local pickIdx = Rng.compat(1, #dirs)
-    local dir = dirs[pickIdx] or dirs[1]
-    local d = DELTA[dir]
-    local tx, ty = eo.cellX + d[1], eo.cellY + d[2]
-    local rx = (eo.radius and eo.radius.x) or 1
-    local ry = (eo.radius and eo.radius.y) or 1
-    if math.abs(tx - eo.homeX) > rx or math.abs(ty - eo.homeY) > ry then
-      eo.idleTimer = 30 + Rng.compat(0, 29)
+    -- src/event_object_movement.c:2716
+    if eo.idleTimer == nil then eo.idleTimer = pick(GfxIds.DELAYS.MEDIUM) end
+    eo.idleTimer = eo.idleTimer - 1
+    if eo.idleTimer > 0 then return end
+    -- src/event_object_movement.c:2731
+    local dir = pick(spec.dirs or dirsForRange(eo.range))
+    eo.facing = dir
+    eo.idleTimer = pick(GfxIds.DELAYS.MEDIUM)
+    if stepCollision(eo, game, ctx, dir) then
+      if not ctx and eo.sight and eo.sight > 0 then checkSight(game, eo) end
       return
     end
-    local ok
-    -- pokefirered/src/event_object_movement.c:4830 GetCollisionAtCoords
-    if ctx then
-      local Coll = Collision()
-      ok = ctx.canEnter(tx, ty, eo.cellX, eo.cellY, dir)
-        and not ctx.blocks(tx, ty, eo.localId)
-      if ok and eo.mapDef and Coll.directionallyImpassableOn(
-          eo.mapDef, eo.cellX, eo.cellY, tx, ty, dir) then
-        ok = false
-      end
-    else
-      local Coll = Collision()
-      -- pokefirered/src/event_object_movement.c:8346 IsElevationMismatchAt
-      local onWater = Coll.isWater(eo.cellX, eo.cellY)
-      ok = Coll.canEnter(game, tx, ty,
-        { fromX = eo.cellX, fromY = eo.cellY, dir = dir, surfing = onWater })
-      if ok and Coll.isWater(tx, ty) ~= onWater then ok = false end
-      if Objects.playerBlocks(tx, ty) then ok = false end
-      if Objects.blocks(tx, ty, eo.localId) then ok = false end
-    end
-    if ok then
-      eo.facing = dir
-      beginStep(eo, tx, ty)
-    else
-      eo.facing = dir -- turn toward blocked anyway
-    end
-    eo.idleTimer = 40 + Rng.compat(0, 49)
+    local d = DELTA[dir]
+    beginStep(eo, eo.cellX + d[1], eo.cellY + d[2])
+    -- src/event_object_movement.c:8959
+    if spec.slow then eo.stepFrames = WALK_FRAMES * 2 end
   end
 end
 
@@ -955,18 +1336,37 @@ function Objects.update(game)
         eo.bowFrames = eo.bowFrames - 1
         if eo.bowFrames <= 0 then eo.bowFrames = nil end
       end
-      tickMotion(eo)
+      tickMotion(eo, game)
       idleTick(eo, game)
     end
   end
 end
 
-function Objects.spawnFromDefs(defs, mapDef)
+function Objects.spawnFromDefs(defs, mapDef, mapId)
   local pool = { byId = {}, order = {}, bounds = layoutBounds(mapDef), mapDef = mapDef }
+  local Sp = mapId and Space()
+  local nb = Sp and Sp.neighborObjectState and Sp.neighborObjectState(mapId)
+  if mapId and not nb and not (Sp and Sp.mapId == mapId) then nb = { store = { flags = {}, vars = {} }, perm = {}, movementType = {} } end
   for _, def in ipairs(defs or {}) do
-    local eo = newEventObject(def)
+    local eo = newEventObject(def, nb)
     if eo.localId > 0 then
       eo.mapDef = mapDef
+      if nb then
+        local p = nb.perm[eo.localId]
+        if p then
+          eo.cellX, eo.cellY, eo.homeX, eo.homeY = p.x, p.y, p.x, p.y
+          eo.targetX, eo.targetY = p.x, p.y
+          eo.px, eo.py = p.x * CELL, p.y * CELL
+          eo.def.x, eo.def.y = p.x, p.y
+        end
+        local mt = nb.movementType[eo.localId]
+        if mt then
+          Objects.setTrainerMovementType(eo, mt)
+          -- pokefirered/src/event_object_movement.c:359
+          eo.facing = GfxIds.initialFacing(mt)
+        end
+        if (tonumber(eo.graphicsId) or 0) >= 240 then eo.invisible = true end
+      end
       pool.byId[eo.localId] = eo
       pool.order[#pool.order + 1] = eo.localId
     end
@@ -983,7 +1383,7 @@ function Objects.tickPool(pool, game, ctx)
         eo.bowFrames = eo.bowFrames - 1
         if eo.bowFrames <= 0 then eo.bowFrames = nil end
       end
-      tickMotion(eo)
+      tickMotion(eo, game, ctx or pool)
       idleTick(eo, game, ctx)
     end
   end
@@ -994,7 +1394,8 @@ function Objects.poolForDraw(pool)
   if type(pool) ~= "table" then return list end
   for _, lid in ipairs(pool.order or {}) do
     local eo = pool.byId[lid]
-    if eo and eo.visible and not eo.hidden and not offMap(pool.bounds, eo) then
+    if eo and eo.visible and not eo.hidden and not eo.invisible
+        and not offMap(pool.bounds, eo) then
       list[#list + 1] = eo
     end
   end
@@ -1013,14 +1414,22 @@ function Objects.adoptPool(pool)
   for _, lid in ipairs(pool.order or {}) do
     local live = Objects._byId[lid]
     local ghost = pool.byId[lid]
-    local wanders = live and tostring(live.movement or "STAY"):upper() == "WALK"
-    if live and ghost and wanders and not ghost.moving then
+    local mv = live and ghost and live.movement == ghost.movement
+      and tostring(live.movement or "STAY"):upper()
+    if mv == "WALK" or mv == "BACK_FORTH" or mv == "SEQUENCE" then
       live.cellX, live.cellY = ghost.cellX, ghost.cellY
       live.px, live.py = ghost.px, ghost.py
+      live.targetX, live.targetY = ghost.targetX, ghost.targetY
+      live.moving, live.progress = ghost.moving, ghost.progress
+      live.stepFrames, live.animClock = ghost.stepFrames, ghost.animClock
       live.facing = ghost.facing
       live.stepFlip = ghost.stepFlip
       live.idleTimer = ghost.idleTimer
+      live.seqIndex = ghost.seqIndex
       if live.def then live.def.x, live.def.y = live.cellX, live.cellY end
+    elseif mv == "LOOK" or mv == "ROTATE" then
+      live.facing = ghost.facing
+      live.idleTimer = ghost.idleTimer
     end
   end
   return true
@@ -1029,26 +1438,8 @@ end
 function Objects.addObject(localId)
   localId = tonumber(localId) or 0
   local eo = Objects._byId[localId]
-  if eo then
-    applyPerm(eo, Objects._mapId)
-    eo.hidden = false
-    eo.visible = true
-    if eo.def then eo.def.hidden = false end
-    return true
-  end
-  -- Respawn from template defs.
-  for _, def in ipairs(Objects._defs or {}) do
-    if tonumber(def.localId or def.index) == localId then
-      eo = newEventObject(def)
-      applyPerm(eo, Objects._mapId)
-      eo.hidden = false
-      eo.visible = true
-      Objects._byId[localId] = eo
-      Objects._order[#Objects._order + 1] = localId
-      return true
-    end
-  end
-  return false
+  if eo and not eo.hidden then return true end
+  return respawnFromTemplate(localId) ~= nil
 end
 
 --- Re-evaluate hide flags after sidecar load / setflag mid-map.
@@ -1063,9 +1454,25 @@ function Objects.refreshVisibility()
   end
 end
 
+-- src/event_object_movement.c:1841
+local function inCameraView(eo)
+  local P = Player()
+  if not P then return false end
+  local px, py = tonumber(P.cellX), tonumber(P.cellY)
+  if not px or not py then return false end
+  local function inside(x, y)
+    x, y = tonumber(x), tonumber(y)
+    return x ~= nil and y ~= nil
+      and x >= px - 9 and x <= px + 10 and y >= py - 7 and y <= py + 9
+  end
+  return inside(eo.cellX, eo.cellY) or inside(eo.homeX, eo.homeY)
+end
+
+Objects.inCameraView = inCameraView
+
 --- pret FlagClear/FlagSet on an object template hide flag.
--- clearflag after removeobject must bring the NPC back at perm coords.
-function Objects.syncFlagVisibility(flagId, hidden)
+-- src/scrcmd.c:558
+function Objects.syncFlagVisibility(flagId, hidden, force)
   flagId = tonumber(flagId) or 0
   if flagId == 0 or flagId == 0xFFFF or flagId == 65535 then return end
   for _, lid in ipairs(Objects._order) do
@@ -1074,14 +1481,14 @@ function Objects.syncFlagVisibility(flagId, hidden)
       local f = tonumber(eo.flag) or (eo.def and tonumber(eo.def.flag or eo.def.flagId)) or 0
       if f == flagId then
         if hidden then
-          eo.hidden = true
-          eo.visible = false
-          if eo.def then eo.def.hidden = true end
-        else
-          applyPerm(eo, Objects._mapId)
-          eo.hidden = false
-          eo.visible = true
-          if eo.def then eo.def.hidden = false end
+          if force or not inCameraView(eo) then
+            eo.hidden = true
+            eo.visible = false
+            if eo.def then eo.def.hidden = true end
+          end
+        elseif eo.hidden then
+          -- src/event_object_movement.c:1792
+          respawnFromTemplate(lid)
         end
       end
     end
@@ -1117,12 +1524,25 @@ function Objects.removeObject(localId)
   return true
 end
 
+-- src/event_object_movement.c:2059
+local function setObjectInvisibility(localId, state)
+  local lid = tonumber(localId) or 0
+  if lid >= Objects.PLAYER_LOCAL_ID then
+    Player().setVisible(not state)
+    return true
+  end
+  local eo = Objects._byId[lid]
+  if not eo then return false end
+  eo.invisible = state
+  return true
+end
+
 function Objects.hideObject(localId)
-  return Objects.removeObject(localId)
+  return setObjectInvisibility(localId, true)
 end
 
 function Objects.showObject(localId)
-  return Objects.addObject(localId)
+  return setObjectInvisibility(localId, false)
 end
 
 function Objects.turnObject(localId, dir)
@@ -1189,14 +1609,10 @@ function Objects.setTrainerMovementType(localId, mt)
   local eo = type(localId) == "table" and localId or Objects._byId[tonumber(localId) or 0]
   if not eo then return end
   mt = tonumber(mt) or 0
-  eo.movementType = mt
-  local hostMv = GfxIds.hostMovement and GfxIds.hostMovement(mt)
-  if hostMv then
-    eo.movement = hostMv.movement
-    eo.range = hostMv.range
-    if hostMv.radius then eo.radius = hostMv.radius end
-  end
+  setSpec(eo, mt)
   clearRaiseHand(eo)
+  -- src/event_object_movement.c:4543
+  if mt == MOVEMENT_TYPE_INVISIBLE then eo.invisible = true end
   if eo.movement == "RAISE_HAND" then
     eo.facing = "down"
   end

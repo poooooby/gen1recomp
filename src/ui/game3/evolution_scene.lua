@@ -13,7 +13,7 @@ local Audio = require("src.core.game3.audio")
 local LearnMove = require("src.core.game3.battle.learn_move")
 local SE = require("src.core.game3.se_ids")
 local Oam = require("src.core.game3.oam")
-local Strings = require("src.core.Strings")
+local RomText = require("src.core.game3.rom_text")
 
 local EvolutionScene = {}
 
@@ -69,6 +69,13 @@ end
 
 function EvolutionScene.isOpen()
   return EvolutionScene.open
+end
+
+-- pokefirered/src/evolution_scene.c:266
+local function evo_pic(species)
+  local mon = EvolutionScene._mon
+  return Pokemon.frontPic(Pokemon.picSpecies(species, mon and mon.personality), nil, Pokemon.isShiny(mon),
+    mon and mon.personality)
 end
 
 --- Start an evolution scene.
@@ -132,13 +139,13 @@ function EvolutionScene.start(mon, postSpecies, opts)
   end
 
   -- Ensure pre-evolution and post-evolution pics are cached
-  Pokemon.frontPic(EvolutionScene._preSpecies)
-  Pokemon.frontPic(EvolutionScene._postSpecies)
+  evo_pic(EvolutionScene._preSpecies)
+  evo_pic(EvolutionScene._postSpecies)
 
   -- Open message box in battle frame
   if Message.setFrame then Message.setFrame("battle") end
 
-  Stack.push("evolution_scene", EvolutionScene, { hideBelow = true })
+  Stack.push("evolution_scene", EvolutionScene, { hideBelow = true, fullscreen = true })
   return true
 end
 
@@ -206,12 +213,9 @@ end
 
 local function open_pending_yesno()
   if EvolutionScene._pendingYesNo == nil then return end
-  if not (Message.isOpen and Message.isOpen()) then
-    EvolutionScene._pendingYesNo = nil
-    return
-  end
   -- pokefirered/src/evolution_scene.c:912
-  if not (Message.isWaiting and Message.isWaiting()) then return end
+  if Message.isOpen and Message.isOpen()
+      and not (Message.isWaiting and Message.isWaiting()) then return end
   local cb = EvolutionScene._pendingYesNo
   EvolutionScene._pendingYesNo = nil
   local Choice = require("src.ui.game3.choice")
@@ -312,10 +316,11 @@ function EvolutionScene.handleInput(input)
 
   local Choice = package.loaded["src.ui.game3.choice"]
   if Choice and Choice.active then
+    -- pokefirered/src/evolution_scene.c:925
     if input:wasPressed("up") then
-      Choice.move(-1)
+      if Choice.cursor ~= 1 then Choice.move(-1) end
     elseif input:wasPressed("down") then
-      Choice.move(1)
+      if Choice.cursor == 1 then Choice.move(1) end
     elseif input:wasPressed("a") then
       Choice.confirm()
     elseif input:wasPressed("b") then
@@ -332,7 +337,8 @@ function EvolutionScene.handleInput(input)
       Audio.playSong(0)
       pcall(function() Audio.playSe(SE.SE_NOT_EFFECTIVE or 2) end)
       local fromName = Pokemon.displayMonName(EvolutionScene._mon)
-      Message.show(Strings("Huh? %s\nstopped evolving!", fromName), { frame = "battle" })
+      -- pokefirered/src/evolution_scene.c:857
+      Message.show(RomText.box("gText_PkmnStoppedEvolving", { stringVars = { fromName } }), { frame = "battle" })
       return
     end
   end
@@ -418,7 +424,7 @@ function EvolutionScene.update(dt)
     EvolutionScene._timer = 0
     Audio.playSong(0)
     -- pokefirered/src/battle_message.c:1277 gText_EllipsisQuestionMark
-    Message.show(Strings("……?"), { frame = "battle" })
+    Message.show(RomText.box("gText_EllipsisQuestionMark"), { frame = "battle" })
     return
   end
 
@@ -430,7 +436,8 @@ function EvolutionScene.update(dt)
       EvolutionScene._state = "intro_msg"
       EvolutionScene._timer = 0
       local fromName = Pokemon.displayMonName(EvolutionScene._mon)
-      Message.show(Strings("What?\n%s is evolving!", fromName), { frame = "battle" })
+      -- pokefirered/src/evolution_scene.c:678
+      Message.show(RomText.box("gText_PkmnIsEvolving", { stringVars = { fromName } }), { frame = "battle" })
     end
 
   elseif st == "intro_msg" then
@@ -531,7 +538,9 @@ function EvolutionScene.update(dt)
 
       local fromName = EvolutionScene._nick or clean_string(Pokemon.name(EvolutionScene._preSpecies))
       local intoName = Pokemon.name(EvolutionScene._postSpecies) or "POKéMON"
-      Message.show(Strings("Congratulations! Your %s\nevolved into %s!", fromName, intoName), { frame = "battle" })
+      -- pokefirered/src/evolution_scene.c:775
+      Message.show(RomText.box("gText_CongratsPkmnEvolved", { stringVars = { fromName, intoName } }),
+        { frame = "battle" })
     end
 
   elseif st == "cancel" then
@@ -583,8 +592,8 @@ function EvolutionScene.draw()
 
   -- 4. Draw Pokémon sprites (silhouette or full color)
   local st = EvolutionScene._state
-  local prePic = Pokemon.frontPic(EvolutionScene._preSpecies)
-  local postPic = Pokemon.frontPic(EvolutionScene._postSpecies)
+  local prePic = evo_pic(EvolutionScene._preSpecies)
+  local postPic = evo_pic(EvolutionScene._postSpecies)
 
   if st == "cycle" then
     -- Solid white silhouette shader

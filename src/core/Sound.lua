@@ -62,6 +62,7 @@ local FANFARES = {
   Pokedex_Rating = true,
   Dex_Page_Added = true,
   Pokeflute = true,
+  Pokeflute_In_Battle = true,
 }
 
 -- which mod put this key in the registry, for attributed failure logs
@@ -469,6 +470,50 @@ function Sound.play(data, name)
   return src
 end
 
+-- audio/poke_flute.asm:1
+local POKEFLUTE_IN_BATTLE = {
+  redblue = { 0x6322, 0x6325, 0x449b },
+  yellow = { 0x59eb, 0x59ee, 0x444b },
+}
+
+local function pokefluteInBattleDef(data)
+  local sfx = data and data.audio and data.audio.sfx
+  local base = sfx and sfx.Caught_Mon
+  if type(base) ~= "table" or base.chip ~= nil or base.bank ~= 8
+      or base.address ~= 0x41CE then
+    return nil
+  end
+  local alt = require("src.core.GameVersion").isYellow()
+    and POKEFLUTE_IN_BATTLE.yellow or POKEFLUTE_IN_BATTLE.redblue
+  local def = {}
+  for key, value in pairs(base) do def[key] = value end
+  def.startChannels = {
+    { number = 5, address = alt[1] },
+    { number = 6, address = alt[2] },
+    { number = 7, address = alt[3] },
+  }
+  def.fanfare = true
+  return def
+end
+Sound._pokefluteInBattleDef = pokefluteInBattleDef
+
+-- engine/items/item_effects.asm:1739
+function Sound.playPokefluteInBattle(data)
+  local sfx = data and data.audio and data.audio.sfx
+  if sfx and sfx.Pokeflute_In_Battle then
+    return Sound.play(data, "Pokeflute_In_Battle")
+  end
+  local field = sfx and sfx.Pokeflute
+  -- audio/headers/sfxheaders1.asm:467
+  if field ~= nil and (type(field) ~= "table" or field.chip ~= nil
+      or field.bank ~= 2 or field.address ~= 0x4228) then
+    return Sound.play(data, "Pokeflute")
+  end
+  local def = pokefluteInBattleDef(data)
+  if not def then return Sound.play(data, "Pokeflute") end
+  return startSfx(data, "Pokeflute_In_Battle", def)
+end
+
 -- PlayStereoSFX (audio/engine.asm), the battle animation path: same sound,
 -- same fanfare duck, but no CheckSFX/wCurSFX gate, and it never writes
 -- wCurSFX either -- so an animation sound can neither be dropped by, nor
@@ -726,6 +771,9 @@ function Sound.playPikaCry(data, n)
     local path = ("assets/generated/audio/pika_cries/cry_%02d.wav"):format(n)
     local ok, s = pcall(love.audio.newSource, path, "static")
     if not ok or not s then
+      if os.getenv("POKEPORT_DEV") == "1" or _G.POKEPORT_DEV_MODE == true then
+        error(("pikachu cry %d failed to load: %s"):format(n, tostring(s)))
+      end
       cache[key] = false
       return nil
     end

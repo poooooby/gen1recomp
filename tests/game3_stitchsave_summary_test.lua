@@ -32,7 +32,7 @@ end
 
 print("[test] 1. CheckPartyPokerus reads the low nibble only")
 do
-  -- pokefirered/src/pokemon.c:5618 GetMonData(..., MON_DATA_POKERUS) & 0xF
+  -- pokefirered/src/pokemon.c:5630
   eq(SummaryData.statusAilment({ pokerus = 0 }), AILMENT_NONE, "never infected is no ailment")
   eq(SummaryData.statusAilment({ pokerus = 0x41 }), AILMENT_PKRS, "strain 4 with 1 day left is PKRS")
   eq(SummaryData.statusAilment({ pokerus = 0x04 }), AILMENT_PKRS, "4 days left is PKRS")
@@ -67,6 +67,12 @@ do
     "poison wins")
   eq(SummaryData.statusAilment({ pokerus = 0x10, hp = 10, status = 0x08 }), AILMENT_PSN,
     "and a cured mon shows only the poison")
+end
+
+if not require("tests.game3_cache").mount() then
+  print("[skip] tests 4-9 read ROM map section names: " .. tostring(require("tests.game3_cache").reason))
+  print(string.format("[test] %d passed, %d failed", passed, failed))
+  os.exit(failed > 0 and 1 or 0)
 end
 
 print("[test] 4. The met location comes from the map section, not a PALLET TOWN default")

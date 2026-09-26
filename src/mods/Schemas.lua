@@ -663,7 +663,8 @@ Schemas.GEN3 = {
   pokemon = "gen3Pokemon", moves = "gen3Moves", items = "gen3Items",
   encounters = "gen3Encounters", trainers = "gen3Trainers",
   text = "gen3Text", map_scripts = "gen3Scripts",
-  tilesets = false, sprites = false, rom_text = false,
+  rom_text = "gen3RomText",
+  tilesets = false, sprites = false,
   palettes = false, icons = false, battle_anims = false, constants = false,
   statuses = false, move_effects = false, item_effects = false,
   balls = false, ai_classes = false, evolution_methods = false,
@@ -677,13 +678,27 @@ Schemas.GEN3 = {
   apricorns = false, landmarks = false, radio_channels = false,
 }
 
+Schemas.GEN3_ROUTING = {}
+Schemas.GEN3_LIVE_MODULES = {}
+
+local mergedRouting = setmetatable({}, { __mode = "k" })
+
 -- The routing table for a generation: which one is consulted is the only
--- difference between the two directions.  An unknown generation routes
--- nothing, so every registry keeps its catalog target.
 local NO_ROUTING = {}
 
-function Schemas.routing(generation)
-  if generation == 3 then return Schemas.GEN3 end
+function Schemas.routing(generation, version)
+  if generation == 3 then
+    local overlay = type(version) == "string" and Schemas.GEN3_ROUTING[version]
+    if not overlay then return Schemas.GEN3 end
+    local merged = mergedRouting[overlay]
+    if not merged then
+      merged = {}
+      for name, target in pairs(Schemas.GEN3) do merged[name] = target end
+      for name, target in pairs(overlay) do merged[name] = target end
+      mergedRouting[overlay] = merged
+    end
+    return merged
+  end
   if generation == 2 then return Schemas.GEN2 end
   if generation == 1 then return Schemas.GEN1 end
   return NO_ROUTING
@@ -691,16 +706,16 @@ end
 
 -- The Data path `name` merges into for a generation, or nil when the registry
 -- has no home there.
-function Schemas.targetFor(name, spec, generation)
-  local routed = Schemas.routing(generation)[name]
+function Schemas.targetFor(name, spec, generation, version)
+  local routed = Schemas.routing(generation, version)[name]
   if routed == nil then return spec.target end
   return routed or nil
 end
 
 -- true when the registry exists but this generation has nowhere to put it,
 -- which is a different diagnostic from a registry that has no target at all
-function Schemas.gatedFor(name, generation)
-  return Schemas.routing(generation)[name] == false
+function Schemas.gatedFor(name, generation, version)
+  return Schemas.routing(generation, version)[name] == false
 end
 
 -- ------- per-generation record shapes
@@ -920,20 +935,34 @@ local LIVE_MODULES = {
   gen3Trainers = "src.core.game3.scripting.trainers",
 }
 
-function Schemas.bindGen3(data)
-  if type(data) == "table" then bound[data] = true end
+function Schemas.liveModuleFor(key, version)
+  local overlay = type(version) == "string" and Schemas.GEN3_LIVE_MODULES[version]
+  local path = (overlay and overlay[key]) or LIVE_MODULES[key]
+  return package.loaded[path or ""]
+end
+
+function Schemas.bindGen3(data, version)
+  if type(data) == "table" then bound[data] = version or true end
+end
+
+function Schemas.boundVersion(data)
+  if type(data) ~= "table" then return nil end
+  local version = bound[data]
+  if version == true then return nil end
+  return version
 end
 
 local function sibling(base, key)
-  for data in pairs(bound) do
+  for data, version in pairs(bound) do
     for _, root in ipairs(ROOT_KEYS) do
       if base ~= nil and rawget(data, root) == base then
         local value = data[key]
         if value ~= nil then return value end
+        return Schemas.liveModuleFor(key, version)
       end
     end
   end
-  return package.loaded[LIVE_MODULES[key] or ""]
+  return Schemas.liveModuleFor(key, nil)
 end
 
 local indexCache = { species = setmetatable({}, { __mode = "k" }),
@@ -1625,6 +1654,9 @@ end
 
 function G3.textIr(value)
   if type(value) ~= "string" then return value end
+  if value:find("[{\\]") then
+    return require("src.core.game3.scripting.text_ir").fromAscii((value:gsub("\n\n", "\\p")))
+  end
   local ir = {}
   local rest = value
   while rest ~= "" do
@@ -2292,7 +2324,6 @@ R.text = {
   example = 'mod.content.text:override("_PalletTownText1", "HELLO!")',
   gen3Value = f.union{ f.str, f.list(f.any) },
   gen3Write = G3.textWrite,
-  gen3Example = 'mod.content.text:override("Text_BootedUpPC", "HELLO!")',
 }
 
 -- Gen 2's data/generated/text.lua is VM script text keyed by bank:address;
@@ -2303,6 +2334,8 @@ R.rom_text = {
   semantics = "record",
   value = f.str,
   example = 'mod.content.rom_text:override("_WokeUpText", "%s se réveille !")',
+  gen3Value = f.union{ f.str, f.list(f.any) },
+  gen3Write = G3.textWrite,
 }
 
 -- The engine's own authored text, the half of the game `text` does not

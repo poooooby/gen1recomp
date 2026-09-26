@@ -127,6 +127,8 @@ O.playTimeFrames = O.mainData + 1870                      -- 1B (0-59, 1/60s tic
 -- offset is identical between pokered and pokeyellow (same sram.asm, same
 -- wMainData field spacing per both symbol files).
 O.pikachuHappiness = O.mainData + 377
+O.pikachuMood = O.mainData + 378                          -- engine/menus/save.asm:260
+O.pikachuEmotionModifier = O.mainData + 421               -- ram/wram.asm:2090
 O.mainDataSize = 1929                                     -- wMainDataEnd - wMainDataStart
 
 O.spriteData = O.mainData + O.mainDataSize
@@ -870,6 +872,9 @@ function GenSave.decode(bytes, data, opts)
   -- O.pikachuHappiness) (#763, #838).
   if data.gameVersion == "yellow" then
     save.pikachuHappiness = u8(bytes, O.pikachuHappiness)
+    save.pikachuMood = u8(bytes, O.pikachuMood)
+    local modifier = u8(bytes, O.pikachuEmotionModifier)
+    save.pikachuEmotionModifier = modifier ~= 0 and modifier or nil
   end
 
   save.warnings = warnings
@@ -1118,10 +1123,12 @@ function GenSave.encode(save, data, template)
   for b = 7, 12 do encodeBoxRegion(O.box7 + (b - 7) * BOX_REGION_SIZE, boxes[b] or {}) end
 
   -- map + position
+  local px = math.floor(tonumber(save.player and save.player.x) or 0)
+  local py = math.floor(tonumber(save.player and save.player.y) or 0)
   if save.player and save.player.map then
     setByte(buf, O.curMap, cw.mapsIndex[save.player.map] or 0)
-    setByte(buf, O.yCoord, save.player.y or 0)
-    setByte(buf, O.xCoord, save.player.x or 0)
+    setByte(buf, O.yCoord, py)
+    setByte(buf, O.xCoord, px)
   end
   if save.lastOutdoor and save.lastOutdoor.id then
     setByte(buf, O.lastMap, cw.mapsIndex[save.lastOutdoor.id] or 0)
@@ -1132,10 +1139,10 @@ function GenSave.encode(save, data, template)
   -- zero-filled one boots into a garbled map on a silent hang (#889).
   --
   -- Rebuilt when there is no template at all (a save that began as a New Game
-  -- in this port), and when the template was saved on a DIFFERENT map than the
-  -- one the player is standing on now -- an imported save that has since been
-  -- played carries the old map's header, which is just as unbootable.  A
-  -- template still on its own map keeps its bytes untouched: they are the
+  -- in this port), and when the template was saved on a DIFFERENT map or cell
+  -- than the one the player is standing on now -- an imported save that has
+  -- since been played carries a stale map window, which is just as unbootable.
+  -- A template still on its own cell keeps its bytes untouched: they are the
   -- game's own, including live NPC positions, and preserving them is what
   -- makes import -> export byte-identical.
   local mapId = save.player and save.player.map
@@ -1146,10 +1153,11 @@ function GenSave.encode(save, data, template)
       -- map has no index at all rather than trusting a stale template
       local index = cw.mapsIndex[mapId]
       rebuild = index == nil or u8(src, O.curMap) ~= bit.band(index, 0xFF)
+        or u8(src, O.yCoord) ~= bit.band(py, 0xFF)
+        or u8(src, O.xCoord) ~= bit.band(px, 0xFF)
     end
     if rebuild then
-      local ctx, why = MapContext.build(data, mapId,
-        (save.player and save.player.x) or 0, (save.player and save.player.y) or 0)
+      local ctx, why = MapContext.build(data, mapId, px, py)
       -- home/overworld.asm:2016 (#1691)
       if not ctx then
         error(("this save cannot be exported: %s"):format(tostring(why)), 0)
@@ -1196,6 +1204,11 @@ function GenSave.encode(save, data, template)
   if data.gameVersion == "yellow" then
     local h = tonumber(save.pikachuHappiness) or 90
     setByte(buf, O.pikachuHappiness, math.max(0, math.min(255, math.floor(h))))
+    -- engine/movie/oak_speech/init_player_data.asm:17
+    local mood = tonumber(save.pikachuMood) or 0x80
+    setByte(buf, O.pikachuMood, math.max(0, math.min(255, math.floor(mood))))
+    local modifier = tonumber(save.pikachuEmotionModifier) or 0
+    setByte(buf, O.pikachuEmotionModifier, math.max(0, math.min(255, math.floor(modifier))))
   end
 
   local out = table.concat(buf)

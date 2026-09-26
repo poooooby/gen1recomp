@@ -70,7 +70,7 @@ end
 
 local function scriptStore(session, ctx)
   local Space = package.loaded["src.core.game3.scripting.space"]
-  return (Space and Space.store) or (ctx and ctx.session) or (session and session.store) or session or nil
+  return (Space and Space.store) or (ctx and ctx.session) or session or nil
 end
 
 function SizeRecord.getVar(session, ctx, varId)
@@ -193,15 +193,7 @@ function SizeRecord.getMonSizeRecordInfo(session, ctx, adapters, species, varId)
 
   SizeRecord.setStringVar(ctx, adapters, 3, SizeRecord.formatMonSizeRecord(size))
 
-  local speciesName = (species == SizeRecord.SPECIES_MAGIKARP and "MAGIKARP")
-    or (species == SizeRecord.SPECIES_HERACROSS and "HERACROSS")
-    or "POKéMON"
-  local okP, Pokemon = pcall(require, "src.core.game3.pokemon")
-  if okP and Pokemon and Pokemon.name then
-    local n = Pokemon.name(species)
-    if n and n ~= "" then speciesName = n end
-  end
-  SizeRecord.setStringVar(ctx, adapters, 1, speciesName)
+  SizeRecord.setStringVar(ctx, adapters, 1, require("src.core.game3.pokemon").name(species))
 end
 
 function SizeRecord.initMagikarpSizeRecord(session, ctx)

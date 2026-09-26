@@ -16,6 +16,7 @@ end
 local editorMode = os.getenv("POKEPORT_EDITOR") == "1" or POKEPORT_EDITOR_MODE == true
 
 local SwitchDiagnostics = require("src.debug.SwitchDiagnostics")
+local PadHints = require("src.core.PadHints")
 local LaunchOptions = require("src.core.LaunchOptions")
 local NxDisplay = require("src.core.NxDisplay")
 local PlatformHooks = require("src.core.PlatformHooks")
@@ -132,6 +133,7 @@ do
 end
 
 local Game, EditorApp, Importer, TouchEditor, Studio, Prelaunch
+local launcherSplash
 
 -- #887: quit-to-launcher state, shared by love.load and love.quit (both need
 -- it, so it is declared here rather than next to love.quit).
@@ -399,11 +401,14 @@ local function makeLauncher(launcherOpts)
     require("src.import.LauncherWindow").observe(0)
     require("src.import.LauncherWindow").flush()
     Importer = nil
+    local onBoot = launcherOpts and launcherOpts.onBoot
+    if onBoot and onBoot(version, cartId, opts) then return end
     bootGame(version, cartId, opts)
   end, {
     launcher = true,
     forceImport = forceImport,
     initialTab = launcherOpts and launcherOpts.initialTab or nil,
+    invite = launcherOpts and launcherOpts.invite or nil,
     onEditSave = openEditor,
     onEditTouchControls = openTouchControlsEditor,
     -- Skin Studio owns a touch-first layout as well as the desktop workspace.
@@ -457,7 +462,8 @@ local function returnToLauncher(opts)
     love.window.setTitle(Version.title("Gen 1 Recompilation Project"))
   end
 
-  Importer = makeLauncher({ initialTab = opts and opts.tab or nil })
+  Importer = makeLauncher({ initialTab = opts and opts.tab or nil,
+    invite = opts and opts.invite or nil })
   -- Finger that confirmed EXIT GAME is often still down over Import Save.
   if Importer.ignoreReturningPointer then
     Importer:ignoreReturningPointer()
@@ -569,8 +575,35 @@ local function showLauncher(version)
   end
 end
 
+local function wantsModUpdate(request)
+  if type(request) ~= "table" then return false end
+  if type(request.tasks) == "table" and request.tasks.mods ~= nil then
+    return request.tasks.mods == true
+  end
+  return request.updateMods == true
+end
+
+local function autoUpdateMods(request, tab)
+  if not wantsModUpdate(request) then return end
+  if Importer and Importer.autoUpdateAll then
+    Importer:autoUpdateAll(function() end, { tab = tab })
+  end
+end
+
+local deferredLaunchRequest
+
+local function launcherBusy()
+  return launcherSplash ~= nil or Importer ~= nil and (Importer._updateAll ~= nil
+    or Importer._modInstall ~= nil or Importer._cartInstall ~= nil
+    or Importer._autoUpdateAll ~= nil)
+end
+
 local function startLaunchRequest(request)
   if type(request) ~= "table" then return false end
+  if launcherBusy() then
+    deferredLaunchRequest = request
+    return true
+  end
 
   local version = request.game
   if request.launcher or not version then
@@ -579,6 +612,7 @@ local function startLaunchRequest(request)
     else
       showLauncher(version)
     end
+    autoUpdateMods(request, not version and "mods" or nil)
     return true
   end
 
@@ -594,6 +628,7 @@ local function startLaunchRequest(request)
     end)
     if not ok or type(cart) ~= "table" or cart.base ~= version then
       showLauncher(version)
+      autoUpdateMods(request)
       return true
     end
     cartId = request.cart
@@ -601,6 +636,7 @@ local function startLaunchRequest(request)
 
   if not RomImporter.isReady(version) then
     showLauncher(version)
+    autoUpdateMods(request)
     return true
   end
 
@@ -608,6 +644,23 @@ local function startLaunchRequest(request)
     if request.slot then LaunchOptions.selectSlot(version, request.slot) end
     launchedIntoGame = true
     bootGame(version, cartId)
+  end
+
+  local function bootAfterMods()
+    if not wantsModUpdate(request) then return bootShortcut() end
+    Importer = makeLauncher({ initialTab = "mods",
+      onBoot = function(v, c, opts)
+        if v ~= version or c ~= cartId or opts ~= nil then return false end
+        bootShortcut()
+        return true
+      end })
+    Importer:autoUpdateAll(function(result)
+      if not (result.ok or result.cancelled or result.skipped) then return end
+      require("src.import.LauncherWindow").observe(0)
+      require("src.import.LauncherWindow").flush()
+      Importer = nil
+      bootShortcut()
+    end)
   end
 
   Prelaunch = require("src.core.Prelaunch").new({
@@ -620,14 +673,18 @@ local function startLaunchRequest(request)
         showLauncher(version)
         return
       end
-      bootShortcut()
+      bootAfterMods()
     end,
   })
-  if not Prelaunch then bootShortcut() end
+  if not Prelaunch then bootAfterMods() end
   return true
 end
 
 function love.load(args)
+  if os.getenv("POKEPORT_BACKGROUND") == "1" and love.audio then
+    love.audio.setVolume(0)
+    love.audio.setVolume = function() end
+  end
   -- Before anything can shell out (update check, mod index, ROM picker),
   -- claim one hidden console on Windows so those children inherit it instead
   -- of each flashing their own cmd.exe window (#606).  No-op elsewhere.
@@ -784,6 +841,11 @@ function love.load(args)
   -- goes to its own service owner, src/core/Game2.lua -- docs/gold-phase1.md).
   -- Edit on a save row opens the bundled editor on that slot (openEditor).
   Importer = makeLauncher()
+  if not relaunched then
+    launcherSplash = require("src.import.LauncherSplash").new()
+    autoUpdateMods(resolvedLaunch,
+      not resolvedLaunch.game and "mods" or nil)
+  end
 end
 
 function love.update(dt)
@@ -792,12 +854,27 @@ function love.update(dt)
   SwitchDiagnostics.maybeFlush(false)
   -- NX only (no-op elsewhere): follow dock/undock without waiting for SDL.
   NxDisplay.sync()
+  if launcherSplash then
+    if launcherSplash:update(dt) then
+      launcherSplash:release()
+      launcherSplash = nil
+      if Importer and Importer.resumeAfterOverlay then Importer:resumeAfterOverlay() end
+    end
+    return
+  end
   if editorMode then return EditorApp.update(dt) end
   if TouchEditor then return TouchEditor.update(dt) end
   if Studio then return Studio.update(dt) end
   local launchURI = LaunchOptions.pollURI()
   if launchURI then love.handlers.intent_uri(launchURI) end
+  if deferredLaunchRequest and not launcherBusy() then
+    local request = deferredLaunchRequest
+    deferredLaunchRequest = nil
+    startLaunchRequest(request)
+  end
   if Prelaunch then return Prelaunch:update(dt) end
+  local connect = package.loaded["src.online.Connect"]
+  if connect then pcall(connect.update, dt) end
   local client = onlineClientModule()
   if client then pcall(client.update, dt) end
   if pendingLauncherReturn then
@@ -880,6 +957,7 @@ function love.draw()
     GameViewport.reset()
     HostDisplay.beginFrame("launcher", Importer)
     local result = Importer:draw()
+    if launcherSplash then launcherSplash:draw() end
     HostDisplay.endFrame("launcher", Importer)
     return result
   end
@@ -907,6 +985,7 @@ function love.draw()
 end
 
 function love.keypressed(key, scancode, isrepeat)
+  if launcherSplash then return end
   if editorMode then return EditorApp.keypressed(key) end
   if TouchEditor then return TouchEditor.keypressed(key) end
   if Studio then return Studio.keypressed(key) end
@@ -917,6 +996,7 @@ function love.keypressed(key, scancode, isrepeat)
 end
 
 function love.keyreleased(key)
+  if launcherSplash then return end
   if editorMode or TouchEditor or Studio then return end
   if Importer then return end
   if not Game then return end
@@ -924,7 +1004,9 @@ function love.keyreleased(key)
 end
 
 function love.gamepadpressed(joystick, button)
+  if launcherSplash then return end
   SwitchDiagnostics.onJoystickEvent("gamepadpressed", joystick, button)
+  if PadHints.windowMinimized() then return end
   if editorMode then
     if EditorApp and EditorApp.gamepadpressed then
       return EditorApp.gamepadpressed(joystick, button)
@@ -945,6 +1027,7 @@ function love.gamepadpressed(joystick, button)
 end
 
 function love.gamepadreleased(joystick, button)
+  if launcherSplash then return end
   SwitchDiagnostics.onJoystickEvent("gamepadreleased", joystick, button)
   if editorMode then
     if EditorApp and EditorApp.gamepadreleased then
@@ -965,7 +1048,9 @@ function love.gamepadreleased(joystick, button)
 end
 
 function love.gamepadaxis(joystick, axis, value)
+  if launcherSplash then return end
   SwitchDiagnostics.onJoystickEvent("gamepadaxis", joystick, axis, { value = value })
+  if PadHints.windowMinimized() then value = 0 end
   if editorMode then
     if EditorApp and EditorApp.gamepadaxis then
       return EditorApp.gamepadaxis(joystick, axis, value)
@@ -985,7 +1070,9 @@ function love.gamepadaxis(joystick, axis, value)
 end
 
 function love.joystickpressed(joystick, button)
+  if launcherSplash then return end
   SwitchDiagnostics.onJoystickEvent("joystickpressed", joystick, button)
+  if PadHints.windowMinimized() then return end
   if editorMode then
     if EditorApp and EditorApp.joystickpressed then
       return EditorApp.joystickpressed(joystick, button)
@@ -1005,6 +1092,7 @@ function love.joystickpressed(joystick, button)
 end
 
 function love.joystickreleased(joystick, button)
+  if launcherSplash then return end
   SwitchDiagnostics.onJoystickEvent("joystickreleased", joystick, button)
   if editorMode then
     if EditorApp and EditorApp.joystickreleased then
@@ -1025,7 +1113,9 @@ function love.joystickreleased(joystick, button)
 end
 
 function love.joystickaxis(joystick, axis, value)
+  if launcherSplash then return end
   SwitchDiagnostics.onJoystickEvent("joystickaxis", joystick, axis, { value = value })
+  if PadHints.windowMinimized() then value = 0 end
   if editorMode then
     if EditorApp and EditorApp.joystickaxis then
       return EditorApp.joystickaxis(joystick, axis, value)
@@ -1045,7 +1135,9 @@ function love.joystickaxis(joystick, axis, value)
 end
 
 function love.joystickhat(joystick, hat, direction)
+  if launcherSplash then return end
   SwitchDiagnostics.onJoystickEvent("joystickhat", joystick, hat, { direction = direction })
+  if PadHints.windowMinimized() then direction = "c" end
   if editorMode then
     if EditorApp and EditorApp.joystickhat then
       return EditorApp.joystickhat(joystick, hat, direction)
@@ -1084,6 +1176,7 @@ end
 -- direction's key-up can be delivered to the OS instead of the game while
 -- unfocused, so reset input on either transition rather than trust it.
 function love.focus(f)
+  SwitchDiagnostics.onFocus(f)
   if editorMode or TouchEditor then return end
   if Studio then
     if Studio.focus then Studio.focus(f) end
@@ -1161,6 +1254,7 @@ function love.handlers.intent_uri(uri)
 end
 
 function love.touchpressed(id, x, y, dx, dy, pressure)
+  if launcherSplash then return end
   if editorMode then
     -- iOS synthesizes mousepressed for the primary touch; forwarding here
     -- would double-fire.  Android / NX need the explicit touch → click path
@@ -1190,6 +1284,7 @@ function love.touchpressed(id, x, y, dx, dy, pressure)
 end
 
 function love.touchmoved(id, x, y, dx, dy, pressure)
+  if launcherSplash then return end
   if editorMode then return end
   if TouchEditor then
     if love.system.getOS() == "iOS" then return end
@@ -1204,6 +1299,7 @@ function love.touchmoved(id, x, y, dx, dy, pressure)
 end
 
 function love.touchreleased(id, x, y, dx, dy, pressure)
+  if launcherSplash then return end
   if editorMode then return end
   if TouchEditor then
     if love.system.getOS() == "iOS" then return end
@@ -1218,6 +1314,7 @@ function love.touchreleased(id, x, y, dx, dy, pressure)
 end
 
 function love.wheelmoved(x, y)
+  if launcherSplash then return end
   if editorMode then
     if EditorApp.wheelmoved then return EditorApp.wheelmoved(x, y) end
     return
@@ -1255,6 +1352,7 @@ if love.system and love.system.getOS() == "Linux"
 end
 
 function love.mousepressed(x, y, button, istouch)
+  if launcherSplash then return end
   if not istouch then eventMouseX, eventMouseY = x, y end
   if TouchEditor then
     -- Android primary touch already arrived via love.touchpressed; a second
@@ -1302,6 +1400,7 @@ function love.mousepressed(x, y, button, istouch)
 end
 
 function love.mousereleased(x, y, button, istouch)
+  if launcherSplash then return end
   if TouchEditor then
     if love.system.getOS() == "Android" then return end
     return TouchEditor.mousereleased(x, y, button)
@@ -1322,6 +1421,7 @@ function love.mousereleased(x, y, button, istouch)
 end
 
 function love.mousemoved(x, y, dx, dy, istouch)
+  if launcherSplash then return end
   if not istouch then eventMouseX, eventMouseY = x, y end
   if TouchEditor then
     if love.system.getOS() == "Android" then return end
@@ -1340,6 +1440,7 @@ function love.mousemoved(x, y, dx, dy, istouch)
 end
 
 function love.textinput(text)
+  if launcherSplash then return end
   if TouchEditor then return end
   if Studio then return Studio.textinput(text) end
   if Importer then return Importer:textinput(text) end
@@ -1355,6 +1456,7 @@ end
 local quitToLauncher = false
 
 function love.quit()
+  if launcherSplash then launcherSplash:release(); launcherSplash = nil end
   if Importer then
     require("src.import.LauncherWindow").observe(0)
     require("src.import.LauncherWindow").flush()
@@ -1418,6 +1520,7 @@ function love.quit()
 end
 
 function love.filedropped(file)
+  if launcherSplash then return end
   local filename = file and file.getFilename and file:getFilename()
   if LaunchOptions.isLaunchURI(filename) then
     local request = LaunchOptions.parseURI(filename)

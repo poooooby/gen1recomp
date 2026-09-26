@@ -2,6 +2,7 @@
 -- Built from mapDef.blocks + tileset.collision (Gen2 COLL_* quads baked from
 -- FRLG metatile attrs at extract). Does not call World:step / Player:tryMove.
 
+local Connections = require("src.core.game3.connections")
 local Collision = {}
 
 local DELTA = {
@@ -526,6 +527,7 @@ local ARRIVAL_FACING = {
 function Collision.arrivalFacing(destBeh, storedDir)
   local f = ARRIVAL_FACING[destBeh]
   if f then return f end
+  -- pokefirered/src/overworld.c:933
   if destBeh == MB_LADDER then return storedDir or "down" end
   return "down"
 end
@@ -581,8 +583,7 @@ function Collision.connectionLanding(destDef, conn, dir, fromCx, fromCy)
   else
     return nil
   end
-  x = math.max(0, math.min(destW - 1, x))
-  y = math.max(0, math.min(destH - 1, y))
+  if x < 0 or y < 0 or x >= destW or y >= destH then return nil end
   return x, y
 end
 
@@ -613,17 +614,17 @@ function Collision.tryConnection(game, fromX, fromY, dir, run)
 
   local mapDef = Collision._mapDef
   if not mapDef or type(mapDef.connections) ~= "table" then return false end
-  local conn = mapDef.connections[dir]
-    or mapDef.connections[DIR_CONN[dir] or ""]
-  if not conn then return false end
-  local destMap = conn.map or conn.mapId
-  if type(destMap) ~= "string" then return false end
-
   local data = game and game.data and game.data.maps
-  local destDef = data and data[destMap]
-  if not destDef then return false end
+  if not data then return false end
   local Map = require("src.core.game3.map")
-  if Map.ensureMidLayout then Map.ensureMidLayout(game, destMap, destDef) end
+  -- pokefirered/src/fieldmap.c:673
+  local conn, destDef = Connections.incoming(mapDef, DIR_CONN[dir], fromX, fromY, function(id)
+    local def = data[id]
+    if def and Map.ensureMidLayout then Map.ensureMidLayout(game, id, def) end
+    return def
+  end)
+  if not conn then return false end
+  local destMap = conn.map
 
   local lx, ly = Collision.connectionLanding(destDef, conn, dir, fromX, fromY)
   if not lx then return false end
@@ -685,6 +686,7 @@ function Collision.tryConnection(game, fromX, fromY, dir, run)
   Player.running = run and true or false
   Player.jumping = false
   Player.dismounting = Player.surfing and not landingWater or false
+  if Player.dismounting then require("src.core.game3.audio").stopSurfMusic() end
   Player.spriteYOffset = 0
   Player.stepFrames = run and RUN_FRAMES or WALK_FRAMES
   Player.syncSavePosition(g)
@@ -720,11 +722,31 @@ function Collision.isGrass(cx, cy)
 end
 
 -- pokefirered/src/event_object_movement.c:8346 IsElevationMismatchAt
-function Collision.elevationAt(cx, cy)
-  local layout = Collision._mapDef and Collision._mapDef.midLayout
-  if not (layout and layout.elevAt) then return nil end
+function Collision.elevationOn(mapDef, cx, cy)
+  local layout = mapDef and mapDef.midLayout
+  if not (layout and layout.elevAt) or cx == nil or cy == nil then return nil end
   if cx < 0 or cy < 0 or cx >= layout.width or cy >= layout.height then return nil end
   return layout:elevAt(cx, cy)
+end
+
+function Collision.elevationAt(cx, cy)
+  return Collision.elevationOn(Collision._mapDef, cx, cy)
+end
+
+-- pokefirered/src/event_object_movement.c:8346
+function Collision.elevationMismatchOn(mapDef, elevation, cx, cy)
+  if elevation == nil or elevation == 0 then return false end
+  local m = Collision.elevationOn(mapDef, cx, cy)
+  if m == nil or m == 0 or m == 15 then return false end
+  return m ~= elevation
+end
+
+-- pokefirered/src/event_object_movement.c:8400
+function Collision.nextElevation(mapDef, current, curX, curY, prevX, prevY)
+  local cur = Collision.elevationOn(mapDef, curX, curY)
+  local prev = Collision.elevationOn(mapDef, prevX, prevY)
+  if cur == nil or cur == 15 or prev == 15 then return current, nil end
+  return cur, (cur ~= 0) and cur or nil
 end
 
 -- pokefirered/src/field_player_avatar.c:597 CanStopSurfing
@@ -752,10 +774,10 @@ function Collision.isWater(cx, cy)
   return Collision.isWaterOn(Collision._mapDef, cx, cy, Collision.cell(cx, cy))
 end
 
-local function entityBlocks(game, tx, ty)
+local function entityBlocks(game, tx, ty, elevation)
   local okO, Objects = pcall(require, "src.core.game3.objects")
   if okO and Objects and Objects.hasMap and Objects.hasMap() then
-    if Objects.blocks(tx, ty) then return true end
+    if Objects.blocks(tx, ty, nil, elevation) then return true end
     return false
   end
   local world = hostWorld(game)
@@ -786,7 +808,7 @@ local function overrideBlocks(tx, ty)
 end
 
 --- Can the avatar enter cell (tx, ty) on foot?
--- Returns ok, reason ("bounds"|"tile"|"entity"|"water"|nil)
+-- Returns ok, reason ("bounds"|"tile"|"elevation"|"entity"|"water"|nil)
 function Collision.canEnter(game, tx, ty, opts)
   opts = opts or {}
   local surfing = opts.surfing
@@ -795,16 +817,26 @@ function Collision.canEnter(game, tx, ty, opts)
     surfing = P and P.surfing == true
   end
 
-  -- Prefer owned grid; fall back to host map if unbound.
-  if Collision._grid then
+  if Collision._grid and Collision._grid[1] ~= nil then
     if not Collision.inBounds(tx, ty) then return false, "bounds" end
     if overrideBlocks(tx, ty) then return false, "tile" end
     -- pokefirered/src/event_object_movement.c:4835 GetCollisionAtCoords
     if Collision.directionallyImpassable(opts.fromX, opts.fromY, tx, ty, opts.dir) then
       return false, "tile"
     end
-    if entityBlocks(game, tx, ty) then return false, "entity" end
+    -- pokefirered/src/event_object_movement.c:4839
+    local mismatch = Collision.elevationMismatchOn(Collision._mapDef, opts.elevation, tx, ty)
+    if mismatch and not surfing then return false, "elevation" end
     local isW = Collision.isWater(tx, ty)
+    local entElevation = opts.elevation
+    if mismatch then
+      if isW then return false, "elevation" end
+      if not Collision.isWalkable(tx, ty) then return false, "tile" end
+      -- pokefirered/src/field_player_avatar.c:597
+      if Collision.elevationAt(tx, ty) ~= 3 then return false, "elevation" end
+      entElevation = 3
+    end
+    if entityBlocks(game, tx, ty, entElevation) then return false, "entity" end
     if surfing then
       if isW then
         return true, nil
@@ -841,7 +873,7 @@ function Collision.ledgeLanding(game, fromX, fromY, dir)
   if not d then return nil end
   local destX, destY = fromX + d[1], fromY + d[2]
   local coll
-  if Collision._grid then
+  if Collision._grid and Collision._grid[1] ~= nil then
     if not Collision.inBounds(destX, destY) then return nil end
     coll = Collision.cell(destX, destY)
   else
@@ -855,8 +887,13 @@ function Collision.ledgeLanding(game, fromX, fromY, dir)
   local facings = P.ledgeFacings(coll)
   if not (facings and facings[dir]) then return nil end
   local tx, ty = fromX + d[1] * 2, fromY + d[2] * 2
-  local ok = Collision.canEnter(game, tx, ty, {})
-  if not ok then return nil end
+  -- pokefirered/src/field_player_avatar.c:613 ShouldJumpLedge
+  if Collision._grid and Collision._grid[1] ~= nil then
+    if not Collision.inBounds(tx, ty) then return nil end
+  else
+    local map = hostWorld(game) and hostWorld(game).map
+    if map and map.inBounds and not map:inBounds(tx, ty) then return nil end
+  end
   return tx, ty
 end
 

@@ -87,6 +87,15 @@ local function filesystem_cache()
   }
 end
 
+local function push_install()
+  Audio._cmdCh:push({
+    cmd = "install",
+    root = Audio._root,
+    prefix = require("src.core.WorkerFs").prefix(),
+    sampleRate = Mix.SAMPLE_RATE,
+  })
+end
+
 local function ensure_worker()
   if Audio._worker ~= nil then return Audio._worker end
   if not (love and love.thread and love.thread.newThread) then
@@ -101,20 +110,18 @@ local function ensure_worker()
   Audio._cmdCh = love.thread.getChannel("game3_m4a_cmd")
   Audio._outCh = love.thread.getChannel("game3_m4a_out")
   Audio._fanfareCh = love.thread.getChannel("game3_m4a_fanfare")
+  Audio._statusCh = love.thread.getChannel("game3_m4a_status")
   Audio._cmdCh:clear()
   Audio._outCh:clear()
   Audio._fanfareCh:clear()
+  Audio._statusCh:clear()
   local started = pcall(function() thread:start() end)
   if not started then
     Audio._worker = false
     return false
   end
   Audio._worker = thread
-  Audio._cmdCh:push({
-    cmd = "install",
-    root = Audio._root,
-    sampleRate = Mix.SAMPLE_RATE,
-  })
+  push_install()
   return true
 end
 
@@ -149,11 +156,7 @@ function Audio.install(cache, opts)
     Audio._fanfareRoot = Audio._root
   end
   if ensure_worker() then
-    Audio._cmdCh:push({
-      cmd = "install",
-      root = Audio._root,
-      sampleRate = Mix.SAMPLE_RATE,
-    })
+    push_install()
   end
   log("installed root=" .. Audio._root)
   return true
@@ -196,6 +199,9 @@ Audio.LEGENDARY_BATTLE_SONGS = {
   [144] = { "battleLegend", 341 }, -- SPECIES_ARTICUNO
   [145] = { "battleLegend", 341 }, -- SPECIES_ZAPDOS
   [146] = { "battleLegend", 341 }, -- SPECIES_MOLTRES
+  [243] = { "battleDeoxys", 339 }, -- SPECIES_RAIKOU
+  [244] = { "battleDeoxys", 339 }, -- SPECIES_ENTEI
+  [245] = { "battleDeoxys", 339 }, -- SPECIES_SUICUNE
   [249] = { "battleLegend", 341 }, -- SPECIES_LUGIA
   [250] = { "battleLegend", 341 }, -- SPECIES_HO_OH
 }
@@ -394,6 +400,13 @@ function Audio.playSong(id, opts)
     -- Sync fallback
     Audio._bgmLocal = { voices = {}, songId = id }
     Player.start(Audio._pack, Audio._cache, Audio._bgmLocal, id, { forceSeq = true })
+    local src = ensure_bgm_source()
+    if src then
+      pcall(function()
+        src:stop()
+        src:setVolume(bgm_gain())
+      end)
+    end
   end
   log(string.format("playsong id=%s", tostring(id)))
   return true
@@ -418,11 +431,103 @@ function Audio.setMapSong(id)
   Audio._mapSong = tonumber(id) or id
 end
 
+-- pokefirered/include/constants/songs.h:290
+Audio.MUS_CYCLING = 282
+-- pokefirered/include/constants/songs.h:313
+Audio.MUS_SURF = 305
+-- pokefirered/include/constants/region_map_sections.h:106
+local NO_RIDE_MUSIC_SECTIONS = { [97] = true, [123] = true, [132] = true }
+
+local function current_section()
+  local Map = package.loaded["src.core.game3.map"]
+  local def = Map and Map.currentDef and Map.currentDef()
+  return def and def.regionMapSectionId
+end
+
+-- pokefirered/src/overworld.c:1193
+function Audio.canOverrideMapMusic(song, sectionId)
+  if song == Audio.MUS_CYCLING or song == Audio.MUS_SURF then
+    if sectionId == nil then sectionId = current_section() end
+    return not NO_RIDE_MUSIC_SECTIONS[tonumber(sectionId) or -1]
+  end
+  return true
+end
+
+-- pokefirered/src/overworld.c:1014
+function Audio.specialMapSong(sectionId)
+  if Audio._savedSong then return Audio._savedSong end
+  local P = package.loaded["src.core.game3.player"]
+  if P and (P.surfing or P.surfHopping) and not P.dismounting
+      and Audio.canOverrideMapMusic(Audio.MUS_SURF, sectionId) then
+    return Audio.MUS_SURF
+  end
+  return Audio._mapSong
+end
+
 -- pokefirered/src/overworld.c:1039
 function Audio.restoreMapSong(opts)
-  local id = Audio._savedSong or Audio._mapSong
+  local id = Audio.specialMapSong()
   if id then return Audio.playSong(id, opts) end
   return true
+end
+
+-- pokefirered/src/sound.c:152
+function Audio.fadeOutAndPlay(id, speed)
+  id = tonumber(id) or id
+  if Audio._fanfareActive then
+    Audio._fanfareDeferred = id
+    return true
+  end
+  if not (Audio._currentSong and Audio._bgmSource) then
+    return Audio.playSong(id)
+  end
+  Audio.fadeOutBgm(speed)
+  if Audio._fadeOut then Audio._fadeOut.nextSong = id end
+  return true
+end
+
+-- pokefirered/src/overworld.c:1096
+function Audio.changeMusicTo(id)
+  id = tonumber(id) or id
+  local cur = Audio._currentSong and Audio._currentSong.id
+  local pending = Audio._fadeOut and Audio._fadeOut.nextSong
+  if (pending or cur) == id then return true end
+  return Audio.fadeOutAndPlay(id, 8)
+end
+
+-- pokefirered/src/overworld.c:1089
+function Audio.changeMusicToDefault()
+  if Audio._mapSong then return Audio.changeMusicTo(Audio._mapSong) end
+  return true
+end
+
+-- pokefirered/src/field_effect.c:2986
+function Audio.startSurfMusic()
+  Audio.setSavedSong(nil)
+  if Audio.canOverrideMapMusic(Audio.MUS_SURF) then Audio.changeMusicTo(Audio.MUS_SURF) end
+end
+
+-- pokefirered/src/field_player_avatar.c:1579
+function Audio.stopSurfMusic()
+  Audio.setSavedSong(nil)
+  Audio.changeMusicToDefault()
+end
+
+-- pokefirered/src/bike.c:314
+function Audio.bikeMusic(on, forced)
+  if on then
+    if forced or Audio.canOverrideMapMusic(Audio.MUS_CYCLING) then
+      Audio.setSavedSong(Audio.MUS_CYCLING)
+      Audio.changeMusicTo(Audio.MUS_CYCLING)
+    end
+    return
+  end
+  Audio.setSavedSong(nil)
+  local id = Audio.specialMapSong()
+  local pending = Audio._fadeOut and Audio._fadeOut.nextSong
+  if id and id ~= (pending or (Audio._currentSong and Audio._currentSong.id)) then
+    Audio.playSong(id)
+  end
 end
 
 -- pokefirered/src/overworld.c:1048
@@ -518,7 +623,12 @@ function Audio.resumeBgm()
   Audio._bgmPaused = false
   if Audio._cmdCh then Audio._cmdCh:push({ cmd = "resume" }) end
   if Audio._bgmSource then
-    pcall(function() Audio._bgmSource:setVolume(bgm_gain()) end)
+    pcall(function()
+      Audio._bgmSource:setVolume(bgm_gain())
+      if not Audio._bgmSource:isPlaying() then
+        Audio._bgmSource:play()
+      end
+    end)
   end
   Audio.pumpBgm()
 end
@@ -948,16 +1058,17 @@ end
 -- pokefirered/src/sound.c:333
 function Audio.playCry(species, mode, pan)
   species = tonumber(species) or species
-  local volume
+  local volume, noDuck
   if type(mode) == "table" then
     local o = mode
     mode = o.mode
     if pan == nil then pan = o.pan end
     volume = o.volume
+    noDuck = o.noDuck == true
   end
   mode = tonumber(mode) or 0
   local params = Sample.cryParams(mode, volume)
-  local doubles = params.mode == 1
+  local doubles = params.mode == 1 or noDuck
   Audio._cryParams = params
   log(string.format("playCry species=%s mode=%d", tostring(species), params.mode))
   if not Audio.isReady() then
@@ -1094,6 +1205,7 @@ function Audio.update(dt)
         Audio._currentSong = nil
       end
       Audio._fadeOut = nil
+      if stillSame and f.nextSong then Audio.playSong(f.nextSong) end
     end
   end
   if Audio._fadeIn and Audio._bgmSource then
@@ -1142,8 +1254,44 @@ function Audio.update(dt)
   end
 end
 
+local function check_worker_status()
+  local ch = Audio._statusCh
+  if not (ch and Audio._worker) then return end
+  local msg = ch:pop()
+  while msg do
+    if type(msg) == "table" and msg.installFailed and msg.root == Audio._root then
+      warn_once("worker", "bgm worker could not load pack at " .. tostring(msg.root)
+        .. ": " .. tostring(msg.err))
+      if Audio._cmdCh then Audio._cmdCh:push({ cmd = "quit" }) end
+      if Audio._outCh then Audio._outCh:clear() end
+      if Audio._fanfareCh then Audio._fanfareCh:clear() end
+      ch:clear()
+      Audio._worker = false
+      Audio._cmdCh = nil
+      Audio._outCh = nil
+      Audio._fanfareCh = nil
+      Audio._statusCh = nil
+      Audio._pendingBgm = nil
+      Audio._bgmQueuedAt = {}
+      local gen = Audio._bgmGen
+      if gen and Audio.isReady() then
+        Audio._bgmLocal = { voices = {}, songId = gen }
+        Player.start(Audio._pack, Audio._cache, Audio._bgmLocal, gen, { forceSeq = true })
+        ensure_bgm_source()
+      end
+      local p = Audio._fanfarePending
+      if p and Audio._fanfareActive and Audio.isReady() then
+        start_fanfare_source(p.id, p.player)
+      end
+      return
+    end
+    msg = ch:pop()
+  end
+end
+
 --- Drain worker → QueueableSource. Safe to call from focus/resume hooks.
 function Audio.pumpBgm()
+  check_worker_status()
   if Audio._suspended then return end
   if not (Audio._outCh and Audio._bgmSource) or Audio._bgmPaused then return end
   local src = Audio._bgmSource
@@ -1294,10 +1442,12 @@ function Audio.shutdown()
   if Audio._cmdCh then Audio._cmdCh:clear() end
   if Audio._outCh then Audio._outCh:clear() end
   if Audio._fanfareCh then Audio._fanfareCh:clear() end
+  if Audio._statusCh then Audio._statusCh:clear() end
   Audio._worker = nil
   Audio._cmdCh = nil
   Audio._outCh = nil
   Audio._fanfareCh = nil
+  Audio._statusCh = nil
 end
 
 pcall(function()

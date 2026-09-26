@@ -4,14 +4,20 @@
 
 local MapIds = require("src.core.game3.map_ids")
 local ModRuntime = require("src.mods.Runtime")
+local Connections = require("src.core.game3.connections")
 local Map = {}
 
 Map.current = nil
 Map._announced = nil
 Map.neighbors = {}
+Map.neighborList = {}
 Map._loadedLayouts = {}
 Map._def = nil
 Map._currentDef = nil
+-- pokefirered/include/overworld.h:46
+Map.MUSIC_DISABLE_OFF, Map.MUSIC_DISABLE_STOP, Map.MUSIC_DISABLE_KEEP = 0, 1, 2
+-- pokefirered/src/overworld.c:103
+Map.disableMusicChange = 0
 
 function Map.currentDef()
   return Map._def or Map._currentDef
@@ -28,33 +34,34 @@ end
 
 function Map.loadNeighborsDepth1(game, primaryDef)
   Map.neighbors = {}
+  Map.neighborList = {}
   if not primaryDef or type(primaryDef.connections) ~= "table" then
     return Map.neighbors
   end
   local data = game and game.data and game.data.maps
   if not data then return Map.neighbors end
-  for dir, conn in pairs(primaryDef.connections) do
-    local mid = type(conn) == "table" and conn.map or conn
-    if type(mid) == "string" and data[mid] then
+  -- pokefirered/src/fieldmap.c:129
+  for _, conn in ipairs(Connections.each(primaryDef)) do
+    local mid = conn.map
+    if data[mid] then
       local def = data[mid]
       Map.ensureMidLayout(game, mid, def)
-      Map.neighbors[dir] = {
+      local n = {
+        dir = conn.dir,
         map = mid,
         mapId = mid,
         def = def,
-        offset = type(conn) == "table" and (conn.offset or 0) or 0,
+        offset = conn.offset,
       }
+      Map.neighborList[#Map.neighborList + 1] = n
+      Map.neighbors[conn.dir] = Map.neighbors[conn.dir] or n
       Map._loadedLayouts[mid] = true
     end
   end
   return Map.neighbors
 end
 
-local function cell_size(def)
-  local L = def and def.midLayout
-  if L and L.width and L.height then return L.width or 0, L.height or 0 end
-  return (tonumber(def and def.width) or 0) * 2, (tonumber(def and def.height) or 0) * 2
-end
+local cell_size = Connections.sizeOf
 
 Map.world = {}
 Map._worldRoot = nil
@@ -82,21 +89,22 @@ function Map.computeWorld(maps, rootId, hops, reachW, reachH, ensure)
     local cur = queue[qi]
     qi = qi + 1
     local curW, curH = cell_size(cur.def)
-    for dir, conn in pairs(cur.def.connections or {}) do
-      local destId = type(conn) == "table" and conn.map or conn
-      local destDef = type(destId) == "string" and maps[destId] or nil
+    for _, conn in ipairs(Connections.each(cur.def)) do
+      local dir = conn.dir
+      local destId = conn.map
+      local destDef = maps[destId]
       if destDef and destDef ~= rootDef and not placed[destId] then
-        local offset = (type(conn) == "table" and tonumber(conn.offset) or 0) or 0
+        local offset = conn.offset
         ensure(destId, destDef)
         local destW, destH = cell_size(destDef)
         local ox, oy
-        if dir == "north" or dir == "up" then
+        if dir == "north" then
           ox, oy = offset, -destH
-        elseif dir == "south" or dir == "down" then
+        elseif dir == "south" then
           ox, oy = offset, curH
-        elseif dir == "west" or dir == "left" then
+        elseif dir == "west" then
           ox, oy = -destW, offset
-        elseif dir == "east" or dir == "right" then
+        elseif dir == "east" then
           ox, oy = curW, offset
         end
         if ox then
@@ -149,26 +157,10 @@ end
 
 function Map.overscanSlices()
   local slices = {}
-  for dir, n in pairs(Map.neighbors) do
-    slices[#slices + 1] = { dir = dir, mapId = n.map or n.mapId, offset = n.offset }
+  for _, n in ipairs(Map.neighborList or {}) do
+    slices[#slices + 1] = { dir = n.dir, mapId = n.map or n.mapId, offset = n.offset }
   end
   return slices
-end
-
-local function neighborFor(cardinal)
-  local n = Map.neighbors
-  if not n then return nil end
-  -- Dataset keys are north/south/west/east; some callers use up/down/left/right.
-  if cardinal == "north" or cardinal == "up" then
-    return n.north or n.up
-  elseif cardinal == "south" or cardinal == "down" then
-    return n.south or n.down
-  elseif cardinal == "west" or cardinal == "left" then
-    return n.west or n.left
-  elseif cardinal == "east" or cardinal == "right" then
-    return n.east or n.right
-  end
-  return n[cardinal]
 end
 
 --- Resolve a cell in current-map space, sampling connected neighbors when OOB
@@ -195,40 +187,44 @@ function Map.worldMidAt(cx, cy, primaryDef)
     return layout:midAt(cx, cy), primaryPair
   end
 
-  if cy < 0 then
-    local n = neighborFor("north")
-    if n then
-      local offset = tonumber(n.offset) or 0
-      local L = n.def and n.def.midLayout
-      local nh = L and L.height or 0
-      local mid, pair = fromNeighbor(n, cx - offset, nh + cy)
-      if mid ~= nil then return mid, pair end
-    end
-  elseif cy >= h then
-    local n = neighborFor("south")
-    if n then
-      local offset = tonumber(n.offset) or 0
-      local mid, pair = fromNeighbor(n, cx - offset, cy - h)
-      if mid ~= nil then return mid, pair end
+  local list = Map.neighborList or {}
+  local function fromDir(dir)
+    for i = #list, 1, -1 do
+      local n = list[i]
+      if n.dir == dir and n.def and n.def.midLayout then
+        local L = n.def.midLayout
+        local offset = tonumber(n.offset) or 0
+        local nx, ny
+        if dir == "north" then
+          nx, ny = cx - offset, (L.height or 0) + cy
+        elseif dir == "south" then
+          nx, ny = cx - offset, cy - h
+        elseif dir == "west" then
+          nx, ny = (L.width or 0) + cx, cy - offset
+        else
+          nx, ny = cx - w, cy - offset
+        end
+        local mid, pair = fromNeighbor(n, nx, ny)
+        if mid ~= nil then return mid, pair end
+      end
     end
   end
 
+  -- pokefirered/src/fieldmap.c:129
+  if cy < 0 then
+    local mid, pair = fromDir("north")
+    if mid ~= nil then return mid, pair end
+  elseif cy >= h then
+    local mid, pair = fromDir("south")
+    if mid ~= nil then return mid, pair end
+  end
+
   if cx < 0 then
-    local n = neighborFor("west")
-    if n then
-      local offset = tonumber(n.offset) or 0
-      local L = n.def and n.def.midLayout
-      local nw = L and L.width or 0
-      local mid, pair = fromNeighbor(n, nw + cx, cy - offset)
-      if mid ~= nil then return mid, pair end
-    end
+    local mid, pair = fromDir("west")
+    if mid ~= nil then return mid, pair end
   elseif cx >= w then
-    local n = neighborFor("east")
-    if n then
-      local offset = tonumber(n.offset) or 0
-      local mid, pair = fromNeighbor(n, cx - w, cy - offset)
-      if mid ~= nil then return mid, pair end
-    end
+    local mid, pair = fromDir("east")
+    if mid ~= nil then return mid, pair end
   end
 
   for _, entry in ipairs(Map.world) do
@@ -272,6 +268,20 @@ function Map.load(mod, game, mapId, opts)
     if okE and Encounters and Encounters.resetRateModifiers then
       Encounters.resetRateModifiers()
     end
+    local okR, Roamer = pcall(require, "src.core.game3.roamer")
+    if okR and Roamer and Roamer.move then
+      local okRt, Runtime = pcall(require, "src.core.game3.runtime")
+      local session = okRt and Runtime and Runtime.getSession and Runtime.getSession()
+      if session and session.roamer and session.roamer.active then
+        local fromMapId = Map._announced
+        if fromMapId ~= nil and fromMapId ~= mapId then
+          local moveReason = (opts.teleport or opts.fly or opts.whiteout) and "warp_random" or "map_transition"
+          Roamer.move(session, moveReason)
+        elseif opts.teleport or opts.fly or opts.whiteout then
+          Roamer.move(session, "warp_random")
+        end
+      end
+    end
   end
   local Ghosts = require("src.core.game3.ghosts")
   local fromMapId = Map._announced
@@ -284,6 +294,8 @@ function Map.load(mod, game, mapId, opts)
   Map._announced = mapId
   Map.current = mapId
   Map._loadedLayouts = { [mapId] = true }
+  -- overworld.c:792, overworld.c:759
+  Map._worldRoot = nil
 
   local def = host_map_def(game, mapId)
   if not def then
@@ -315,6 +327,7 @@ function Map.load(mod, game, mapId, opts)
     Map.loadNeighborsDepth1(game, def)
   else
     Map.neighbors = {}
+    Map.neighborList = {}
   end
 
   local world = host_world(game)
@@ -434,10 +447,19 @@ function Map.load(mod, game, mapId, opts)
     Objects.loadMap(game, mapId, def)
     Ghosts.adopt(mapId)
   end
-  -- pokefirered/src/overworld.c:806
-  if not opts.seamless then
-    require("src.core.game3.audio").setSavedSong(nil)
+  -- pokefirered/src/overworld.c:771 / :808 TryRegenerateRenewableHiddenItems
+  local okRen, Renewable = pcall(require, "src.core.game3.renewable_hidden_items")
+  if okRen and Renewable and Renewable.tryRegenerate then
+    Renewable.tryRegenerate(session, def and (def.group or (def.pair and def.pair[1])), def and (def.num or (def.pair and def.pair[2])), mapId)
   end
+  -- pokefirered/src/overworld.c:809 SetCurrentAndNextWeather
+  if def and def.weather ~= nil then
+    local Weather = require("src.core.game3.weather")
+    Weather.apply(def.weather)
+  end
+  -- pokefirered/src/overworld.c:769
+  -- pokefirered/src/overworld.c:806
+  require("src.core.game3.audio").setSavedSong(nil)
   if fromMapId == mapId then
     if opts.reason and ModRuntime.wants("map.reloaded") then
       ModRuntime.emit("map.reloaded", { mapId = mapId, reason = opts.reason or "reload" })
@@ -466,10 +488,31 @@ function Map.load(mod, game, mapId, opts)
     if not music and Audio._pack and Audio._pack.index and Audio._pack.index.mapSongs then
       music = Audio._pack.index.mapSongs[mapId]
     end
+    -- pokefirered/src/overworld.c:1063
+    if Map.disableMusicChange == Map.MUSIC_DISABLE_STOP then
+      Audio.playSong(0)
+      music = nil
+    elseif Map.disableMusicChange == Map.MUSIC_DISABLE_KEEP then
+      music = nil
+    end
     if music and music ~= 0xFFFF then
-      -- pokefirered/src/overworld.c:1039
-      local id = (not opts.seamless and Audio._savedSong) or music
-      Audio.playMapSong(id, { mapSong = music })
+      local id
+      if opts.seamless then
+        -- pokefirered/src/overworld.c:1075
+        local fromDef = fromMapId and host_map_def(game, fromMapId)
+        if Audio._currentSong and Audio._currentSong.id == Audio.MUS_SURF then
+          Audio.setMapSong(music)
+        elseif Audio.specialMapSong(fromDef and fromDef.regionMapSectionId) == Audio.MUS_SURF then
+          id = Audio.MUS_SURF
+        else
+          id = music
+        end
+      else
+        -- pokefirered/src/overworld.c:1039
+        id = Audio._savedSong or (Audio.specialMapSong(def and def.regionMapSectionId) == Audio.MUS_SURF
+          and Audio.MUS_SURF) or music
+      end
+      if id then Audio.playMapSong(id, { mapSong = music }) end
     end
   end
 

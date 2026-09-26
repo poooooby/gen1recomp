@@ -17,6 +17,7 @@
 local SaveConvert = require("src.save_convert.SaveConvert")
 local SaveData = require("src.core.SaveData")
 local GameVersion = require("src.core.GameVersion")
+local SaveSerializer = require("src.core.SaveSerializer")
 
 local SaveFileIO = {}
 
@@ -24,7 +25,13 @@ local SaveFileIO = {}
 -- rather than inside it: export needs the regions the codec does not model,
 -- and 32 KB of binary in the serialized table is 40 KB of Lua source reparsed
 -- on every save and load.
+local function valid_slot_id(id)
+  id = tostring(id)
+  return id:match("^slot%d+$") ~= nil or id == "save"
+end
+
 local function cartPath(version, slotId)
+  if not valid_slot_id(slotId) then return nil end
   return ("saves/%s/%s.cart"):format(version, tostring(slotId))
 end
 
@@ -40,15 +47,38 @@ local function writeCart(version, slotId, bytes)
     fs.createDirectory("saves")
     fs.createDirectory("saves/" .. version)
   end
-  fs.write(cartPath(version, slotId), bytes)
+  local rel = cartPath(version, slotId)
+  if not rel then return end
+  fs.write(rel, bytes)
 end
 
 local function readCart(version, slotId)
   local fs = cartFs()
   if not (fs and fs.read) then return nil end
-  local ok, bytes = pcall(fs.read, cartPath(version, slotId))
+  local rel = cartPath(version, slotId)
+  if not rel then return nil end
+  local ok, bytes = pcall(fs.read, rel)
   if ok and type(bytes) == "string" then return bytes end
   return nil
+end
+
+local function removeCart(version, slotId)
+  local fs = cartFs()
+  local rel = cartPath(version, slotId)
+  if not (fs and fs.remove and rel) then return false end
+  if fs.getInfo and not fs.getInfo(rel) then return false end
+  return pcall(fs.remove, rel) == true
+end
+
+function SaveFileIO.dropStaleCart(version, slotId, save)
+  if not (GameVersion.VERSIONS[version] and GameVersion.generation(version) == 3) or type(save) ~= "table" then
+    return false
+  end
+  local bytes = readCart(version, slotId)
+  if not bytes then return false end
+  local Gen3Save = require("src.save_convert.Gen3Save")
+  if Gen3Save.templateBelongs(Gen3Save.ownerOf(bytes), save) then return false end
+  return removeCart(version, slotId)
 end
 
 local SAVE_SIZE = SaveConvert.SAVE_SIZE
@@ -95,6 +125,72 @@ local function readSource(source)
   return nil, "could not read the save file: " .. tostring(openErr)
 end
 
+local LUA_SLOT_LIMITS = {
+  maxBytes = 16 * 1024 * 1024,
+  maxNodes = 262144,
+  maxTableEntries = 8192,
+  rootName = "save",
+}
+
+local function isLuaSlotExport(bytes)
+  return bytes:find("^%s*return[%s{]") ~= nil
+end
+
+local function gameName(version)
+  local info = GameVersion.VERSIONS[version]
+  return info and (info.displayName or info.label) or tostring(version)
+end
+
+local function importLuaSlot(bytes, version)
+  local save, parseErr = SaveSerializer.decode(bytes, LUA_SLOT_LIMITS)
+  if type(save) ~= "table" then
+    return false, "That .lua file is not a readable save (" .. tostring(parseErr) .. ")."
+  end
+  local saveVersion = save.version == nil and "red" or save.version
+  if type(saveVersion) ~= "string" or not GameVersion.VERSIONS[saveVersion] then
+    return false, "That save is for a game this launcher does not know."
+  end
+  local generation = save.generation == nil and 1 or save.generation
+  local engineOk = save.engine == nil or save.engine == GameVersion.engine(version)
+  if saveVersion ~= version or generation ~= GameVersion.generation(version)
+      or not engineOk then
+    return false, ("That save is for %s, not %s."):format(gameName(saveVersion), gameName(version))
+  end
+  if type(save.party) ~= "table" then
+    return false, "That .lua file is not a save exported from this launcher."
+  end
+  local slotId = SaveData.createSlot(version)
+  if not slotId then return false, "this game has no save slots to import into" end
+  local ok, writeErr = SaveData.writeSlot(version, slotId, save)
+  if not ok then
+    SaveData.deleteSlot(version, slotId)
+    return false, "could not write the imported save: " .. tostring(writeErr)
+  end
+  if not SaveData.readSlotSource(version, slotId) then
+    SaveData.deleteSlot(version, slotId)
+    return false, "the imported save did not read back; nothing was imported"
+  end
+  SaveData.setActiveSlot(version, slotId)
+  return true, slotId
+end
+
+local function importGen3Cart(bytes, version)
+  local save, convertErr, note = SaveConvert.importSav(bytes, version, version)
+  if not save then return false, convertErr end
+  save.version = version
+  save.meta = SaveData.buildMeta(nil, save.meta)
+  local slotId = SaveData.createSlot(version)
+  if not slotId then return false, "this game has no save slots to import into" end
+  local ok, writeErr = SaveData.writeSlot(version, slotId, save)
+  if not ok then
+    SaveData.deleteSlot(version, slotId)
+    return false, "could not write the imported save: " .. tostring(writeErr)
+  end
+  SaveData.setActiveSlot(version, slotId)
+  writeCart(version, slotId, bytes)
+  return true, slotId, note and { note = note } or nil
+end
+
 -- importToSlot(source, version, force) -> ok, slotIdOrErr | (false, nil, info)
 -- source: an absolute path, a LOVE DroppedFile, or raw bytes.  On success
 -- registers a new slot for the version, writes the imported save into it, makes
@@ -116,12 +212,16 @@ function SaveFileIO.importToSlot(source, version, force)
   -- pokered's checksum -- which is why a perfectly good Crystal save reported
   -- as corrupt (#1832).  mainChecksumValid now takes the game and asks that
   -- generation's rule.
+  if isLuaSlotExport(bytes) then return importLuaSlot(bytes, version) end
   local supported, unsupportedWhy = SaveConvert.importSupported(version)
   if not supported then return false, unsupportedWhy end
+  if GameVersion.VERSIONS[version] and GameVersion.generation(version) == 3 then
+    return importGen3Cart(bytes, version)
+  end
   if #bytes ~= SAVE_SIZE then
-    local check = SaveConvert.mainChecksumValid(bytes, version)
+    local check, checkWhy = SaveConvert.mainChecksumValid(bytes, version)
     if check == nil then
-      return false, ("A save file must be %d bytes (32 KB); this one is %d.")
+      return false, checkWhy or ("A save file must be %d bytes (32 KB); this one is %d.")
         :format(SAVE_SIZE, #bytes)
     end
     if check == false then
@@ -173,10 +273,12 @@ function SaveFileIO.exportActiveSlot(version)
   if not save then return false, "this game has no save to export yet" end
   local activeSlot = SaveData.activeSlot(version)
   local slotId = activeSlot or "save"
+  if not valid_slot_id(slotId) then return false, "invalid save slot id" end
   if activeSlot and type(save.meta) == "table" then
     local minted, id = pcall(SaveData.slotPlaythroughId, version, activeSlot, save)
     if minted and type(id) == "string" then save.meta.playthroughId = id end
   end
+  SaveFileIO.dropStaleCart(version, slotId, save)
   local bytes, exportErr = SaveConvert.exportSav(save, version,
                                                  readCart(version, slotId))
   if not bytes then return false, exportErr end

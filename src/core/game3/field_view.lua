@@ -241,11 +241,23 @@ local function playerSpriteName(game)
   return "SPRITE_CHRIS"
 end
 
+local PalettesMod, PalettesMissing
+local function palettes()
+  if PalettesMod then return PalettesMod end
+  local loaded = package.loaded["src.world.gen2.Palettes"]
+  if loaded then PalettesMod = loaded; return loaded end
+  if PalettesMissing then return nil end
+  local ok, m = pcall(require, "src.world.gen2.Palettes")
+  if ok and m then PalettesMod = m; return m end
+  PalettesMissing = true
+  return nil
+end
+
 local function daytimeFor(game, mapDef)
   local world = game and (game.overworld or game.world)
   if world and world.daytime then return world.daytime end
-  local ok, Palettes = pcall(require, "src.world.gen2.Palettes")
-  if ok and Palettes and Palettes.daytimeFor and world and world.hour then
+  local Palettes = palettes()
+  if Palettes and Palettes.daytimeFor and world and world.hour then
     local hour = type(world.hour) == "function" and world:hour() or 12
     return Palettes.daytimeFor(mapDef, hour, world.flashUsed)
   end
@@ -294,61 +306,6 @@ local function objectVisible(obj)
   return true
 end
 
---- Prefer live host entities (animated + already palette-baked). Returns true if drawn.
-local function drawWorldEntities(world, camX, camY)
-  local entities = world and world.entities
-  if type(entities) ~= "table" or #entities == 0 then return false end
-
-  local PlayerMod = package.loaded["src.core.game3.player"]
-  local list = {}
-  for _, e in ipairs(entities) do
-    local isPlayer = (world and world.player and e == world.player) or (e.isPlayer == true) or (e.id == "player")
-    if isPlayer then
-      if (PlayerMod and PlayerMod.isVisible and not PlayerMod.isVisible()) or (e.visible == false) or (e.hidden == true) then
-        -- Skip hidden player entity
-      elseif e and e.sprite then
-        list[#list + 1] = e
-      end
-    elseif e and e.sprite and (e.visible ~= false) and (e.hidden ~= true) then
-      list[#list + 1] = e
-    end
-  end
-  if #list == 0 then return false end
-
-  table.sort(list, function(a, b)
-    local ay = a.py or ((a.cellY or 0) * CELL)
-    local by = b.py or ((b.cellY or 0) * CELL)
-    if ay == by then
-      return tostring(a.id or "") < tostring(b.id or "")
-    end
-    return ay < by
-  end)
-
-  -- Ensure OBJ palettes are current (World normally does this; re-apply cheaply).
-  if world.applySpritePalette then
-    for _, e in ipairs(list) do
-      world:applySpritePalette(e)
-    end
-  end
-
-  love.graphics.setColor(1, 1, 1, 1)
-  for _, e in ipairs(list) do
-    local px = e.px or ((e.cellX or 0) * CELL)
-    local py = e.py or ((e.cellY or 0) * CELL)
-    local facing = e.facing or "down"
-    local phase = 0
-    if type(e.walkPhase) == "function" then
-      phase = e:walkPhase() or 0
-    end
-    local flip = e.stepFlip
-    if type(e.drawFlip) == "function" then
-      flip = e:drawFlip()
-    end
-    e.sprite:draw(px, py, camX, camY, facing, phase, flip)
-  end
-  return true
-end
-
 local function neighborActorDefs(mapId, def)
   local Space = package.loaded["src.core.game3.scripting.space"]
   local ev = Space and Space.bundle and Space.bundle.events
@@ -373,6 +330,7 @@ local function collectNeighborActors(actors, baseIndex, hostMapId, hostDef)
             kind = "npc",
             i = baseIndex,
             obj = eo.def,
+            eventObject = eo,
             ghost = entry.id,
             x = (eo.px or (eo.cellX or 0) * CELL) + entry.ox * CELL,
             y = (eo.py or (eo.cellY or 0) * CELL) + entry.oy * CELL,
@@ -388,23 +346,39 @@ local function collectNeighborActors(actors, baseIndex, hostMapId, hostDef)
         local defs = neighborActorDefs(entry.id, entry.def)
         local bounds = Objects and Objects.layoutBounds
           and Objects.layoutBounds(entry.def) or nil
+        local Space = package.loaded["src.core.game3.scripting.space"]
+        local nb = Space and Space.neighborObjectState
+          and Space.neighborObjectState(entry.id)
+          or { store = { flags = {}, vars = {} }, perm = {}, movementType = {} }
         if defs then
           for _, obj in ipairs(defs) do
-            local ox, oy = tonumber(obj.x) or 0, tonumber(obj.y) or 0
+            local lid = tonumber(obj.localId or obj.index) or 0
+            local p = nb.perm[lid]
+            local ox = p and p.x or tonumber(obj.x) or 0
+            local oy = p and p.y or tonumber(obj.y) or 0
             local out = bounds and (ox < 0 or oy < 0
               or ox >= bounds.w or oy >= bounds.h)
-            if objectVisible(obj) and not out then
+            -- src/event_object_movement.c:8014
+            if tonumber(obj.movementType) == 0x4C then out = true end
+            local gid = obj.graphicsId or obj.graphics
+            if Space and Space.resolveObjectGraphicsId then
+              gid = Space.resolveObjectGraphicsId(obj, nb)
+            end
+            if objectVisible(obj) and not out and gid then
+              local mt = nb.movementType[lid]
               baseIndex = baseIndex + 1
               actors[#actors + 1] = {
                 kind = "npc",
                 i = baseIndex,
                 obj = obj,
                 ghost = entry.id,
-                x = (entry.ox + (tonumber(obj.x) or 0)) * CELL,
-                y = (entry.oy + (tonumber(obj.y) or 0)) * CELL,
-                facing = facingFromObj(obj),
+                x = (entry.ox + ox) * CELL,
+                y = (entry.oy + oy) * CELL,
+                facing = (mt and GfxIds.initialFacing(mt))
+                  or (obj.movementType ~= nil and GfxIds.initialFacing(obj.movementType))
+                  or facingFromObj(obj),
                 sprite = spriteNameForObj(obj),
-                graphicsId = obj.graphicsId or obj.graphics,
+                graphicsId = gid,
               }
             end
           end
@@ -441,6 +415,8 @@ local function actorPriority(a)
     if PlayerMod and (PlayerMod.jumping or PlayerMod.surfHopping) then
       return 1
     end
+    -- pokefirered/src/field_effect.c:2413
+    if PlayerMod and PlayerMod.oamPriority then return PlayerMod.oamPriority end
     local WarpMod = package.loaded["src.core.game3.warp"]
     if WarpMod and WarpMod.isEscalatorActive and WarpMod.isEscalatorActive() then
       return 1
@@ -457,6 +433,44 @@ local function actorPriority(a)
   end
 end
 
+local function sortActors(a, b)
+  local ay = a.subpriority or a.sortY or a.y
+  local by = b.subpriority or b.sortY or b.y
+  if ay == by then return (a.i or 0) < (b.i or 0) end
+  return ay < by
+end
+
+-- event_object_movement.c:8379-8387, scrcmd.c:1130
+local function applyDrawOrder(actors, underActors, overActors)
+  underActors = underActors or {}
+  overActors = overActors or {}
+  for i = #underActors, 1, -1 do underActors[i] = nil end
+  for i = #overActors, 1, -1 do overActors[i] = nil end
+  for _, a in ipairs(actors) do
+    local obj = a.eventObject
+    if obj and obj.fixedPriority then
+      if obj.fixedClass == nil then obj.fixedClass = a.priority or actorPriority(a) end
+      a.priority = obj.fixedClass
+      a.subpriority = obj.subpriority
+    else
+      if obj then obj.fixedClass = nil end
+      a.priority = actorPriority(a)
+      a.subpriority = nil
+    end
+    if (a.priority or 2) < 2 then
+      overActors[#overActors + 1] = a
+    else
+      underActors[#underActors + 1] = a
+    end
+  end
+  table.sort(underActors, sortActors)
+  table.sort(overActors, sortActors)
+  return underActors, overActors
+end
+FieldView.applyDrawOrder = applyDrawOrder
+
+local owOpts = {}
+
 local function drawSingleActor(game, mapDef, a, camX, camY)
   local daytime = daytimeFor(game, mapDef)
   local okOw, OwSprites = pcall(require, "src.core.game3.ow_sprites")
@@ -464,12 +478,19 @@ local function drawSingleActor(game, mapDef, a, camX, camY)
   love.graphics.setColor(1, 1, 1, 1)
   local billboarded = pushBillboard(a.x, a.y, camX, camY)
   local drew = false
-  if useOw and a.graphicsId ~= nil then
-    local opts = {
-      bow = a.bow,
-      fieldMove = a.fieldMove,
-      frame = a.frame,
-    }
+  if a.renderer then
+    a.renderer:draw(a.x, a.y, camX, camY, a.facing, a.walkPhase or 0, false)
+    drew = true
+  end
+  if not drew and useOw and a.graphicsId ~= nil then
+    local opts = owOpts
+    opts.bow = a.bow
+    opts.fieldMove = a.fieldMove
+    opts.fieldMoveFrame = a.fieldMoveFrame
+    opts.fishing = a.fishing
+    opts.fishFrame = a.fishFrame
+    opts.frame = a.frame
+    opts.running = a.running
     drew = OwSprites.draw(
       a.graphicsId, a.x, a.y, camX, camY, a.facing, a.walkPhase, a.stepFlip, opts)
   end
@@ -492,11 +513,16 @@ local function drawSingleActor(game, mapDef, a, camX, camY)
   if billboarded then love.graphics.pop() end
 end
 
+local frameActors, frameUnder, frameOver = {}, {}, {}
+local npcActors = setmetatable({}, { __mode = "k" })
+local playerActor = {}
+
 local function collectGame3Actors(game, mapDef, camX, camY, px, py, facing, walkPhase, stepFlip, playerYOff, playerXOff)
   local okO, Objects = pcall(require, "src.core.game3.objects")
   local okOw, OwSprites = pcall(require, "src.core.game3.ow_sprites")
   local useOw = okOw and OwSprites and OwSprites.ready and OwSprites.ready()
-  local actors = {}
+  local actors = frameActors
+  for i = #actors, 1, -1 do actors[i] = nil end
   local hasObjects = okO and Objects and Objects.hasMap and Objects.hasMap()
 
   if hasObjects then
@@ -505,22 +531,27 @@ local function collectGame3Actors(game, mapDef, camX, camY, px, py, facing, walk
       if eo.moving and eo.targetY and eo.targetY > (eo.cellY or 0) then
         sortY = math.max(sortY, eo.targetY * CELL)
       end
-      actors[#actors + 1] = {
-        kind = "npc",
-        i = eo.localId,
-        obj = eo.def,
-        elevation = eo.elevation or (eo.def and eo.def.elevation) or 0,
-        x = (eo.px or (eo.cellX * CELL)) + (eo.raiseX or 0),
-        y = (eo.py or (eo.cellY * CELL)) + (eo.raiseY or 0),
-        sortY = sortY,
-        facing = eo.facing or "down",
-        walkPhase = Objects.walkPhase(eo),
-        stepFlip = eo.stepFlip and true or false,
-        bow = (eo.bowFrames and eo.bowFrames > 0) or eo.raiseHand == true,
-        frame = eo.customFrame,
-        sprite = eo.sprite or spriteNameForObj(eo.def or {}),
-        graphicsId = eo.graphicsId or (eo.def and (eo.def.graphicsId or eo.def.graphics)),
-      }
+      local a = npcActors[eo]
+      if not a then
+        a = { kind = "npc", eventObject = eo }
+        npcActors[eo] = a
+      end
+      a.i = eo.localId
+      a.obj = eo.def
+      a.elevation = eo.elevation or (eo.def and eo.def.elevation) or 0
+      a.x = (eo.px or (eo.cellX * CELL)) + (eo.raiseX or 0)
+      a.y = (eo.py or (eo.cellY * CELL)) + (eo.raiseY or 0)
+      a.sortY = sortY
+      a.facing = eo.facing or "down"
+      a.walkPhase = Objects.walkPhase(eo)
+      a.stepFlip = eo.stepFlip and true or false
+      a.bow = (eo.bowFrames and eo.bowFrames > 0) or eo.raiseHand == true
+      a.frame = eo.customFrame
+      a.sprite = eo.sprite or spriteNameForObj(eo.def or {})
+      a.graphicsId = eo.graphicsId or (eo.def and (eo.def.graphicsId or eo.def.graphics))
+      a.priority = nil
+      a.subpriority = nil
+      actors[#actors + 1] = a
     end
     collectNeighborActors(actors, 10000, currentMapId(game),
       resolveMapDef(game, currentMapId(game)))
@@ -576,47 +607,54 @@ local function collectGame3Actors(game, mapDef, camX, camY, px, py, facing, walk
     if PlayerMod and PlayerMod.moving and PlayerMod.targetY and PlayerMod.targetY > (PlayerMod.cellY or 0) then
       playerSortY = math.max(playerSortY, PlayerMod.targetY * CELL)
     end
-    actors[#actors + 1] = {
-      kind = "player",
-      elevation = PlayerMod and PlayerMod.elevation or 3,
-      x = px + (playerXOff or 0),
-      y = py + (playerYOff or 0),
-      sortY = playerSortY,
-      facing = facing or "down",
-      walkPhase = (walkPhase == 1 or walkPhase == true) and 1 or 0,
-      stepFlip = stepFlip and true or false,
-      fieldMove = (PlayerMod and PlayerMod.fieldMoveAnim and PlayerMod.fieldMoveAnim > 0),
-      sprite = playerSpriteName(game),
-      graphicsId = useOw and OwSprites.playerGraphicsId(game) or nil,
-    }
-  end
-
-  local underActors = {}
-  local overActors = {}
-  for _, a in ipairs(actors) do
-    a.priority = actorPriority(a)
-    if (a.priority or 2) < 2 then
-      overActors[#overActors + 1] = a
-    else
-      underActors[#underActors + 1] = a
+    local fieldMove = (PlayerMod and PlayerMod.fieldMoveAnim and PlayerMod.fieldMoveAnim > 0) or false
+    local fieldMoveFrame
+    if fieldMove and useOw and OwSprites.fieldMoveFrame then
+      fieldMoveFrame = OwSprites.fieldMoveFrame(
+        (PlayerMod.fieldMoveTotal or PlayerMod.fieldMoveAnim) - PlayerMod.fieldMoveAnim,
+        PlayerMod.fieldMoveKind)
     end
+    local FieldMod = package.loaded["src.core.game3.field"]
+    local fishFrame, fishX2, fishY2
+    if not fieldMove and FieldMod and FieldMod.fishingPose then
+      fishFrame, fishX2, fishY2 = FieldMod.fishingPose()
+    end
+    local a = playerActor
+    a.kind = "player"
+    a.elevation = PlayerMod and PlayerMod.elevation or 3
+    a.x = px + (playerXOff or 0) + (fishX2 or 0)
+    a.y = py + (playerYOff or 0) + (fishY2 or 0)
+    a.sortY = playerSortY
+    a.facing = facing or "down"
+    a.walkPhase = (walkPhase == 1 or walkPhase == true) and 1 or 0
+    a.stepFlip = stepFlip and true or false
+    a.fieldMove = fieldMove
+    a.fieldMoveFrame = fieldMoveFrame
+    a.fishing = fishFrame ~= nil
+    a.fishFrame = fishFrame
+    a.running = PlayerMod and PlayerMod.runPose and PlayerMod.runPose() or nil
+    a.sprite = playerSpriteName(game)
+    a.graphicsId = useOw and OwSprites.playerGraphicsId(game) or nil
+    a.priority = nil
+    a.subpriority = nil
+    actors[#actors + 1] = a
   end
 
-  local function sortActors(a, b)
-    local ay = a.sortY or a.y
-    local by = b.sortY or b.y
-    if ay == by then return (a.i or 0) < (b.i or 0) end
-    return ay < by
-  end
-  table.sort(underActors, sortActors)
-  table.sort(overActors, sortActors)
-
-  return underActors, overActors
+  local follower = require("src.world.game3.Follower").actor()
+  if follower then actors[#actors + 1] = follower end
+  return applyDrawOrder(actors, frameUnder, frameOver)
 end
 
 --- Collect visible tile draws grouped by palette slot for batched GbcPalette.with.
+local tile_draw_pool, tile_draw_count, tile_draw_slots = {}, 0, {}
+
 local function collectTileDraws(mapDef, camX, camY, canvasW, canvasH)
-  local bySlot = {} -- slot → { {quad, x, y}, ... }
+  local bySlot = tile_draw_slots
+  for slot, list in pairs(bySlot) do
+    for i = #list, 1, -1 do list[i] = nil end
+    bySlot[slot] = nil
+  end
+  tile_draw_count = 0
   local blocksTbl = FieldView._blockTiles
   local tilePals = FieldView._tilePalettes
   local bx0 = math.floor(camX / BLOCK) - 1
@@ -642,17 +680,29 @@ local function collectTileDraws(mapDef, camX, camY, canvasW, canvasH)
               list = {}
               bySlot[slot] = list
             end
-            list[#list + 1] = {
-              q = q,
-              x = originX + (i % 4) * 8,
-              y = originY + math.floor(i / 4) * 8,
-            }
+            local d = tile_draw_pool[tile_draw_count + 1]
+            if not d then
+              d = { q = false, x = 0, y = 0 }
+              tile_draw_pool[tile_draw_count + 1] = d
+            end
+            tile_draw_count = tile_draw_count + 1
+            d.q = q
+            d.x = originX + (i % 4) * 8
+            d.y = originY + math.floor(i / 4) * 8
+            list[#list + 1] = d
           end
         end
       end
     end
   end
   return bySlot
+end
+
+local palAtlas, palList
+local function draw_pal_list()
+  for _, d in ipairs(palList) do
+    love.graphics.draw(palAtlas, d.q, d.x, d.y)
+  end
 end
 
 local function drawTilesColored(atlas, bySlot, bgSet)
@@ -669,11 +719,8 @@ local function drawTilesColored(atlas, bySlot, bgSet)
     for slot, list in pairs(bySlot) do
       local colors = bgSet[slot] or bgSet[1]
       if colors then
-        GbcPalette.with(colors, function()
-          for _, d in ipairs(list) do
-            love.graphics.draw(atlas, d.q, d.x, d.y)
-          end
-        end)
+        palAtlas, palList = atlas, list
+        GbcPalette.with(colors, draw_pal_list)
       else
         for _, d in ipairs(list) do
           love.graphics.draw(atlas, d.q, d.x, d.y)
@@ -1049,6 +1096,14 @@ function FieldView.draw(game, canvasW, canvasH, opts)
   canvasH = canvasH or Display.H
   opts = opts or {}
 
+  local okSea, SeagallopUi = pcall(require, "src.ui.game3.seagallop")
+  if okSea and SeagallopUi and SeagallopUi.isActive and SeagallopUi.isActive() then
+    love.graphics.setColor(0, 0, 0, 1)
+    love.graphics.rectangle("fill", 0, 0, canvasW, canvasH)
+    love.graphics.setColor(1, 1, 1, 1)
+    return
+  end
+
   local mapId = currentMapId(game)
   local mapDef = resolveMapDef(game, mapId)
   if FieldView._flashMapId ~= mapId then
@@ -1183,9 +1238,18 @@ function FieldView.draw(game, canvasW, canvasH, opts)
     end
   end
 
+  -- S.S. Anne wake (pret oam.priority = 2, subpriority = 0xFF: under boat hull).
+  if not opts.actorsOnly then
+    local okSS, SSAnne = pcall(require, "src.core.game3.ss_anne_cutscene")
+    if okSS and SSAnne and SSAnne.drawWake then
+      SSAnne.drawWake(camX, camY)
+    end
+  end
+
   -- Collect Game3 actors partitioned by OAM priority.
   local underActors, overActors = nil, nil
-  if not opts.skipActors then
+  -- pokefirered/src/credits.c:717
+  if not (opts.skipActors or FieldView.hideActors) then
     underActors, overActors = collectGame3Actors(
       game, mapDef, camX, camY, px, py, facing, walkPhase, stepFlip, playerYOff, playerXOff)
   end
@@ -1237,6 +1301,14 @@ function FieldView.draw(game, canvasW, canvasH, opts)
       love.graphics.translate(screenOx, screenOy)
       FieldEffects.drawOverlay(camX, camY)
       love.graphics.pop()
+    end
+    local okSS, SSAnne = pcall(require, "src.core.game3.ss_anne_cutscene")
+    if okSS and SSAnne and SSAnne.drawSmoke then
+      SSAnne.drawSmoke(camX, camY)
+    end
+    local okW, FieldWeather = pcall(require, "src.core.game3.field_weather")
+    if okW and FieldWeather and FieldWeather.draw then
+      FieldWeather.draw(camX, camY, canvasW, canvasH)
     end
   end
 

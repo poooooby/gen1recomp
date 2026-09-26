@@ -21,7 +21,7 @@ function R.capture(game,session)
   end
   for _,o in ipairs(O.forDraw()) do
     local gid=Space and Space.resolveObjectGraphicsId and o.def and Space.resolveObjectGraphicsId(o.def)
-    f.actors[#f.actors+1]={id=o.localId,x=o.px or o.cellX*16,y=o.py or o.cellY*16,
+    f.actors[#f.actors+1]={id=o.localId or 1000+(tonumber(o.virtualId) or 0),x=o.px or o.cellX*16,y=o.py or o.cellY*16,
       graphicsId=gid or o.graphicsId or (o.def and (o.def.graphicsId or o.def.graphics)),
       facing=o.facing,walkPhase=O.walkPhase(o),stepFlip=o.stepFlip,frame=o.customFrame,bow=(o.bowFrames or 0)>0}
   end
@@ -91,12 +91,14 @@ function R.battle(session,st)
     local outcome=hp>=math.floor(max/3)*2 and 'Handily' or (hp>=math.floor(max/3) and 'Tenaciously' or 'Somehow')
     local args={D0=loc,D1=st.trainerName or 'TRAINER',D2=enemy,D3=player,D4={text=outcome}}
     local key='TookOnTrainersMonWithMonAndWon'
-    local class=st.trainerClassName or ''
-    if class=='LEADER' then key='TookOnGymLeadersMonWithMonAndWon'
-    elseif class=='ELITE FOUR' then
+    -- pokefirered/src/quest_log_battle.c:25 switches on the class id, which a
+    -- mod renaming the class leaves alone (include/constants/trainers.h:267-273)
+    local class=tonumber(st.trainerClass)
+    if class==84 then key='TookOnGymLeadersMonWithMonAndWon'
+    elseif class==87 then
       key='TookOnEliteFoursMonWithMonAndWon'
       args={D0=st.trainerName,D1=enemy,D2=player,D3={text=outcome}}
-    elseif class=='CHAMPION' then
+    elseif class==90 then
       key='PlayerBattledChampionRival';args={D0=session.name,D1=st.trainerName}
     end
     R.event(session,key,args)

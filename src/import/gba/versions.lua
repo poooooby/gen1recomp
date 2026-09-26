@@ -41,9 +41,11 @@ Versions.ROM_SIZE = 16777216
 -- v114: pokemon/icons/412.rgba, the SPECIES_EGG menu icon — eggs were drawn
 --       with the icon of the species they hatch into.
 -- v115: LeafGreen profiles, edition-specific title assets and Deoxys stats.
-Versions.CACHE_VERSION = 116
+-- v121: chrome/fonts/japanese_{normal,small}_* and japanese_widths.lua, the
+--       cart's Japanese fonts, for text a Japanese translation mod prints.
+Versions.CACHE_VERSION = 126
 Versions.NATIVE_VERSION = 6
-Versions.OW_VERSION = 2
+Versions.OW_VERSION = 3
 Versions.ANIM_VERSION = 1
 -- Audio pack (M4A banks / DirectSound samples / cries).
 Versions.AUDIO_VERSION = 6
@@ -76,11 +78,13 @@ Versions.OW_PLAYER_MALE_BIKE = 1
 Versions.OW_PLAYER_MALE_SURF = 2
 Versions.OW_PLAYER_MALE_FIELD_MOVE = 3
 Versions.OW_PLAYER_MALE_FISH = 4
+Versions.OW_PLAYER_MALE_VS_SEEKER_BIKE = 6
 Versions.OW_PLAYER_FEMALE = 7
 Versions.OW_PLAYER_FEMALE_BIKE = 8
 Versions.OW_PLAYER_FEMALE_SURF = 9
 Versions.OW_PLAYER_FEMALE_FIELD_MOVE = 10
 Versions.OW_PLAYER_FEMALE_FISH = 11
+Versions.OW_PLAYER_FEMALE_VS_SEEKER_BIKE = 13
 -- FireRed USA 1.0 font (menu cursor = SelectorArrow2 / charmap ▶ = 0xEF).
 Versions.FONT_LATIN_NORMAL = 0x1FF300       -- sFontNormalLatinGlyphs
 Versions.FONT_LATIN_WIDTHS = 0x207300       -- sFontNormalLatinGlyphWidths
@@ -137,6 +141,8 @@ Versions.SPECIES_TO_KANTO = 0x251EE0      -- sSpeciesToKantoPokedexNum (411 u16s
 Versions.DEX_CATEGORIES = 0x452C4C        -- gDexCategories (9 categories)
 Versions.EASY_CHAT_GROUPS = 0x3ECED4       -- sEasyChatGroups (22 entries × 8 bytes)
 Versions.EASY_CHAT_GROUP_COUNT = 22
+-- src/easy_chat.c:41
+Versions.EASY_CHAT_GROUP_NAMES = 0x3EDF98
 Versions.POKEDEX_ORDERS = {
   alphabetical = 0x443FF2,
   weight = 0x4442F6,
@@ -323,6 +329,21 @@ Versions.REGION_MAP_DUNGEON_ICON_GFX = 0x3F18D8
 Versions.REGION_MAP_FLY_ICON_GFX = 0x3F1908
 Versions.REGION_MAP_BG_SECONDARY_GFX = 0x3F1978
 Versions.REGION_MAP_BG_SECONDARY_TILEMAP = 0x3F19A0
+-- src/region_map.c:415-423, :527, :2257-2277, :3158-3171, :3359
+Versions.REGION_MAP_SWITCH_ALL_TILEMAP = 0x3F0F1C
+Versions.REGION_MAP_SWITCH_123_TILEMAP = 0x3F1084
+Versions.REGION_MAP_EDGE_SPRITES = {
+  top_left = 0x3F12CC,
+  top_right = 0x3F13EC,
+  mid_left = 0x3F1550,
+  mid_right = 0x3F1640,
+  bottom_left = 0x3F1738,
+  bottom_right = 0x3F1804,
+}
+Versions.REGION_MAP_SEVII_MAPSECS = 0x3F1AA4
+Versions.REGION_MAP_SECTION_TOP_LEFT = 0x3F1E60
+Versions.REGION_MAP_SECTION_DIMENSIONS = 0x3F2178
+Versions.REGION_MAP_LAYOUTS = { 0x3F2490, 0x3F2724, 0x3F29B8, 0x3F2C4C }
 
 -- pokefirered/src/heal_location.c:28
 Versions.S_HEAL_LOCATIONS = 0x3EEBF8
@@ -1407,6 +1428,21 @@ Versions.FIELD_EFFECTS = {
   deoxys_rock_fragments = {
     pic = 0x3CBDB0, pal = 0x3F6346, w = 8, h = 8, frames = 4,
   },
+  -- pokefirered/src/data/field_effects/field_effect_objects.h:288
+  ground_impact_dust = { pic = 0x399008, pal = 0x398FA8, w = 16, h = 8, frames = 3 },
+  -- pokefirered/src/itemfinder.c:40, src/event_object_movement.c:490
+  itemfinder_arrow_star = { pic = 0x4644D0, pal = 0x35B968, w = 16, h = 16, frames = 5 },
+  -- src/ss_anne.c:21, :156, include/event_object_movement.h:20
+  ss_anne_wake = { pic = 0x479838, pal = 0x395AE8, w = 16, h = 32, frames = 2 },
+  -- src/ss_anne.c:22, :190
+  ss_anne_smoke = { pic = 0x479A38, pal = 0x395AE8, w = 16, h = 16, frames = 4 },
+}
+
+Versions.FIELD_MOVE_STREAKS = {
+  -- pokefirered/src/field_effect.c:73
+  outdoors = { gfx = 0x3CB5F0, pal = 0x3CB7F0, tilemap = 0x3CB810, tiles = 16 },
+  -- pokefirered/src/field_effect.c:77
+  indoors = { gfx = 0x3CBA90, pal = 0x3CBB10, tilemap = 0x3CBB30, tiles = 4 },
 }
 
 -- Battle interface chrome (FireRed USA 1.0 file offsets; LZ unless noted).
@@ -1444,6 +1480,9 @@ Versions.BALL_OPEN = {
   particle_palettes = 0x40BFA8,   -- pokefirered/src/battle_anim_special.c:133
   fade_colors = 0x40C1C4,         -- pokefirered/src/battle_anim_special.c:345
   sine_table = 0x25E074,          -- pokefirered/src/trig.c:4
+  sprite_sheets = 0x26056C,       -- pokefirered/src/pokeball.c:59
+  sprite_palettes = 0x2605CC,     -- pokefirered/src/pokeball.c:75
+  open_ball_gfx = 0xD022E8,       -- pokefirered/src/data/graphics/interface_pokeballs.h:37
 }
 
 -- Battle field→battle transitions (FireRed USA 1.0; uncompressed INCBINs in
@@ -1470,6 +1509,13 @@ Versions.BATTLE_TRANSITION = {
 }
 
 Versions.MON_BACK_PIC_TABLE = 0x23654C -- gMonBackPicTable
+-- src/data/pokemon_graphics/shiny_palette_table.h:1
+Versions.MON_SHINY_PALETTE_TABLE = 0x2380CC
+-- src/pokemon.c:1350
+Versions.SPINDA_SPOT_GRAPHICS = 0x25265C
+-- include/constants/species.h:425-451
+Versions.SPECIES_UNOWN_B = 413
+Versions.SPECIES_UNOWN_QMARK = 439
 Versions.GHOST_PALETTE = 0xE93B14 -- pokefirered/src/graphics.c:1135
 Versions.GHOST_FRONT_PIC = 0xE93B38 -- pokefirered/src/graphics.c:1136
 
@@ -1492,6 +1538,14 @@ Versions.PARTY_MENU_BG_PAL = 0xE829C8       -- gPartyMenuBg_Pal
 Versions.PARTY_MENU_BG_TILEMAP = 0xE82AB0   -- gPartyMenuBg_Tilemap
 Versions.PARTY_MENU_BALL_GFX = 0xE82BE8     -- gPartyMenuPokeball_Gfx
 Versions.PARTY_MENU_BALL_PAL = 0xE82E7C     -- gPartyMenuPokeball_Pal
+Versions.PARTY_MENU_HOLD_ICONS_GFX = 0x45A3AC
+Versions.PARTY_MENU_HOLD_ICONS_PAL = 0x45A3EC
+-- src/data/party_menu.h:111
+Versions.PARTY_MENU_CONFIRM_BUTTON_TILEMAP = 0x459FC4
+Versions.PARTY_MENU_CANCEL_BUTTON_TILEMAP = 0x459FE0
+Versions.PARTY_MENU_SLOT_MAIN_TILEMAP = 0x45A180
+Versions.PARTY_MENU_SLOT_WIDE_TILEMAP = 0x45A20C
+Versions.PARTY_MENU_SLOT_WIDE_EMPTY_TILEMAP = 0x45A278
 
 -- Pokémon Summary Screen (LZ-compressed & raw; FireRed USA 1.0).
 Versions.SUMMARY_BG_GFX = 0xE9A460               -- gSummaryScreen_Gfx (LZ 4bpp, 16384 bytes)
@@ -1518,6 +1572,10 @@ Versions.SUMMARY_POKERUS_GFX = 0x463B20          -- sPokerus_Gfx (64 bytes)
 Versions.SUMMARY_POKERUS_PAL = 0x463B00          -- sPokerus_Pal (32 bytes)
 Versions.SUMMARY_HP_BAR_YELLOW_PAL = 0x463AAC    -- sHpBar_Yellow_Pal (32 bytes)
 Versions.SUMMARY_HP_BAR_RED_PAL = 0x463ACC       -- sHpBar_Red_Pal (32 bytes)
+Versions.SUMMARY_MARKING_PAL = 0x4636E0
+Versions.SUMMARY_TEXT_MOVES_PAL = 0x463700
+Versions.SUMMARY_MON_PIC_BOUNCE = 0x463FBE
+Versions.MON_MARKINGS_GFX = 0x3EE028
 Versions.MENU_INFO_GFX = 0xE95DDC                -- gMenuInfoElements_Gfx (4bpp 128x128, 8192 bytes)
 Versions.MENU_INFO_PAL = 0xE95D9C                -- gMenuInfoElements1_Pal + gMenuInfoElements2_Pal (64 bytes)
 
@@ -1538,6 +1596,9 @@ Versions.BAG_LIST_TILES_H = 12
 Versions.BAG_LIST_BLANK_TILE = 0x02D             -- src/item_menu.c:1163
 Versions.RED_ARROW_PAL = 0x463308               -- sRedArrowPal (raw 32 bytes)
 Versions.RED_ARROW_OTHER_GFX = 0x463328         -- sRedArrowOtherGfx (LZ 4bpp 16x32)
+Versions.ITEM_PC_TILES = 0xE85090
+Versions.ITEM_PC_BG_PALS = 0xE85408
+Versions.ITEM_PC_TILEMAP = 0xE85458
 
 -- TM Case (LZ-compressed & raw; FireRed USA 1.0).
 Versions.TM_CASE_BG_GFX = 0xE845D8               -- gTMCase_Gfx (LZ 4bpp, 2912 bytes)
@@ -1630,8 +1691,22 @@ Versions.TRADE_GBA_MAP_WIRELESS = 0x269A5C
 Versions.TRADE_GBA_MAP_CABLE = 0x26AA5C
 Versions.TRADE_GBA_GFX = 0xEAEA80
 Versions.TRADE_GBA_PAL2 = 0xEAEA20
+-- src/trade_scene.c:165
+Versions.TRADE_MON_SHADOW_MAP = 0x26601C
 -- src/trade_scene.c:398
 Versions.TRADE_GBA_SCREEN_ANIM = 0x26CED8
+-- src/trade.c:224
+Versions.TRADE_MOVES_BOX_MAP = 0x260834
+Versions.TRADE_PARTY_BOX_MAP = 0x260A32
+Versions.TRADE_STRIPES_BG2_MAP = 0x260C30
+Versions.TRADE_STRIPES_BG3_MAP = 0x261430
+-- src/graphics.c:1222
+Versions.TRADE_MENU_PAL = 0xE9CEDC
+Versions.TRADE_CURSOR_PAL = 0xE9CF3C
+Versions.TRADE_MENU_GFX = 0xE9CF5C
+Versions.TRADE_CURSOR_GFX = 0xE9E1DC
+Versions.TRADE_MENU_MAP = 0xE9E9FC
+Versions.TRADE_MENU_MON_BOX_MAP = 0xE9F1FC
 
 -- src/link_rfu_3.c:34
 Versions.WIRELESS_ICON_PAL = 0x43EEC0
@@ -1659,6 +1734,7 @@ Versions.FAME_BG_PAL = 0xE9F220
 Versions.FAME_BG_GFX = 0xE9F260
 Versions.FAME_BG3_TILEMAP = 0xEA0700
 Versions.FAME_BG2_TILEMAP = 0xEA0F00
+Versions.FAME_BG1_TILEMAP = 0x45C600
 Versions.FAME_QUESTION_GFX = 0x45CE00
 Versions.FAME_CURSOR_GFX = 0x45D100
 Versions.FAME_CURSOR_PAL = 0x45D500
@@ -1695,6 +1771,159 @@ Versions.WONDER_NEWS_GRAPHICS = 0x468720
 Versions.WONDER_BG_COUNT = 8
 Versions.WONDER_BG_TILE_OFFSET = 8
 
+-- src/menu_indicators.c:54
+Versions.SCROLL_ARROW_PAL = 0x463308
+Versions.SCROLL_ARROW_GFX = 0x463328
+Versions.SELECTOR_OUTLINE_GFX = 0x463398
+Versions.RED_ARROW_CURSOR_GFX = 0x4633D8
+Versions.SCROLL_INDICATOR_TEMPLATES = 0x46325C
+
+-- src/minigame_countdown.c:213, src/pokemon_jump.c:454, src/digit_obj_util.c:67
+Versions.MG_COUNTDOWN_PAL = 0x47A328
+Versions.MG_COUNTDOWN_GFX = 0x47A348
+Versions.MG_321START_PAL = 0x46AFE8
+Versions.MG_321START_GFX = 0x46B008
+Versions.MG_DIGITS_PAL = 0x479668
+Versions.MG_DIGITS_GFX = 0x479688
+
+-- src/mystery_gift_show_card.c:115, src/mystery_gift_menu.c:33
+Versions.WONDER_STAMP_SHADOW_PALS = 0x467DF4
+Versions.WONDER_STAMP_SHADOW_PAL_COUNT = 8
+Versions.WONDER_STAMP_SHADOW_GFX = 0x467EF4
+Versions.MYSTERY_GIFT_BORDER_PAL = 0x466D10
+Versions.MYSTERY_GIFT_BORDER_GFX = 0x466D30
+
+-- src/union_room_player_avatar.c:33
+Versions.UR_OBJ_GFX_IDS = 0x4570D8
+Versions.UR_PLAYER_COORDS = 0x4570EC
+Versions.UR_GROUP_OFFSETS = 0x45710C
+Versions.UR_OPPOSITE_FACING = 0x457116
+Versions.UR_MEMBER_FACING = 0x45711B
+
+-- src/graphics.c:1378, src/berry.c:870, src/berry_crush.c:428
+Versions.BC_CRUSHER_PAL = 0xEAFEA0
+Versions.BC_CRUSHER_GFX = 0xEAFFC0
+Versions.BC_TEXT_WINDOWS_MAP = 0xEB0ADC
+Versions.BC_CORE_PAL = 0x46E470
+Versions.BC_EFFECT_PAL = 0x46E490
+Versions.BC_TIMER_PAL = 0x46E4B0
+Versions.BC_CORE_GFX = 0x46E4D0
+Versions.BC_IMPACT_GFX = 0x46E7FC
+Versions.BC_SPARKLE_GFX = 0x46EB78
+Versions.BC_TIMER_GFX = 0x46ECC4
+Versions.BC_CRUSHER_TOP_MAP = 0x46ED90
+Versions.BC_CONTAINER_CAP_MAP = 0x46EEC0
+Versions.BC_BG_MAP = 0x46F058
+Versions.BC_BERRY_DATA = 0x3DFC9C
+Versions.BC_SYNC_PRESS_BONUS = 0x46E2E8
+Versions.BC_INTRO_OUTRO_VIBRATION = 0x46E2F0
+Versions.BC_VIBRATION = 0x46E314
+Versions.BC_SPARKLE_THRESHOLDS = 0x46E3B4
+Versions.BC_BIG_SPARKLE_THRESHOLDS = 0x46E3C4
+Versions.BC_RECEIVED_PLAYER_BITMASKS = 0x46E3C8
+Versions.BC_BG_TEMPLATES = 0x46E3CC
+Versions.BC_TEXT_COLORS = 0x46E3DC
+Versions.BC_WIN_RANKINGS = 0x46E3F0
+Versions.BC_WIN_PLAYER_NAMES = 0x46E3F8
+Versions.BC_WIN_RESULTS = 0x46E428
+Versions.BC_RESULTS_WINDOW_HEIGHTS = 0x46E448
+Versions.BC_PRESSING_SPEED_TABLE = 0x46E450
+Versions.BC_PLAYER_ID_TO_POS_ID = 0x46F280
+Versions.BC_PLAYER_COORDS = 0x46F294
+Versions.BC_IMPACT_COORDS = 0x46F2D0
+Versions.BC_SPARKLE_COORDS = 0x46F2D6
+Versions.BC_DIGIT_TEMPLATES = 0x46F488
+
+-- src/dodrio_berry_picking.c:487
+Versions.DBP_BG_PAL = 0x4758A8
+Versions.DBP_DODRIO_PAL = 0x4758E8
+Versions.DBP_DODRIO_SHINY_PAL = 0x475908
+Versions.DBP_STATUS_PAL = 0x475928
+Versions.DBP_BERRIES_PAL = 0x475948
+Versions.DBP_BERRIES_GFX = 0x475968
+Versions.DBP_CLOUD_PAL = 0x475B1C
+Versions.DBP_BG_GFX = 0x475B3C
+Versions.DBP_TREE_BORDER_GFX = 0x4763CC
+Versions.DBP_STATUS_GFX = 0x477198
+Versions.DBP_CLOUD_GFX = 0x47722C
+Versions.DBP_DODRIO_GFX = 0x477374
+Versions.DBP_BG_MAP = 0x478590
+Versions.DBP_TREE_RIGHT_MAP = 0x4787FC
+Versions.DBP_TREE_LEFT_MAP = 0x478A4C
+Versions.DBP_ACTIVE_COLUMN_MAP = 0x471F50
+Versions.DBP_HEAD_TO_COLUMN_MAP = 0x472063
+Versions.DBP_NEIGHBOR_MAP = 0x4720AE
+Versions.DBP_PLAYER_ID_AT_COLUMN = 0x4720FC
+Versions.DBP_UNSHARED_COLUMNS = 0x472133
+Versions.DBP_BERRY_FALL_DELAYS = 0x47553C
+Versions.DBP_TREE_BORDER_X = 0x475548
+Versions.DBP_DIFFICULTY_THRESHOLDS = 0x475550
+Versions.DBP_PRIZE_BERRY_IDS = 0x475558
+Versions.DBP_BERRY_SCORE_MULT = 0x4755D8
+Versions.DBP_WIN_RECORDS = 0x4755E0
+Versions.DBP_RECORD_MAX_DIGITS = 0x4755F8
+Versions.DBP_RECORD_TEXT_Y = 0x4755FC
+Versions.DBP_RECORD_NUM_Y = 0x475602
+Versions.DBP_BG_TEMPLATES = 0x47565C
+Versions.DBP_WIN_RESULTS = 0x475674
+Versions.DBP_WIN_PRIZE = 0x475684
+Versions.DBP_WIN_PLAY_AGAIN = 0x47568C
+Versions.DBP_WIN_DROPPED_OUT = 0x47569C
+Versions.DBP_WIN_COMM_STANDBY = 0x4756A4
+Versions.DBP_BERRY_ICON_X = 0x478DD4
+Versions.DBP_CLOUD_MOVE_DELAYS = 0x478E0C
+Versions.DBP_CLOUD_START = 0x478E0E
+Versions.DBP_TEXT_COLORS = 0x478E38
+Versions.DBP_NAME_WIN_1P = 0x478E44
+Versions.DBP_NAME_WIN_2P = 0x478E48
+Versions.DBP_NAME_WIN_3P = 0x478E50
+Versions.DBP_NAME_WIN_4P = 0x478E5C
+Versions.DBP_NAME_WIN_5P = 0x478E6C
+Versions.DBP_RESULTS_X = 0x478EA8
+Versions.DBP_RESULTS_Y = 0x478EB0
+Versions.DBP_RANKING_Y = 0x478EBA
+
+-- src/pokemon_jump.c:766
+Versions.PJ_INTERFACE_PAL = 0x46B794
+Versions.PJ_BG_PAL = 0x46B7B4
+Versions.PJ_BG_GFX = 0x46B7D4
+Versions.PJ_BG_MAP = 0x46BA00
+Versions.PJ_VENUSAUR_PAL = 0x46BBB0
+Versions.PJ_VENUSAUR_GFX = 0x46BBD0
+Versions.PJ_VENUSAUR_MAP = 0x46C520
+Versions.PJ_BONUSES_PAL = 0x46C8D8
+Versions.PJ_BONUSES_GFX = 0x46C8F8
+Versions.PJ_BONUSES_MAP = 0x46D3A8
+Versions.PJ_PAL1 = 0x46D9E4
+Versions.PJ_PAL2 = 0x46DA04
+Versions.PJ_VINE1_GFX = 0x46DA24
+Versions.PJ_VINE2_GFX = 0x46DB44
+Versions.PJ_VINE3_GFX = 0x46DD18
+Versions.PJ_VINE4_GFX = 0x46DE48
+Versions.PJ_STAR_GFX = 0x46DF44
+Versions.PJ_MONS = 0x46B4BC
+Versions.PJ_VINE_BASE_SPEEDS = 0x46B694
+Versions.PJ_VINE_SPEED_DELAYS = 0x46B6A4
+Versions.PJ_SOUND_EFFECTS = 0x46B6AC
+Versions.PJ_JUMP_OFFSETS = 0x46B6B4
+Versions.PJ_SCORE_BONUSES = 0x46B744
+Versions.PJ_PRIZE_ITEMS = 0x46B75C
+Versions.PJ_PRIZE_QUANTITY = 0x46B76C
+Versions.PJ_BG_TEMPLATES = 0x46D8D4
+Versions.PJ_WINDOW_TEMPLATES = 0x46D8E4
+Versions.PJ_VENUSAUR_STATES = 0x46D953
+Versions.PJ_NAME_WIN_2P = 0x46D970
+Versions.PJ_NAME_WIN_3P = 0x46D978
+Versions.PJ_NAME_WIN_4P = 0x46D984
+Versions.PJ_NAME_WIN_5P = 0x46D994
+Versions.PJ_MON_X_2P = 0x46D9B8
+Versions.PJ_MON_X_3P = 0x46D9BC
+Versions.PJ_MON_X_4P = 0x46D9C2
+Versions.PJ_MON_X_5P = 0x46D9CA
+Versions.PJ_VINE_Y = 0x46E100
+Versions.PJ_VINE_X = 0x46E150
+Versions.PJ_WIN_RECORDS = 0x46E2CC
+
 -- src/trainer_tower.c:105, :191, :204, :382; src/trainer_tower_sets.c:8951
 Versions.TRAINER_TOWER_HEADER = 0x4827AC
 Versions.TRAINER_TOWER_FLOORS = 0x4827B4
@@ -1712,6 +1941,10 @@ Versions.TT_ENCOUNTER_MUSIC_COUNT = 14
 Versions.FACILITY_CLASS_TO_PIC = 0x2538A8
 Versions.FACILITY_CLASS_TO_TRAINER_CLASS = 0x25393E
 Versions.FACILITY_CLASS_COUNT = 150
+
+-- data/battle_ai_scripts.s:17
+Versions.BATTLE_AI_SCRIPTS_TABLE = 0x1D9BF4
+Versions.BATTLE_AI_SCRIPT_COUNT = 32
 
 -- src/data/pokemon/tutor_learnsets.h:1, :22
 Versions.TUTOR_MOVES = 0x459B60
@@ -1739,6 +1972,176 @@ Versions.MOVE_RELEARNER_TILEMAP = 0xE97EC4
 Versions.BATTLE_RECORDS_GFX = 0x3F6388
 Versions.BATTLE_RECORDS_PAL = 0x3F6448
 Versions.BATTLE_RECORDS_TILEMAP = 0x3F6468
+
+-- data/event_scripts.s:77
+Versions.STD_SCRIPTS = 0x160450
+Versions.STD_SCRIPTS_COUNT = 10
+
+-- data/scripts/pc.inc:1, data/scripts/pokedex_rating.inc:35
+Versions.NAMED_SCRIPTS = {
+  EventScript_PC = 0x1A6955,
+  EventScript_PCDisabled = 0x1A698E,
+  EventScript_PCMainMenu = 0x1A6998,
+  EventScript_ChoosePCMenu = 0x1A69A8,
+  EventScript_AccessPlayersPC = 0x1A69F0,
+  EventScript_AccessPokemonStorage = 0x1A6A05,
+  EventScript_AccessSomeonesPC = 0x1A6A34,
+  EventScript_AccessBillsPC = 0x1A6A3D,
+  EventScript_TurnOffPC = 0x1A6A46,
+  EventScript_AccessHallOfFame = 0x1A6A56,
+  EventScript_AccessProfOaksPC = 0x1A6A7A,
+  EventScript_ExitOaksPC = 0x1A6AB2,
+  PokedexRating_EventScript_Rate = 0x1A73E0,
+  -- data/scripts/white_out.inc:1, :22
+  EventScript_AfterWhiteOutHeal = 0x1A8D97,
+  EventScript_AfterWhiteOutMomHeal = 0x1A8DD8,
+}
+
+do
+  local VersionsText = require("src.import.gba.versions_text")
+  Versions.NAMED_TEXTS = VersionsText.NAMED_TEXTS
+  Versions.NAMED_BATTLE_TEXTS = VersionsText.NAMED_BATTLE_TEXTS
+  Versions.TEXT_TABLES = VersionsText.TEXT_TABLES
+  -- include/constants/battle_string_ids.h:4
+  Versions.BATTLE_STRING_IDS = VersionsText.BATTLE_STRING_IDS
+end
+
+-- src/trade_scene.c:57, src/data/ingame_trades.h:1, :184
+Versions.INGAME_TRADES = 0x26CF8C
+Versions.INGAME_TRADE_COUNT = 9
+Versions.INGAME_TRADE_SIZE = 60
+Versions.INGAME_TRADE_MAIL = 0x26D1A8
+Versions.INGAME_TRADE_MAIL_COUNT = 1
+
+-- src/pokemon.c:1666, :6197, :6206
+Versions.UNION_ROOM_FACILITY_CLASSES = 0x25E032
+Versions.UNION_ROOM_CLASS_COUNT = 16
+Versions.FACILITY_CLASS_TO_TRAINER_CLASS = 0x25393E
+Versions.FACILITY_CLASS_TO_PIC_INDEX = 0x2538A8
+
+-- src/fldeff_flash.c:157-162
+Versions.CAVE_TRANSITION = {
+  white_pal = 0x3F5804,
+  black_pal = 0x3F5824,
+  pal = 0x3F5844,
+  tilemap = 0x3F5864,
+  tiles = 0x3F5A44,
+}
+
+-- src/script_menu.c:574
+Versions.STD_STRING_PTRS = 0x3E06B8
+Versions.STD_STRING_COUNT = 29
+
+-- src/field_specials.c:2081, :2096, :2108, :2122
+Versions.LEAGUE_LIGHTING = {
+  e4_pals = 0x3F5F50,
+  e4_pal_count = 12,
+  e4_timers = 0x3F61F0,
+  e4_steps = 11,
+  champ_pals = 0x3F60D0,
+  champ_pal_count = 9,
+  champ_timers = 0x3F61FB,
+  champ_steps = 8,
+}
+
+-- src/hall_of_fame.c:143, :148, :288, :289
+Versions.HALL_OF_FAME = {
+  pal = 0x40C39C,
+  gfx = 0x40C3BC,
+  confetti_sheet = 0xD2D5FC,
+  confetti_pal = 0xD2D71C,
+  confetti_frames = 17,
+}
+
+-- src/diploma.c:42
+Versions.DIPLOMA = {
+  gfx = 0x4147C0,
+  tilemap = 0x4154E8,
+  pal = 0x415954,
+}
+
+-- src/credits.c:341, :383, :456, :479, :649, :665, src/graphics.c:1329, :1368, src/strings.c:1063
+Versions.CREDITS = {
+  script = 0x410CF4,
+  script_max = 0x42,
+  texts = 0x4145BC,
+  text_count = 43,
+  scenes = 0x414588,
+  scene_count = 13,
+  sprite_params = 0x41431C,
+  sprite_param_count = 5,
+  staff_firered = 0x41D198,
+  staff_leafgreen = 0x41D1B8,
+  copyright_pal = 0xEAE528,
+  copyright_tiles = 0xEAE548,
+  copyright_map = 0xEAE900,
+  the_end_pal = 0x410B00,
+  the_end_tiles = 0x410B20,
+  the_end_map = 0x410B94,
+  pokeball_pals = 0xEAAB18,
+  pokeball_tiles = 0xEAAB98,
+  pokeball_map = 0xEAB30C,
+  circle_pal = 0x40C630,
+  circle_tiles = 0x40C650,
+  circle_map = 0x40CA54,
+  player_male_pal = 0x410E10,
+  player_male_tiles = 0x410E30,
+  player_female_pal = 0x411BF8,
+  player_female_tiles = 0x411C18,
+  rival_pal = 0x4129A0,
+  rival_tiles = 0x4129C0,
+  ground_grass_pal = 0x413318,
+  ground_grass_tiles = 0x413338,
+  ground_dirt_pal = 0x413854,
+  ground_dirt_tiles = 0x413874,
+  ground_city_pal = 0x413D98,
+  ground_city_tiles = 0x413DB8,
+  charizard_1 = 0x40CB8C,
+  charizard_2 = 0x40D228,
+  venusaur_1 = 0x40E158,
+  venusaur_2 = 0x40E904,
+  blastoise_1 = 0x40F240,
+  blastoise_2 = 0x40F944,
+  pikachu_1 = 0x410198,
+  pikachu_2 = 0x4105B4,
+  windows_charizard = 0x40C5B0,
+  windows_venusaur = 0x40C5D0,
+  windows_blastoise = 0x40C5F0,
+  windows_pikachu = 0x40C610,
+}
+
+Versions.DYNAMIC_METATILES = {
+  -- src/field_tasks.c:225, :241
+  { metatiles = 0x2BB51C, mids = { 0x35A, 0x35B } },
+  -- src/field_specials.c:776
+  { metatiles = 0x2C0E04, mids = { 0x2E8, 0x2E9, 0x2EA, 0x2F0, 0x2F1, 0x2F2, 0x2F8, 0x2F9, 0x2FA } },
+  -- src/field_specials.c:2312
+  { metatiles = 0x2CF3F0, mids = { 0x358 } },
+  -- src/special_field_anim.c:257
+  { metatiles = 0x2C0968, mids = { 0x285, 0x28A, 0x296, 0x2B4, 0x2B5, 0x2B6, 0x2B7, 0x2B8, 0x2B9, 0x2BA } },
+  -- src/fldeff_cut.c:36
+  { metatiles = 0x29F6C8, mids = { 0x001, 0x013, 0x00E, 0x00F } },
+  { metatiles = 0x2A65F4, mids = { 0x33E } },
+  { metatiles = 0x2A78B4, mids = { 0x310, 0x311, 0x312 } },
+  { metatiles = 0x2B90B4, mids = { 0x281 } },
+}
+
+-- src/data/pokemon/item_effects.h:338, src/item_use.c:409
+Versions.ITEM_EFFECT_TABLE = 0x2528BC
+Versions.ITEM_EFFECT_FIRST = 13
+Versions.ITEM_EFFECT_LAST = 175
+Versions.FIELD_USE_FUNCS = {
+  medicine = 0x0A16E0,
+  ether = 0x0A16FC,
+  pp_up = 0x0A1718,
+  rare_candy = 0x0A1734,
+  evo_item = 0x0A1750,
+  sacred_ash = 0x0A176C,
+  repel = 0x0A1998,
+  escape_rope = 0x0A1BAC,
+  -- src/item_use.c:582
+  black_white_flute = 0x0A1A94,
+}
 
 -- Title screen + Oak speech graphics (FireRed USA 1.0 file offsets).
 -- Verified by matching pret .gbapal bytes + LZ sizes in local dump.
@@ -2484,5 +2887,7 @@ function Versions.select(identity)
   end
   edition = game
 end
+
+Versions.game = require("src.import.gba.versions_game").game
 
 return Versions

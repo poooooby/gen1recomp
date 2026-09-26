@@ -164,11 +164,7 @@ end
 -- pokefirered/src/trainer_tower.c:631
 local function convertSpeech(words)
   if type(words) ~= "table" then return "" end
-  local okE, EasyChatData = pcall(require, "src.core.game3.easy_chat_data")
-  if not (okE and EasyChatData and EasyChatData.formatPhrase) then return "" end
-  local ok, text = pcall(EasyChatData.formatPhrase, words, 3, 2)
-  if ok and type(text) == "string" then return text end
-  return ""
+  return require("src.core.game3.easy_chat_text").phrase(words, 3, 2)
 end
 
 local function natives()
@@ -465,8 +461,9 @@ FUNCS[Tower.FUNC.ENCOUNTER_MUSIC] = function(ctx)
   local lut = pack and pack.encounterMusic
   local song = row and row.facilityClass and type(lut) == "table" and lut[row.facilityClass]
   local okA, Audio = pcall(require, "src.core.game3.audio")
-  if okA and Audio and Audio.playMapSong then
-    pcall(Audio.playMapSong, tonumber(song) or Tower.MUS_ENCOUNTER_BOY)
+  if okA and Audio and Audio.playSong then
+    -- pokefirered/src/sound.c:129 PlayNewMapMusic
+    pcall(Audio.playSong, tonumber(song) or Tower.MUS_ENCOUNTER_BOY)
   end
   return false
 end
@@ -570,9 +567,10 @@ TowerNatives.HANDLERS = {
     -- pokefirered/src/battle_records.c:136
     local kind = (varGet(ctx, VAR_0x8004) ~= 0) and "tower" or "link"
     local Screen = recordsScreen()
+    -- src/battle_records.c:83, cable_club.inc:566-575
     if not Screen then
       takeScreenForPartyMenu()()
-      return false
+      return natives().yieldHost(ctx, adapters, function(done) done() end)
     end
     return natives().yieldHost(ctx, adapters, function(done)
       Screen.show({ session = session, kind = kind, onDone = done })
@@ -605,6 +603,9 @@ TowerNatives.HANDLERS = {
     return runBattle(ctx, adapters, foe, {
       trainerId = 0,
       eReader = which == SPECIAL_BATTLE.EREADER,
+      -- src/battle_tower.c:895-933
+      battleTower = which == SPECIAL_BATTLE.BATTLE_TOWER,
+      secretBase = which == SPECIAL_BATTLE.SECRET_BASE,
       -- pokefirered/src/battle_message.c:2072 CopyEReaderTrainerName5
       trainerName = foe.trainerName,
       trainerPicId = foe.trainerPicId,

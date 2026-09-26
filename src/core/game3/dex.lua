@@ -113,6 +113,39 @@ function Dex.setCaught(dex, species)
   bit_set(dex.owned, sp, true)
 end
 
+local SPECIES_UNOWN = 201
+local SPECIES_SPINDA = 308
+
+local function record_personality(dex, species, personality)
+  local p = (tonumber(personality) or 0) % 4294967296
+  if species == SPECIES_UNOWN then dex.unownPersonality = p end
+  if species == SPECIES_SPINDA then dex.spindaPersonality = p end
+end
+
+-- pokefirered/src/pokemon.c:6233
+function Dex.handleSetPokedexFlag(dex, species, caught, personality)
+  if not dex then return end
+  local sp = resolve_species_id(species)
+  if not sp then return end
+  if caught then
+    if Dex.isCaught(dex, sp) then return end
+    Dex.setCaught(dex, sp)
+  else
+    if Dex.isSeen(dex, sp) then return end
+    Dex.setSeen(dex, sp)
+  end
+  record_personality(dex, sp, personality)
+end
+
+-- pokefirered/src/pokedex_screen.c:2197
+function Dex.defaultPersonality(dex, species)
+  species = tonumber(species)
+  if not dex then return 0 end
+  if species == SPECIES_SPINDA then return tonumber(dex.spindaPersonality) or 0 end
+  if species == SPECIES_UNOWN then return tonumber(dex.unownPersonality) or 0 end
+  return 0
+end
+
 function Dex.isSeen(dex, species)
   if not dex then return false end
   return bit_get(dex.seen, species)
@@ -143,7 +176,7 @@ function Dex.registerEncounter(dex, species, session)
 end
 
 --- Register a capture; returns whether it was already caught.
-function Dex.registerCapture(dex, species, session)
+function Dex.registerCapture(dex, species, session, personality)
   if not dex or not species then return false end
   local sp = tonumber(species) or 1
   if sp > (Dex.KANTO_MAX or 151) then
@@ -154,6 +187,8 @@ function Dex.registerCapture(dex, species, session)
   end
   local wasCaught = Dex.isCaught(dex, species)
   Dex.setCaught(dex, species)
+  -- pokefirered/src/battle_script_commands.c:9657
+  if not wasCaught then record_personality(dex, resolve_species_id(species), personality) end
   return wasCaught
 end
 
@@ -205,6 +240,65 @@ end
 
 function Dex.countOwned(dex, mode)
   return Dex.countCaught(dex, mode)
+end
+
+local function keyed(t, id)
+  if type(t) ~= "table" then return nil end
+  local v = t[id]
+  if v == nil then v = t[tostring(id)] end
+  if v == nil then v = t[string.format("0x%X", id)] end
+  return v
+end
+
+-- pokefirered/src/event_data.c:107
+function Dex.nationalEnabled(save)
+  if type(save) ~= "table" then return false end
+  local dex = type(save.dex) == "table" and save.dex or {}
+  if dex.national == true or dex.nationalUnlocked == true or dex.isNationalUnlocked == true
+      or save.national_dex_unlocked == true then
+    return true
+  end
+  local flag = keyed(save.flags, 0x840)
+  if flag == true or (type(save.flags) == "table" and save.flags.FLAG_SYS_NATIONAL_DEX == true) then
+    return true
+  end
+  local var = keyed(save.vars, 0x404E)
+  if var == nil and type(save.vars) == "table" then var = save.vars.VAR_NATIONAL_DEX end
+  return tonumber(var) == 0x6258
+end
+
+-- pokefirered/src/main_menu.c:643
+function Dex.summaryCount(save)
+  if type(save) ~= "table" then return 0 end
+  local dex = type(save.dex) == "table" and save.dex
+    or type(save.pokedex) == "table" and save.pokedex or {}
+  local national = Dex.nationalEnabled(save)
+  local counted, n = {}, 0
+  for _, key in ipairs({ "caught", "owned" }) do
+    for sp, on in pairs(type(dex[key]) == "table" and dex[key] or {}) do
+      local id = tonumber(sp)
+      if not id and type(sp) == "string" then
+        local ok, res = pcall(resolve_species_id, sp)
+        id = ok and tonumber(res) or nil
+      end
+      if id and on and on ~= 0 and not counted[id]
+          and id >= 1 and (national or id <= Dex.KANTO_MAX) then
+        counted[id] = true
+        n = n + 1
+      end
+    end
+  end
+  local ci = type(save.modData) == "table" and type(save.modData.cartImport) == "table"
+    and save.modData.cartImport
+  local maxNat = national and Dex.NATIONAL_MAX or Dex.KANTO_MAX
+  for _, nat in ipairs(ci and type(ci.dexOwned) == "table" and ci.dexOwned or {}) do
+    nat = tonumber(nat)
+    if nat and nat >= 1 and nat <= maxNat and not (nat <= Dex.HOST_MAX and counted[nat]) then
+      if nat <= Dex.HOST_MAX then counted[nat] = true end
+      n = n + 1
+    end
+  end
+  return n
 end
 
 --- Split for returnToHost: hostUpdates (1–251) + national sidecar (252+).

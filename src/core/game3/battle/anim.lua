@@ -244,7 +244,9 @@ function Anim.reset(opts)
   Anim._stageTasks = {}
   Anim._headless = opts.headless and true or false
   Anim._hpTweening = false
+  Anim._hpTweenTask = nil
   Anim._expTweening = false
+  Anim._expTweenTask = nil
   Anim._introTweening = 0
   Anim._seqBusy = false
   Anim._statusQueue = {}
@@ -285,6 +287,12 @@ function Anim.ballOpen(key, x, y)
   return BallOpen.start(id, x, y, b and b.mon and b.mon.pokeball)
 end
 
+-- pokefirered/src/pokeball.c:373
+function Anim.ballIdOf(key)
+  local b = AnimCoords.battler(nil, Anim.idOf(key) or 1)
+  return BallOpen.ballIdForItem(b and b.mon and b.mon.pokeball)
+end
+
 local function play_se(name, pan)
   pcall(function()
     local SE = require("src.core.game3.se_ids")
@@ -310,7 +318,8 @@ function Anim.sendOutMon(key, opts)
   local base = Anim.coords(nil, id) or Anim.ENEMY_MON
   local stage = Anim.stage()
   stage.balls = stage.balls or {}
-  local ball = { visible = true, frame = 0, rot = 0, side = side, battler = id, x = 0, y = 0 }
+  local ball = { visible = true, frame = 0, rot = 0, side = side, battler = id, x = 0, y = 0,
+    ballId = Anim.ballIdOf(id) }
   stage.balls[id] = ball
   local pan = (side == "player") and -64 or 63
   local function reveal()
@@ -337,7 +346,8 @@ function Anim.sendOutMon(key, opts)
   end
   if side == "player" then
     -- pokefirered/src/pokeball.c:912
-    local sx, sy = 48, 70
+    local Battle = package.loaded["src.core.game3.battle"]
+    local sx, sy = require("src.core.game3.battle.pokedude").sendOutOrigin(Battle and Battle._st)
     local tx, ty = base.x, base.y + 24
     ball.x, ball.y = sx, sy
     play_se("SE_BALL_THROW", pan)
@@ -526,9 +536,13 @@ function Anim.tweenHp(side, fromHp, toHp, maxHp, opts)
   end, function()
     Anim._stageTasks[t.id] = nil
     p.displayHp = toHp
-    Anim._hpTweening = false
+    if Anim._hpTweenTask == t.id then
+      Anim._hpTweening = false
+      Anim._hpTweenTask = nil
+    end
     if opts.onComplete then opts.onComplete() end
   end)
+  Anim._hpTweenTask = t.id
   Anim._stageTasks[t.id] = true
 end
 
@@ -572,9 +586,13 @@ function Anim.tweenExp(side, fromRatio, toRatio, opts)
   end, function()
     Anim._stageTasks[task.id] = nil
     p.displayExp = toRatio
-    Anim._expTweening = false
+    if Anim._expTweenTask == task.id then
+      Anim._expTweening = false
+      Anim._expTweenTask = nil
+    end
     if opts.onComplete then opts.onComplete() end
   end)
+  Anim._expTweenTask = task.id
   Anim._stageTasks[task.id] = true
 end
 

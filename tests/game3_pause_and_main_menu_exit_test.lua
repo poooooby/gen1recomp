@@ -2,6 +2,15 @@
 -- Run: luajit tests/game3_pause_and_main_menu_exit_test.lua
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
+local ROM_TEXT = { ["sStartMenuActionTable[3]"] = "{PLAYER}" }
+local function romTextKey(n, i, j) return j and (n .. "[" .. i .. "][" .. j .. "]") or (n .. "[" .. i .. "]") end
+local function romTextPlain(key, ctx) return ((ROM_TEXT[key] or key):gsub("{PLAYER}", ctx and ctx.playerName or "")) end
+package.loaded["src.core.game3.rom_text"] = {
+  plain = romTextPlain, box = romTextPlain, ascii = romTextPlain, has = function() return true end,
+  key = romTextKey, at = function(n, i, j, ctx) return romTextPlain(romTextKey(n, i, j), ctx) end,
+  count = function() return 0 end, list = function() return {} end,
+  lazy = function(map) return setmetatable({}, { __index = function(_, k) return map[k] end }) end,
+}
 
 local T = require("tests.harness")
 local check, eq = T.check, T.eq
@@ -97,10 +106,11 @@ do
   local stateWithContinue = Boot.new()
   Boot.setHasContinue(stateWithContinue, true)
   local items1 = Boot.menuItems(stateWithContinue)
-  eq(#items1, 3, "Main menu has 3 items when continue save exists")
+  eq(#items1, 4, "Main menu has 4 items when continue save exists")
   eq(items1[1], "CONTINUE", "Item 1 is CONTINUE")
   eq(items1[2], "NEW GAME", "Item 2 is NEW GAME")
-  eq(items1[3], "EXIT", "Item 3 is EXIT")
+  eq(items1[3], "MYSTERY GIFT", "Item 3 is MYSTERY GIFT")
+  eq(items1[4], "EXIT", "Item 4 is EXIT")
 
   local stateNoContinue = Boot.new()
   Boot.setHasContinue(stateNoContinue, false)
@@ -115,7 +125,7 @@ do
   local state = Boot.new()
   Boot.setHasContinue(state, true)
   state.phase = Boot.PHASE.MENU
-  state.menuIndex = 3 -- EXIT
+  state.menuIndex = 4 -- EXIT
   state.fadeT, state.fadeTarget = 0, 0
 
   local pressedKey = nil
@@ -174,11 +184,23 @@ do
     badges = 4,
     gender = 0,
   }
-  for idx = 1, 3 do
+  local ListMenu = require("src.ui.game3.list_menu")
+  local realArrow = ListMenu.drawArrow
+  local arrows = {}
+  ListMenu.drawArrow = function(dir) arrows[#arrows + 1] = dir end
+  for idx = 1, 4 do
     stateWith.menuIndex = idx
+    stateWith.menuScroll = idx == 4 and 4 or nil
+    arrows = {}
     local ok, err = pcall(Boot.draw, stateWith)
     check(ok, "drawMainMenu with continue at index " .. idx .. " runs without error: " .. tostring(err))
+    if idx == 4 then
+      eq(#arrows, 0, "no down arrow once EXIT is scrolled into view")
+    else
+      eq(arrows[1], "down", "down arrow flags EXIT below the fold at index " .. idx)
+    end
   end
+  ListMenu.drawArrow = realArrow
 
   local stateWithout = Boot.new()
   Boot.setHasContinue(stateWithout, false)

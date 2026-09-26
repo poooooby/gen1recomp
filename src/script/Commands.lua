@@ -492,10 +492,12 @@ function Commands.face(ctx, dir)
 end
 
 -- face an arbitrary map object (by object_event index)
-function Commands.face_object(ctx, objIndex, dir)
+function Commands.face_object(ctx, objIndex, dir, opts)
   local npc = stampSpriteIndex(ctx,
     ctx.overworld and ctx.overworld:npcByIndex(objIndex))
   if npc then npc.facing = dir end
+  -- pokeyellow engine/overworld/movement.asm:349
+  if npc and opts and opts.hold then npc.timer = opts.hold end
 end
 
 -- Instantly relocate an NPC (OaksLabCalcRivalMovementScript / SetSpritePosition1).
@@ -634,7 +636,7 @@ function Commands.hide_object(ctx, mapId, objName)
 end
 
 function Commands.play_sound(ctx, soundId)
-  require("src.core.Sound").play(ctx.game.data, soundId)
+  ctx.lastSfxSrc = require("src.core.Sound").play(ctx.game.data, soundId)
 end
 
 -- wait_sound: WaitForSoundToFinish (home/delay.asm:15), the drain that
@@ -644,12 +646,20 @@ local WAIT_SOUND_CEILING = 600
 
 function Commands.wait_sound(ctx)
   local Sound = require("src.core.Sound")
-  if not Sound.sfxBusy() then return end
+  local src = ctx.lastSfxSrc
+  ctx.lastSfxSrc = nil
+  local function busy()
+    if Sound.sfxBusy() then return true end
+    if not src then return false end
+    local ok, playing = pcall(function() return src:isPlaying() end)
+    return ok and playing and true or false
+  end
+  if not busy() then return end
   local runner = ctx.runner
   local left = WAIT_SOUND_CEILING
   runner.waitingCheck = function()
     left = left - 1
-    return left <= 0 or not Sound.sfxBusy()
+    return left <= 0 or not busy()
   end
   runner:yield()
 end
@@ -1201,12 +1211,17 @@ function Commands.walk_npc(ctx, objIndex, dirs, opts)
   claimMove(ctx, entity)
   local runner = ctx.runner
   local wait = not (opts and opts.wait == false)
+  -- pokeyellow engine/overworld/movement.asm:932
+  local fast = opts and opts.stepFrames and entity ~= ow.player
+  local prevStep = entity.stepFrames
+  if fast then entity.stepFrames = opts.stepFrames end
   local yielded, finished = false, false
   local i = 0
   local function step()
     i = i + 1
     if not dirs[i] then
       finished = true
+      if fast then entity.stepFrames = prevStep end
       if wait and yielded then runner:resume() end
       return
     end

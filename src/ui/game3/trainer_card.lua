@@ -2,7 +2,7 @@
 
 local Stack = require("src.ui.game3.stack")
 local FrlgFont = require("src.ui.game3.frlg_font")
-local Strings = require("src.core.Strings")
+local RomText = require("src.core.game3.rom_text")
 
 local TrainerCard = {}
 
@@ -209,11 +209,27 @@ local function screen_image(stars, female)
   return img
 end
 
+-- pokefirered/include/constants/flags.h:1364-1371
 local BADGE_FLAGS = { 0x820, 0x821, 0x822, 0x823, 0x824, 0x825, 0x826, 0x827 }
 local BADGE_NAMES = { "BOULDER", "CASCADE", "THUNDER", "RAINBOW", "SOUL", "MARSH", "VOLCANO", "EARTH" }
+do
+  local okP, Profile = pcall(require, "src.core.game3.profile")
+  if okP and Profile and Profile.active then
+    local okA, row = pcall(Profile.active)
+    local badges = okA and type(row) == "table" and row.badges
+    if type(badges) == "table" and type(badges.flagBase) == "number"
+        and type(badges.names) == "table" and badges.count == #badges.names then
+      local flags = {}
+      for i = 1, badges.count do flags[i] = badges.flagBase + i - 1 end
+      BADGE_FLAGS, BADGE_NAMES = flags, badges.names
+    end
+  end
+end
 
 local FLAG_SYS_POKEDEX_GET = 0x829
 local FLAG_SYS_NATIONAL_DEX = 0x840
+-- src/trainer_card.c:899
+local VAR_TRAINER_CARD_MON_ICON_TINT_IDX = 0x4042
 local VAR_TRAINER_CARD_MON_ICON_1 = 0x4043
 local VAR_HOF_BRAG_STATE = 0x4049
 local VAR_EGG_BRAG_STATE = 0x404A
@@ -323,7 +339,11 @@ local function get_var(session, varId)
     end
     if type(store.vars) == "table" then return tonumber(store.vars[varId]) or 0 end
   end
-  if session and type(session.vars) == "table" then return tonumber(session.vars[varId]) or 0 end
+  if session and type(session.vars) == "table" then
+    local v = session.vars[varId]
+    if v == nil then v = session.vars[tostring(varId)] end
+    return tonumber(v) or 0
+  end
   return 0
 end
 
@@ -358,7 +378,7 @@ end
 
 local function caught_mons_count(session, national)
   local dex = session and session.dex
-  if not dex then return tonumber(session and session.caughtMonsCount) or 0 end
+  if not dex then return 0 end
   local okD, Dex = pcall(require, "src.core.game3.dex")
   if okD and Dex and Dex.countCaught then
     local ok, n = pcall(Dex.countCaught, dex, national and "national" or "kanto")
@@ -369,6 +389,17 @@ local function caught_mons_count(session, national)
     if on then n = n + 1 end
   end
   return n
+end
+
+local function capped_stat(session, id, key, cap)
+  local stats = session.gameStats
+  local v
+  if type(stats) == "table" then
+    v = stats[id] or stats[key]
+  else
+    v = session[key]
+  end
+  return math.min(cap, math.max(0, math.floor(tonumber(v) or 0)))
 end
 
 -- src/trainer_card.c:858 TrainerCard_GenerateCardForLinkPlayer
@@ -398,14 +429,13 @@ local function gather(session)
   c.caughtMonsCount = caught_mons_count(session, national)
 
   c.money = math.max(0, math.floor(tonumber(session.money) or 0))
-  c.linkBattleWins = math.min(9999, math.max(0, math.floor(tonumber(session.linkBattleWins) or 0)))
-  c.linkBattleLosses = math.min(9999, math.max(0, math.floor(tonumber(session.linkBattleLosses) or 0)))
-  c.pokemonTrades = math.min(65535, math.max(0, math.floor(
-    tonumber(session.pokemonTrades or session.trades) or 0)))
-  c.berryCrushPoints = math.min(65535, math.max(0, math.floor(
-    tonumber(session.berryCrushPoints) or 0)))
-  c.unionRoomNum = math.min(65535, math.max(0, math.floor(
-    tonumber(session.unionRoomNum or session.unionTrades) or 0)))
+  -- src/trainer_card.c:822
+  c.linkBattleWins = capped_stat(session, 23, "linkBattleWins", 9999)
+  c.linkBattleLosses = capped_stat(session, 24, "linkBattleLosses", 9999)
+  c.pokemonTrades = capped_stat(session, 21, "pokemonTrades", 0xFFFF)
+  -- src/trainer_card.c:876
+  c.berryCrushPoints = capped_stat(session, 51, "berryCrushPoints", 0xFFFF)
+  c.unionRoomNum = capped_stat(session, 50, "unionRoomNum", 0xFFFF)
 
   c.hasHofResult = (c.hofDebutHours ~= 0 or c.hofDebutMinutes ~= 0 or c.hofDebutSeconds ~= 0)
   c.hasLinkResults = (c.linkBattleWins ~= 0 or c.linkBattleLosses ~= 0)
@@ -419,6 +449,9 @@ local function gather(session)
   local jumps = tonumber(session.jumpsInRow) or 0
   if berries >= 200 and jumps >= 200 then stars = stars + 1 end
   c.stars = math.min(4, stars)
+
+  -- src/trainer_card.c:899
+  c.monIconTint = get_var(session, VAR_TRAINER_CARD_MON_ICON_TINT_IDX)
 
   c.monSpecies = {}
   for i = 1, 6 do
@@ -491,6 +524,22 @@ function TrainerCard.update(dt)
   end
 end
 
+local texts_cache = { c = false, colon = false, front = nil, back = nil }
+local function front_texts_cached(c, colonInvisible)
+  if texts_cache.front and texts_cache.c == c and texts_cache.colon == colonInvisible then
+    return texts_cache.front
+  end
+  texts_cache.c, texts_cache.colon = c, colonInvisible
+  texts_cache.front = TrainerCard.frontTexts(c, colonInvisible)
+  return texts_cache.front
+end
+local function back_texts_cached(c)
+  if texts_cache.back and texts_cache.c == c then return texts_cache.back end
+  texts_cache.c = c
+  texts_cache.back = TrainerCard.backTexts(c)
+  return texts_cache.back
+end
+
 function TrainerCard.show(opts)
   opts = opts or {}
   TrainerCard.open = true
@@ -498,9 +547,10 @@ function TrainerCard.show(opts)
   TrainerCard._flip = nil
   TrainerCard._session = opts.session
   TrainerCard._card = gather(opts.session)
+  texts_cache.c, texts_cache.colon, texts_cache.front, texts_cache.back = false, false, nil, nil
   TrainerCard._onClose = opts.onClose
   ensureAssets()
-  Stack.push("trainer", TrainerCard, { hideBelow = true })
+  Stack.push("trainer", TrainerCard, { hideBelow = true, fullscreen = true })
   play_se("SE_CARD_OPEN")
 end
 
@@ -563,23 +613,23 @@ function TrainerCard.frontTexts(c, colonInvisible)
     t[#t + 1] = { id = id, text = text, x = WIN_X + x, y = WIN_Y + y, stat = stat or false }
   end
 
-  add("name", Strings("NAME: ") .. c.playerName, 20, 29)
-  add("id", Strings("IDNo.") .. leading_zeros(c.trainerId, 5), 142, 10)
+  add("name", RomText.plain("gText_TrainerCardName") .. c.playerName, 20, 29)
+  add("id", RomText.plain("gText_TrainerCardIDNo") .. leading_zeros(c.trainerId, 5), 142, 10)
 
-  add("money_label", Strings("MONEY"), 20, 56)
-  local moneyStr = Strings("¥") .. tostring(c.money)
+  add("money_label", RomText.plain("gText_TrainerCardMoney"), 20, 56)
+  local moneyStr = RomText.plain("gText_TrainerCardYen") .. tostring(c.money)
   add("money", moneyStr, 134 - CHAR_ADVANCE * str_length(moneyStr), 56)
 
   if c.hasPokedex then
-    add("dex_label", Strings("POKéDEX"), 20, 72)
+    add("dex_label", RomText.plain("gText_TrainerCardPokedex"), 20, 72)
     local dexStr = tostring(c.caughtMonsCount)
     add("dex", dexStr, 136 - CHAR_ADVANCE * str_length(dexStr), 72)
   end
 
-  add("time_label", Strings("TIME"), 20, 88)
+  add("time_label", RomText.plain("gText_TrainerCardTime"), 20, 88)
   add("hours", right_align(c.playTimeHours, 3), 101, 88)
   if not colonInvisible then
-    add("colon", ":", 119, 88)
+    add("colon", RomText.plain("gText_Colon2"), 119, 88)
   end
   add("minutes", leading_zeros(c.playTimeMinutes, 2), 124, 88)
   return t
@@ -596,14 +646,14 @@ function TrainerCard.backTexts(c)
   add("name", c.playerName, 138, 11)
 
   if c.hasHofResult then
-    add("hof_label", Strings("HALL OF FAME DEBUT"), 10, 35)
+    add("hof_label", RomText.plain("gText_HallOfFameDebut"), 10, 35)
     add("hof", right_align(c.hofDebutHours, 3)
       .. ":" .. leading_zeros(c.hofDebutMinutes, 2)
       .. ":" .. leading_zeros(c.hofDebutSeconds, 2), 164, 35, true)
   end
 
   if c.hasLinkResults then
-    add("link_label", Strings("LINK BATTLES"), 10, 51)
+    add("link_label", RomText.plain("gText_LinkBattles"), 10, 51)
     add("link_w", "W:", 130, 51)
     add("link_wins", right_align(c.linkBattleWins, 4), 144, 51, true)
     add("link_l", "L:", 178, 51)
@@ -611,17 +661,17 @@ function TrainerCard.backTexts(c)
   end
 
   if c.hasTrades then
-    add("trades_label", Strings("POKéMON TRADES"), 10, 67)
+    add("trades_label", RomText.plain("gText_PokemonTrades"), 10, 67)
     add("trades", right_align(c.pokemonTrades, 5), 186, 67, true)
   end
 
   if c.unionRoomNum ~= 0 then
-    add("union_label", Strings("UNION TRADES & BATTLES"), 10, 83)
+    add("union_label", RomText.plain("gText_UnionRoomTradesBattles"), 10, 83)
     add("union", right_align(c.unionRoomNum, 5), 186, 83, true)
   end
 
   if c.berryCrushPoints ~= 0 then
-    add("berry_label", Strings("BERRY CRUSH"), 10, 99)
+    add("berry_label", RomText.plain("gText_BerryCrushes"), 10, 99)
     add("berry", right_align(c.berryCrushPoints, 5), 186, 99, true)
   end
   return t
@@ -642,7 +692,7 @@ local function draw_front(c)
     love.graphics.draw(pic, WIN_X + 144 + 13, WIN_Y + 32 + 4)
   end
 
-  draw_texts(TrainerCard.frontTexts(c, TrainerCard._colonInvisible))
+  draw_texts(front_texts_cached(c, TrainerCard._colonInvisible))
 
   -- src/trainer_card.c:1553 stars at tile (15, 7), badges at tile (4 + 3i, 16)
   if _starImg then
@@ -660,16 +710,89 @@ local function draw_front(c)
   end
 end
 
+-- src/trainer_card.c:1411, include/constants/trainer_card.h
+local MON_ICON_TINT_BLACK = 1
+local MON_ICON_TINT_PINK = 2
+local MON_ICON_TINT_SEPIA = 3
+
+-- pokefirered/src/palette.c:832
+local function tint_pixel(tint, r, g, b)
+  local gray = 0.3 * r + 0.59 * g + 0.1133 * b
+  local nr, ng, nb
+  if tint == MON_ICON_TINT_BLACK then
+    nr, ng, nb = 0, 0, 0
+  elseif tint == MON_ICON_TINT_PINK then
+    nr, ng, nb = 500 * gray / 256, 330 * gray / 256, 310 * gray / 256
+  else
+    nr, ng, nb = 1.2 * gray, gray, 0.94 * gray
+  end
+  if nr > 255 then nr = 255 end
+  if ng > 255 then ng = 255 end
+  if nb > 255 then nb = 255 end
+  return math.floor(nr), math.floor(ng), math.floor(nb)
+end
+
+local _tintedIcons = {}
+
+local function tinted_icon(icon, species, tint)
+  if not icon or not icon.image or not tint then return icon end
+  tint = math.floor(tint)
+  if tint < MON_ICON_TINT_BLACK or tint > MON_ICON_TINT_SEPIA then return icon end
+  local byTint = _tintedIcons[tint]
+  if not byTint then
+    byTint = {}
+    _tintedIcons[tint] = byTint
+  end
+  local hit = byTint[species]
+  if hit ~= nil then return hit or icon end
+
+  local function fail()
+    byTint[species] = false
+    return icon
+  end
+
+  if not (love and love.image and love.image.newImageData and love.graphics) then return fail() end
+  local okData, src = pcall(function() return icon.image:getData() end)
+  if not okData or not src or not src.getPixel then return fail() end
+  local w, h = src:getWidth(), src:getHeight()
+  local okBuild, dst = pcall(function()
+    local out = love.image.newImageData(w, h)
+    for y = 0, h - 1 do
+      for x = 0, w - 1 do
+        local r, g, b, a = src:getPixel(x, y)
+        local nr, ng, nb = tint_pixel(tint, r * 255, g * 255, b * 255)
+        out:setPixel(x, y, nr / 255, ng / 255, nb / 255, a)
+      end
+    end
+    return out
+  end)
+  if not okBuild or not dst then return fail() end
+  local okImg, img = pcall(love.graphics.newImage, dst)
+  if not okImg or not img then return fail() end
+  if img.setFilter then img:setFilter("nearest", "nearest") end
+
+  byTint[species] = {
+    image = img,
+    w = icon.w,
+    h = icon.h,
+    sheetH = icon.sheetH,
+    frames = icon.frames,
+    quads = icon.quads,
+  }
+  return byTint[species]
+end
+
 local function draw_back(c)
-  draw_texts(TrainerCard.backTexts(c))
+  draw_texts(back_texts_cached(c))
 
   -- src/trainer_card.c:1414 WriteSequenceToBgTilemapBuffer(3, .., 4i + 3, 15, 4, 4, ..)
   local okPk, Pokemon = pcall(require, "src.core.game3.pokemon")
   if okPk and Pokemon and Pokemon.icon then
+    local tint = tonumber(c.monIconTint) or 0
     for i = 1, 6 do
       local sp = c.monSpecies[i]
       if sp and sp > 0 then
-        local icon = Pokemon.icon(sp)
+        local icon = tinted_icon(Pokemon.icon(sp), sp, tint)
         local q = icon and icon.quads and icon.quads[0]
         if icon and icon.image and q then
           love.graphics.setColor(1, 1, 1, 1)

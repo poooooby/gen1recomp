@@ -92,6 +92,13 @@ function TrainerSight.getTrainerId(eo)
   return nil
 end
 
+-- pokefirered/src/trainer_see.c:97
+function TrainerSight.isTrainerType(eo)
+  if not eo then return false end
+  local tt = tonumber(eo.trainerType or (eo.def and eo.def.trainerType)) or 0
+  return tt == 1 or tt == 3
+end
+
 --- Check if trainer has already been defeated.
 function TrainerSight.isDefeated(eo, store, ctx)
   if not eo then return true end
@@ -159,7 +166,9 @@ function TrainerSight.checkLineOfSight(eo, P, game)
   local d = DELTA[facing]
   if not d then return false, 0 end
 
-  local ex, ey = eo.cellX, eo.cellY
+  -- src/trainer_see.c:151
+  local ex = eo.moving and eo.targetX or eo.cellX
+  local ey = eo.moving and eo.targetY or eo.cellY
   local px, py = P.cellX, P.cellY
   local dx, dy = d[1], d[2]
   local dist = 0
@@ -179,23 +188,18 @@ function TrainerSight.checkLineOfSight(eo, P, game)
     return false, 0
   end
 
-  local function normElevation(e)
-    local n = tonumber(e) or 0
-    if n == 0 or n == 3 then
-      return 3
-    end
-    return n
-  end
-
-  -- Elevation tier check: trainer and player must share the exact same elevation tier
-  local eoElev = normElevation(eo.elevation or (eo.def and eo.def.elevation))
-  local pElev = normElevation(P.elevation)
-  if eoElev ~= pElev then
-    return false, 0
-  end
-
   local Coll = Collision()
   local Objs = Objects()
+  local eoElev = tonumber(eo.currentElevation) or 0
+  local mapDef = eo.mapDef or Coll._mapDef
+
+  -- pokefirered/src/trainer_see.c:225
+  if Objs.elevationsCompatible and not Objs.elevationsCompatible(eoElev, P.currentElevation) then
+    return false, 0
+  end
+  if Coll.elevationMismatchOn and Coll.elevationMismatchOn(mapDef, eoElev, px, py) then
+    return false, 0
+  end
 
   -- Raycast intermediate tiles strictly between trainer and player
   for step = 1, dist - 1 do
@@ -205,7 +209,11 @@ function TrainerSight.checkLineOfSight(eo, P, game)
     local fromY = ey + dy * (step - 1)
 
     -- 1. Collision check: must be passable along raycast direction
-    if Coll.canEnter and not Coll.canEnter(game, cx, cy, { fromX = fromX, fromY = fromY, dir = facing }) then
+    if Coll.canEnter and not Coll.canEnter(game, cx, cy, { fromX = fromX, fromY = fromY, dir = facing, elevation = eoElev }) then
+      return false, 0
+    end
+    -- pokefirered/src/trainer_see.c:214
+    if Coll.elevationMismatchOn and Coll.elevationMismatchOn(mapDef, eoElev, cx, cy) then
       return false, 0
     end
 
@@ -215,10 +223,11 @@ function TrainerSight.checkLineOfSight(eo, P, game)
     end
 
     -- 3. Intermediary NPCs block vision
-    if Objs.blocks and Objs.blocks(cx, cy, eo.localId) then
+    if Objs.blocks and Objs.blocks(cx, cy, eo.localId, eoElev) then
       return false, 0
     end
-    if Objs.at and Objs.at(cx, cy) then
+    local other = Objs.at and Objs.at(cx, cy)
+    if other and (not Objs.elevationsCompatible or Objs.elevationsCompatible(eoElev, other.currentElevation)) then
       return false, 0
     end
   end
@@ -274,6 +283,35 @@ function TrainerSight.engage(game, eo, dist)
 
     local function finishEngagement()
       P.facing = playerFacing
+      -- pokefirered/src/trainer_see.c:349-351 SetTrainerMovementType, OverrideMovementTypeForObjectEvent, OverrideTemplateCoordsForObjectEvent
+      local faceMt = ({ down = 0x08, up = 0x07, left = 0x09, right = 0x0A })[eo.facing] or 0x08
+      if Objs.setTrainerMovementType then
+        Objs.setTrainerMovementType(eo, faceMt)
+      else
+        eo.movementType = faceMt
+        eo.movement = "STAY"
+        eo.range = (eo.facing or "down"):upper()
+      end
+      if Objs.overrideTemplateMovementType then
+        Objs.overrideTemplateMovementType(eo.localId, faceMt)
+      end
+      eo.homeX = eo.cellX
+      eo.homeY = eo.cellY
+      if eo.def then
+        eo.def.movementType = faceMt
+        eo.def.movement = "STAY"
+        eo.def.x = eo.cellX
+        eo.def.y = eo.cellY
+        eo.def.range = (eo.facing or "down"):upper()
+      end
+      if Objs.rememberPerm and Objs._mapId then
+        Objs.rememberPerm(Objs._mapId, eo.localId, {
+          x = eo.cellX,
+          y = eo.cellY,
+          movementType = faceMt,
+          facing = eo.facing,
+        })
+      end
       eo.frozen = false
       eo.scriptBusy = false
       F.locked = false
@@ -341,9 +379,12 @@ function TrainerSight.check(game, specificTrainer)
 
   if specificTrainer then
     local eo = specificTrainer
-    if eo.visible and not eo.hidden and not eo.moving and not eo.scriptBusy and not eo.frozen then
+    -- src/trainer_see.c:94
+    if Objs.find(eo.localId) ~= eo then return false end
+    if eo.visible and not eo.hidden and not eo.scriptBusy and not eo.frozen then
       local sight = tonumber(eo.sight or (eo.def and (eo.def.sight or eo.def.trainerRange))) or 0
-      if sight > 0 and not TrainerSight.isDefeated(eo, store, ctx) then
+      if sight > 0 and TrainerSight.isTrainerType(eo)
+        and not TrainerSight.isDefeated(eo, store, ctx) then
         local spotted, dist = TrainerSight.checkLineOfSight(eo, P, game)
         if spotted and not TrainerSight.blockedByDoubles(eo) then
           TrainerSight.engage(game, eo, dist)
@@ -358,9 +399,10 @@ function TrainerSight.check(game, specificTrainer)
   local order = Objs._order or {}
   for _, lid in ipairs(order) do
     local eo = Objs.find(lid)
-    if eo and eo ~= P and eo.visible and not eo.hidden and not eo.moving and not eo.scriptBusy and not eo.frozen then
+    if eo and eo ~= P and eo.visible and not eo.hidden and not eo.scriptBusy and not eo.frozen then
       local sight = tonumber(eo.sight or (eo.def and (eo.def.sight or eo.def.trainerRange))) or 0
-      if sight > 0 and not TrainerSight.isDefeated(eo, store, ctx) then
+      if sight > 0 and TrainerSight.isTrainerType(eo)
+        and not TrainerSight.isDefeated(eo, store, ctx) then
         local spotted, dist = TrainerSight.checkLineOfSight(eo, P, game)
         if spotted and not TrainerSight.blockedByDoubles(eo) then
           -- Immediately engage and break iterator to suppress any other simultaneous spots

@@ -3,7 +3,6 @@
 local State = require("src.core.game3.battle.state")
 local Rules = require("src.core.game3.battle.rules")
 local ModRuntime = require("src.mods.Runtime")
-local Strings = require("src.core.Strings")
 
 local Adapter = {}
 
@@ -57,6 +56,52 @@ local function id_of(battler)
 end
 Adapter.idOf = id_of
 
+-- src/battle_message.c:1523
+function Adapter.fill(st, extra)
+  local f = {}
+  if st then
+    f.trainer = not st.wild
+    f.link = st.link or nil
+    f.double = st.double or nil
+    f.unionRoom = st.unionRoom or nil
+    f.linkOpponent = (st.link and not st.unionRoom) or nil
+    f.ghost = st.ghostBattle or nil
+    f.ghostUnveiled = st.ghostUnveiled or nil
+    f.legendary = st.legendary or nil
+    f.oldMan = st.oldManTutorial or nil
+    f.playerName = st.playerName
+    f.linkPlayerName = st.playerName
+    f.linkOpponent1Name = st.peerName
+    f.trainer1Class = (st.trainerClassName ~= nil and st.trainerClassName ~= "") and st.trainerClassName
+      or st.trainerClass
+    f.trainer1Name = st.trainerName
+    if st.unionRoom then
+      -- src/battle_message.c:2039
+      f.trainer1Class = require("src.core.game3.link.battle").unionRoomTrainerClass()
+      -- src/battle_message.c:2058
+      f.trainer1Name = st.peerName
+    end
+    if st.multi and st.linkNames then
+      -- pokefirered/src/battle_message.c:1910
+      local own = tonumber(st.linkOwn) or 0
+      local names = st.linkNames
+      local seat = st.linkSeatOf and st.linkSeatOf[own]
+      local opp = seat and st.linkLocalOf and st.linkLocalOf[State.OPPOSITE(seat)] or State.OPPOSITE(own)
+      f.multi = true
+      f.linkPlayerName = names[own] or st.playerName
+      f.linkPartnerName = names[(own + 2) % 4]
+      f.linkOpponent1Name = names[opp]
+      f.linkOpponent2Name = names[(opp + 2) % 4]
+      f.linkPlayerMon1 = State.battler(st, own)
+      f.linkPlayerMon2 = State.battler(st, (own + 2) % 4)
+      f.linkOpponentMon1 = State.battler(st, opp)
+      f.linkOpponentMon2 = State.battler(st, (opp + 2) % 4)
+    end
+  end
+  for k, v in pairs(extra or {}) do f[k] = v end
+  return f
+end
+
 function Adapter.new(battleState, sayFn)
   local a = {
     _st = battleState,
@@ -74,9 +119,6 @@ function Adapter.new(battleState, sayFn)
     local out = {}
     for i = (mark or 0) + 1, #self._events do out[#out + 1] = self._events[i] end
     return out
-  end
-  function a:truncateEvents(mark)
-    for i = #self._events, (mark or 0) + 1, -1 do self._events[i] = nil end
   end
 
   function a:playAnim(kind, name, attacker, target, arg)
@@ -160,7 +202,9 @@ function Adapter.new(battleState, sayFn)
 
   function a:rollSleepTurns()
     local ok, v = pcall(self:rng(), 0, 3)
-    if not (ok and type(v) == "number") then v = math.random(0, 3) end
+    if not (ok and type(v) == "number") then
+      v = require("src.core.game3.battle.link_guard").fallback("adapter.sleep", 0, 3)
+    end
     return (math.floor(v) % 4) + 2
   end
 
@@ -202,13 +246,6 @@ function Adapter.new(battleState, sayFn)
     battler.toxicCounter = nil
     battler.sleepTurns = nil
     if battler.mon then battler.mon.status = nil end
-  end
-  function a:types(battler)
-    if not battler then return {} end
-    local Types = require("src.core.game3.battle.types")
-    local out = { Types.name(battler.type1) }
-    if battler.type2 and battler.type2 ~= battler.type1 then out[2] = Types.name(battler.type2) end
-    return out
   end
   function a:stages(battler) return battler and battler.stages end
   function a:changeStages(battler, changes)
@@ -289,32 +326,30 @@ function Adapter.new(battleState, sayFn)
     end
   end
   function a:displayName(battler) return State.displayName(battler) end
-  function a:say(text, ...)
-    if select("#", ...) > 0 then
-      text = string.format(tostring(text), ...)
-    end
+  function a:say(text, id)
     text = tostring(text or "")
-    self:pushEvent({ kind = "msg", text = text })
+    self:pushEvent({ kind = "msg", text = text, id = id })
     self._say(text)
   end
-  function a:sayFail() self:say(Strings("But it failed!")) end
-  function a:rng() return self._st.rng or math.random end
+  function a:sayText(id, fill)
+    local BattleText = require("src.core.game3.battle.battle_text")
+    fill = Adapter.fill(self._st, fill)
+    local text = BattleText.get(id, fill)
+    self:pushEvent({ kind = "msg", text = text, id = (BattleText.key(id, fill)) })
+    self._say(text)
+    return text
+  end
+  -- src/battle_message.c:336
+  function a:sayFail() self:sayText("STRINGID_BUTITFAILED") end
+  function a:rng()
+    return self._st.rng or require("src.core.game3.battle.link_guard").source("adapter.rng", math.random)
+  end
   function a:roll(lo, hi)
     local ok, v = pcall(self:rng(), lo, hi)
     if ok and type(v) == "number" then return v end
-    return math.random(lo, hi)
+    return require("src.core.game3.battle.link_guard").fallback("adapter.roll", lo, hi)
   end
-  function a:battlers() return State.present(self._st) end
   function a:activeBattlers() return State.present(self._st) end
-  function a:aliveBattlers()
-    local out = {}
-    for _, b in ipairs(State.present(self._st)) do
-      if not State.isFainted(b) then out[#out + 1] = b end
-    end
-    return out
-  end
-  function a:battler(id) return State.battler(self._st, id) end
-  function a:isDouble() return self._st.double == true end
   function a:foeOf(battler)
     if not battler then return nil end
     local st = self._st
@@ -329,7 +364,6 @@ function Adapter.new(battleState, sayFn)
     return State.battler(st, opp)
   end
   function a:foesOf(battler) return State.foes(self._st, battler) end
-  function a:alliesOf(battler) return State.allies(self._st, battler) end
   function a:partnerOf(battler) return State.partner(self._st, battler) end
   function a:ownSide(battler)
     if not battler then return nil end
@@ -395,28 +429,14 @@ function Adapter.new(battleState, sayFn)
     battler.confusionTurns = t
     return true
   end
-  function a:isConfused(battler)
-    return battler and (battler.confusionTurns or 0) > 0
-  end
-  function a:invokeEffect(id, user, target, opts)
-    local Effects = require("src.core.game3.battle.effects")
-    opts = opts or {}
-    return Effects.run(id, self, user, target, opts.move, opts.moveId)
-  end
   function a:useMove(user, moveId, target, opts)
     local Engine = require("src.core.game3.battle.engine")
     return Engine.resolveMove(user, target, moveId, opts and opts.slot, self, self._st, {})
   end
-  function a:fieldGet(key) return self._st[key] end
-  function a:fieldSet(key, val) self._st[key] = val end
 
   function a:setWeather(kind, turns)
     self._st.weather = kind
     self._st.weatherTurns = turns or 5
-  end
-
-  function a:weather()
-    return Rules.weather.effective(self._st, self)
   end
 
   function a:tickWeather()

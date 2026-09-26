@@ -22,9 +22,12 @@ local Task = require("src.core.game3.task")
 local Trainers = require("src.core.game3.scripting.trainers")
 local SwitchSeq = require("src.core.game3.battle.switch_seq")
 local Oak = require("src.core.game3.battle.oak_advice")
+local Pokedude = require("src.core.game3.battle.pokedude")
 local Rules = require("src.core.game3.battle.rules")
 local ModRuntime = require("src.mods.Runtime")
 local Strings = require("src.core.Strings")
+local RomText = require("src.core.game3.rom_text")
+local BattleText = require("src.core.game3.battle.battle_text")
 local Audio = require("src.core.game3.audio")
 local SE = require("src.core.game3.se_ids")
 local BattleChrome = require("src.ui.game3.battle_chrome")
@@ -50,6 +53,13 @@ Battle._residualIndex = 1
 Battle._residualStepState = nil
 
 local D = {}
+
+local function LB_copy(value, depth)
+  if type(value) ~= "table" or (depth or 0) > 8 then return value end
+  local out = {}
+  for k, v in pairs(value) do out[k] = LB_copy(v, (depth or 0) + 1) end
+  return out
+end
 
 -- Phases in which the level-up stat window can still be dismissed by the
 -- player.  Input routing and drawing both key off this, so the window can never
@@ -114,10 +124,13 @@ local function party_menu_input(PartyMenu, input)
 end
 
 -- pokefirered/src/battle_script_commands.c:1108
-local function seq_push(text, wait)
-  local t = tostring(text or "")
-  local used = AnimSeq.isMoveUsedText(t) or t:find(" used\n", 1, true) or t:find(" used ", 1, true)
-  Ui.pushTimed(t, tonumber(wait) or (used and 0 or 64))
+local function seq_push(text, wait, id)
+  local st = Battle._st
+  if st and st.pokedude and id then
+    -- pokefirered/src/battle_controller_pokedude.c:209 HandlePokedudeVoiceoverEtc
+    Pokedude.event(st, "printstring", st.pdActor, id)
+  end
+  Ui.pushTimed(tostring(text or ""), tonumber(wait) or (AnimSeq.isMoveUsedId(id) and 0 or 64))
 end
 
 local function push_msgs(list)
@@ -126,7 +139,28 @@ local function push_msgs(list)
   end
 end
 
-local function foe_mon_from(foe)
+local function link_mon_from(foe)
+  if type(foe) ~= "table" then error("link battle: the peer sent no mon") end
+  for _, key in ipairs({ "personality", "ivs", "item" }) do
+    if foe[key] == nil then error("link battle: the peer's mon has no " .. key) end
+  end
+  if type(foe.moves) ~= "table" or #foe.moves == 0 then error("link battle: the peer's mon has no moves") end
+  local mon = LB_copy(foe)
+  mon.item = tonumber(foe.item) or 0
+  mon.heldItem = mon.item
+  if not mon.maxPp or #mon.maxPp == 0 then
+    mon.maxPp = {}
+    for i, m in ipairs(mon.moves) do mon.maxPp[i] = Pokemon.movePp(m) end
+  end
+  if not mon.pp or #mon.pp == 0 then
+    mon.pp = {}
+    for i in ipairs(mon.moves) do mon.pp[i] = mon.maxPp[i] end
+  end
+  return Damage.ensureStats(mon, mon.level)
+end
+
+local function foe_mon_from(foe, link)
+  if link then return link_mon_from(foe) end
   if type(foe) ~= "table" then
     return Damage.ensureStats({
       species = 16, level = 3,
@@ -180,6 +214,8 @@ local function foe_mon_from(foe)
   end
   local mon = {
     species = species,
+    name = foe.name or foe.nickname,
+    nickname = foe.nickname,
     level = foe.level or 5,
     hp = foe.hp,
     maxHp = foe.maxHp,
@@ -200,32 +236,24 @@ local function foe_mon_from(foe)
     ability = foe.ability or foe.abilityId,
     dvs = foe.dvs,
   }
-  local needMoves = not mon.moves or #mon.moves == 0
-  if needMoves then
-    if Pokemon.movesAtLevel then
-      local moves, pp, maxPp = Pokemon.movesAtLevel(mon.species, mon.level)
-      if moves and #moves > 0 then
-        mon.moves = moves
-        mon.pp = pp
-        mon.maxPp = maxPp
-      end
-    end
-  end
   if not mon.moves or #mon.moves == 0 then
-    mon.moves = { 33 }
-    mon.pp = { 35 }
-    mon.maxPp = { 35 }
+    -- pokefirered/src/pokemon.c:2265
+    local moves, pp, maxPp = Pokemon.movesAtLevel(mon.species, mon.level)
+    if not moves or #moves == 0 then
+      error(string.format("species %s has no moves at level %s", tostring(mon.species), tostring(mon.level)))
+    end
+    mon.moves, mon.pp, mon.maxPp = moves, pp, maxPp
   end
   if not mon.maxPp or #mon.maxPp == 0 then
     mon.maxPp = {}
     for i, m in ipairs(mon.moves) do
-      mon.maxPp[i] = Pokemon.movePp and Pokemon.movePp(m) or 35
+      mon.maxPp[i] = Pokemon.movePp(m)
     end
   end
   if not mon.pp or #mon.pp == 0 then
     mon.pp = {}
-    for i, m in ipairs(mon.moves) do
-      mon.pp[i] = mon.maxPp[i] or 35
+    for i in ipairs(mon.moves) do
+      mon.pp[i] = mon.maxPp[i]
     end
   end
   return Damage.ensureStats(mon, mon.level)
@@ -315,22 +343,21 @@ function Battle.getState()
 end
 
 -- pokefirered/src/battle_message.c:1695 STRINGID_BATTLEEND
-function Battle.linkEndText(st, outcome)
-  local who = (st and st.peerName) or Strings("the LINK TRAINER")
-  if outcome == "lose" then
-    -- pokefirered/src/battle_message.c:326
-    return Strings("Player lost against\n%s!", who)
-  elseif outcome == "draw" then
-    -- pokefirered/src/battle_message.c:328
-    return Strings("Player battled to a draw against\n%s!", who)
-  end
-  -- pokefirered/src/battle_message.c:324
-  return Strings("Player defeated\n%s!", who)
+function Battle.linkEndText(st, outcome, ran)
+  local out = ({ lose = "lost", draw = "drew" })[outcome] or "won"
+  return BattleText.get(BattleText.BATTLEEND, Adapter.fill(st, { outcome = out, linkRan = ran and true or nil }))
 end
 
 local function finish(result)
   if not Battle._active then return end
+  local pst = Battle._st
+  if pst and pst.pokedude and not pst.pdEnded and Battle._headless then
+    pst.pdEnded = true
+    -- pokefirered/data/battle_scripts_2.s:102 endlinkbattle
+    Pokedude.event(pst, "endlinkbattle", "player")
+  end
   stop_low_hp_song()
+  require("src.core.game3.battle.link_guard").disarm()
   Battle._active = false
   Battle._phase = nil
   Battle._residualEvents = nil
@@ -345,7 +372,8 @@ local function finish(result)
     st.result = result or st.result or "win"
     local Runtime=package.loaded["src.core.game3.runtime"]
     local session=Runtime and Runtime.getSession()
-    if session and not Battle._headless then
+    -- pokefirered/src/quest_log_battle.c:14
+    if session and not Battle._headless and not (st.link or st.oldManTutorial or st.pokedude) then
       require("src.core.game3.quest_log_recorder").battle(session,st)
     end
   end
@@ -368,8 +396,7 @@ local function finish(result)
     local okF, Fade = pcall(require, "src.ui.game3.fade")
     if okF and Fade and Fade.clear then Fade.clear() end
   end
-  -- Victory BGM starts in begin_win_award (while awards play). Map BGM is
-  -- restored by battle_bridge on exit — do not clobber victory here.
+  -- battle_main.c:3746-3759
   local cb = Battle._onDone
   Battle._onDone = nil
   if cb then cb(st and st.result or result or "win", st) end
@@ -392,42 +419,75 @@ function Battle.start(opts)
   if #playerParty == 0 then
     return nil, "empty party"
   end
-  local foeMon = foe_mon_from(opts.foe)
-  local foeParty = opts.foeParty
-  if not foeParty and opts.foe and opts.foe.party then
+  local linkBattle = (opts.link or (type(opts.foe) == "table" and opts.foe.link)) and true or false
+  local Guard = require("src.core.game3.battle.link_guard")
+  if linkBattle then Guard.arm() else Guard.disarm() end
+  local foeMon, foeParty
+  if linkBattle then
     foeParty = {}
-    for _, fm in ipairs(opts.foe.party) do
-      foeParty[#foeParty + 1] = foe_mon_from(fm)
+    for _, fm in ipairs((type(opts.foe) == "table" and opts.foe.party) or {}) do
+      foeParty[#foeParty + 1] = foe_mon_from(fm, true)
     end
-  end
-  if foeParty and foeParty[1] and type(opts.foe) == "table" and opts.foe.species == nil and opts.foe.id == nil then
-    foeMon = foeParty[1]
+    if #foeParty == 0 then
+      Guard.disarm()
+      return nil, "the peer sent no party"
+    end
+  else
+    foeMon = foe_mon_from(opts.foe)
+    foeParty = opts.foeParty
+    if not foeParty and opts.foe and opts.foe.party then
+      foeParty = {}
+      for _, fm in ipairs(opts.foe.party) do
+        foeParty[#foeParty + 1] = foe_mon_from(fm)
+      end
+    end
+    if foeParty and foeParty[1] and type(opts.foe) == "table" and opts.foe.species == nil and opts.foe.id == nil then
+      foeMon = foeParty[1]
+    end
   end
   Moves.loadRomPack(opts.cache)
   local double = (opts.double == true) and not opts.wild
+  local multi = (linkBattle and double and type(opts.multi) == "table") and opts.multi or nil
   local st = State.new({
     wild = opts.wild,
     double = double or nil,
-    playerIndex = opts.playerIndex or State.firstUsable(playerParty) or 1,
+    playerIndex = opts.playerIndex or (not multi and State.firstUsable(playerParty)) or nil,
     playerParty = playerParty,
     foeMon = foeMon,
     foeParty = foeParty,
     rng = opts.rng,
+    multi = multi and true or nil,
+    partyOwner = multi and multi.owners or nil,
   })
+  if st.multi then
+    -- pokefirered/src/battle_controllers.c:223
+    st.linkOwn = tonumber(multi.own)
+    st.linkNames = multi.names or {}
+    st.linkGenders = multi.genders or {}
+    st.linkSeatOf = multi.seatOf or {}
+    st.linkLocalOf = multi.localOf or {}
+    st.linkOrder = multi.order
+  end
+  -- pokefirered/src/battle_main.c:2584
+  SwitchSeq.stampSwitchIn(st)
   D.reset()
   -- pokefirered/src/cable_club.c:664 BATTLE_TYPE_LINK
-  st.link = (opts.link or (opts.foe and opts.foe.link)) and true or false
+  st.link = linkBattle
+  st.spectate = (linkBattle and opts.spectate) and true or false
   st.linkFlags = tonumber(opts.linkFlags) or nil
   -- pokefirered/src/battle_controllers.c:148 InitLinkBtlControllers
   st.linkMaster = (opts.linkMaster ~= false) and true or false
   st.unionRoom = opts.unionRoom and true or false
   st.peerName = opts.peerName or (opts.foe and opts.foe.name) or nil
+  -- pokefirered/src/battle_controller_pokedude.c:2683
+  st.pokedude = opts.pokedude and true or false
+  if st.pokedude then st.pd = Pokedude.newState(opts.pdScriptNum) end
   st.ghostBattle = ghost_battle(opts, st)
   if st.ghostBattle then
     -- pokefirered/src/battle_setup.c:326
     st.ghostUnveiled = (opts.ghostUnveiled or (type(opts.foe) == "table" and opts.foe.ghostUnveiled)) and true or nil
     -- pokefirered/src/battle_setup.c:334
-    if st.enemy and st.enemy.mon then st.enemy.mon.nickname = Strings("GHOST") end
+    if st.enemy and st.enemy.mon then st.enemy.mon.nickname = RomText.plain("gText_Ghost") end
   end
   Battle._headless = opts.headless and true or false
   Battle._auto = (opts.autoFight == true) or (opts.headless and opts.autoFight ~= false)
@@ -440,16 +500,20 @@ function Battle.start(opts)
     st.session = session
     st.dex = opts.dex or (session and session.dex)
     Ui.bindState(st, session)
-    st.playerName = session and session.name or "PLAYER"
+    st.playerName = (session and session.name) or opts.playerName
     -- pokefirered/src/battle_main.c:2618
     -- pokefirered/src/battle_script_commands.c:4520
     if session and session.dex and foeMon and (foeMon.species or foeMon.speciesId)
         and not st.link
+        and not st.oldManTutorial
+        and not st.pokedude
         and not (st.ghostBattle and not st.ghostUnveiled) then
       local Dex = require("src.core.game3.dex")
-      Dex.setSeen(session.dex, foeMon.species or foeMon.speciesId)
+      Dex.handleSetPokedexFlag(session.dex, foeMon.species or foeMon.speciesId, false, foeMon.personality)
       local b3 = st.double and not st.absent[3] and st.battlers[3]
-      if b3 and b3.mon then Dex.setSeen(session.dex, b3.mon.species or b3.mon.speciesId) end
+      if b3 and b3.mon then
+        Dex.handleSetPokedexFlag(session.dex, b3.mon.species or b3.mon.speciesId, false, b3.mon.personality)
+      end
     end
     -- pokefirered/src/pokemon.c:1796
     local wildMon = st.wild and st.enemy and st.enemy.mon
@@ -481,6 +545,7 @@ function Battle.start(opts)
   Battle._adapter = Adapter.new(st, function(text) Ui.push(text) end)
   Battle._onDone = opts.onDone
   Battle._active = true
+  Battle._linkFault = nil
   Battle._lowHpSong = false
   Battle._phase = "intro"
   Battle._actions = nil
@@ -498,6 +563,9 @@ function Battle.start(opts)
   -- pokefirered/src/trainer_tower.c:735, src/battle_tower.c:933
   st.trainerTower = opts.trainerTower or false
   st.eReader = opts.eReader or false
+  -- src/battle_tower.c:895-933
+  st.battleTower = opts.battleTower or false
+  st.secretBase = opts.secretBase or false
   local trainerInfo = nil
   -- pokefirered/src/battle_message.c:2043 the tower and e-reader trainers are not gTrainers rows
   if trainerId and not st.wild and not (st.trainerTower or st.eReader) then
@@ -529,10 +597,21 @@ function Battle.start(opts)
   }))
 
   st.trainerId = trainerId
+  st.trainerClass = trainerInfo and tonumber(trainerInfo.class)
   st.trainerClassName = trainerInfo and trainerInfo.className
   st.trainerName = (trainerInfo and trainerInfo.name) or opts.trainerName
+  -- pokefirered/src/trainer_tower.c:447, src/battle_tower.c:1340
+  if st.trainerTower or st.eReader then
+    local facilityClass = tonumber(opts.foe and opts.foe.trainerClass)
+    local tower = require("src.core.game3.trainer_tower").pack()
+    local classes = tower and tower.facilityClassTrainerClass
+    if type(classes) ~= "table" then error("trainer_tower.lua has no facilityClassTrainerClass") end
+    st.trainerClass = classes[facilityClass]
+    if st.trainerClass == nil then error("no trainer class for facility class " .. tostring(facilityClass)) end
+  end
   -- pokefirered/src/battle_message.c:394 the link opponent is named, never classed
   if st.link and not st.unionRoom and st.peerName then
+    st.trainerClass = nil
     st.trainerClassName = ""
     st.trainerName = st.peerName
   end
@@ -575,7 +654,7 @@ function Battle.start(opts)
     or (trainerInfo and trainerInfo.items)
     or { 0, 0, 0, 0 }
   st.playerGender = playerGender
-  st.overworldWeather = opts.overworldWeather or overworld_weather()
+  st.overworldWeather = (not st.link) and (opts.overworldWeather or overworld_weather()) or nil
   do
     -- pokefirered/src/battle_controllers.c:59
     local okAi, Ai = pcall(require, "src.core.game3.battle.ai")
@@ -614,11 +693,10 @@ function Battle.start(opts)
   }
   if IntroSeq.begin(st, introOpts) then
     -- pokefirered/src/battle_message.c:1564 sText_LinkTrainerWantsToBattle
-    if st.link and not st.unionRoom then
-      local who = st.peerName or ""
+    if st.link then
       local texts = {
-        Strings("%s\nwants to battle!", who),
-        Strings("%s sent out\n%s!", who, State.displayName(st.enemy)),
+        IntroSeq.introText(st),
+        IntroSeq.sendOutText(st, "enemy"),
       }
       local n = 0
       for _, step in ipairs(IntroSeq._steps or {}) do
@@ -629,27 +707,26 @@ function Battle.start(opts)
       end
     end
   else
-    -- Headless / skip: push FRLG strings for log parity.
     local ename = State.displayName(st.enemy)
     if st.ghostBattle then
       for _, t in ipairs(IntroSeq.headlessGhostIntro(st)) do Ui.push(t) end
     elseif st.wild then
-      Ui.push(Strings("Wild %s appeared!", ename))
+      Ui.push(IntroSeq.introText(st))
+    elseif st.link then
+      -- pokefirered/src/battle_message.c:1551
+      Ui.push(IntroSeq.introText(st))
+      Ui.push(IntroSeq.sendOutText(st, "enemy"))
+      if st.double then Ui.push(IntroSeq.sendOutText(st, "player")) end
     elseif st.double then
       for _, t in ipairs(D.headlessIntro(st, trainerId, rivalName)) do Ui.push(t) end
-    elseif st.link and not st.unionRoom then
-      -- pokefirered/src/battle_message.c:389
-      Ui.push(Strings("%s\nwants to battle!", st.peerName or ""))
-      -- pokefirered/src/battle_message.c:394
-      Ui.push(Strings("%s sent out\n%s!", st.peerName or "", ename))
     else
       local strings = Trainers.introStrings(trainerId, ename, { rivalName = rivalName })
       Ui.push(strings.wants)
       Ui.push(strings.sentOut)
     end
     -- pokefirered/src/battle_main.c:2801
-    if not st.double and not st.safari then
-      Ui.push(Strings("Go! %s!", State.displayName(st.player)))
+    if not st.double and not st.safari and not st.oldManTutorial then
+      Ui.push(IntroSeq.sendOutText(st, "player"))
     end
     -- pokefirered/src/battle_controller_oak_old_man.c:626
     if Oak.active(st) and not st.oakIntroDone then
@@ -702,7 +779,7 @@ local function focus_punch_prelude()
   for _, b in ipairs(list) do
     if not ad:isFainted(b) then
       ad:playAnim("general", "FOCUS_PUNCH_SETUP", b, b)
-      ad:say(Strings("%s is tightening\nits focus!", ad:displayName(b)))
+      ad:sayText("STRINGID_PKMNTIGHTENINGFOCUS", { atk = b })
     end
   end
   ad._say = prev
@@ -717,9 +794,12 @@ local function begin_start_effects()
   local mark = ad:eventMark()
   local prev = ad._say
   ad._say = function() end
-  local ok = pcall(Engine.battleStartEffects, st, ad)
+  local ok, startErr = pcall(Engine.battleStartEffects, st, ad)
   ad._say = prev
-  if not ok then return false end
+  if not ok then
+    print("[game3/battle] start effects failed: " .. tostring(startErr))
+    return false
+  end
   local evs = ad:eventsSince(mark)
   if #evs == 0 then return false end
   if Battle._headless then
@@ -739,24 +819,41 @@ local function link_battle()
 end
 
 -- pokefirered/src/battle_main.c:3226 HandleTurnActionSelectionState
-local function link_enemy_action(st, msg, id)
+local function link_side_action(st, msg, id, side)
   if type(msg) ~= "table" then return nil end
-  if msg.kind == "run" then return { kind = "run", user = "enemy" } end
+  local lockedB = (id and State.battler(st, id)) or st[side]
+  if lockedB and (lockedB.expLockedMove or lockedB.expMustRecharge) then
+    -- pokefirered/src/battle_main.c:3125
+    local mon = lockedB.mon or {}
+    local slot = lockedB.expLockedSlot or 1
+    return { kind = "move", slot = slot, user = side, locked = true,
+      move = lockedB.expLockedMove or lockedB.lastMoveId or lockedB.lastMove or (mon.moves and mon.moves[slot]),
+      target = st.moveTarget and id and st.moveTarget[id] or nil }
+  end
+  if msg.kind == "run" then return { kind = "run", user = side } end
   if msg.kind == "switch" then
-    return { kind = "switch", user = "enemy", slot = tonumber(msg.slot) }
+    return { kind = "switch", user = side, slot = tonumber(msg.slot) }
   end
   if msg.kind == "bag" or msg.kind == "item" then
-    return { kind = "item", user = "enemy", item = msg.item }
+    local itemId = tonumber(msg.itemId)
+    return { kind = (side == "player") and "bag" or "item", user = side, item = itemId, itemId = itemId }
   end
-  local battler = (id and State.battler(st, id)) or st.enemy
+  local battler = (id and State.battler(st, id)) or st[side]
   local mon = battler and battler.mon
+  if msg.move == "STRUGGLE" or (msg.slot == nil and msg.move == nil) then
+    return { kind = "move", move = "STRUGGLE", slot = nil, user = side }
+  end
   local slot = math.floor(tonumber(msg.slot) or 1)
   if slot < 1 or slot > 4 then slot = 1 end
   local move = mon and mon.moves and mon.moves[slot]
   if not move or move == 0 or move == "" then
-    return { kind = "move", move = "STRUGGLE", slot = nil, user = "enemy" }
+    return { kind = "move", move = "STRUGGLE", slot = nil, user = side }
   end
-  return { kind = "move", move = move, slot = slot, user = "enemy" }
+  return { kind = "move", move = move, slot = slot, user = side }
+end
+
+local function link_enemy_action(st, msg, id)
+  return link_side_action(st, msg, id, "enemy")
 end
 
 Battle._linkEnemyAction = link_enemy_action
@@ -768,29 +865,90 @@ local function link_enemy_action_for(st, msg, id)
   act.user = nil
   act.battler = id
   local target = tonumber(msg and msg.target)
-  if target then act.target = (target % 2 == 0) and (target + 1) or (target - 1) end
+  if target and not act.locked then act.target = (target % 2 == 0) and (target + 1) or (target - 1) end
   return act
 end
 
+local function link_own_action_for(st, msg, id)
+  local act = link_side_action(st, msg, id, "player")
+  if not act then return nil end
+  act.user = nil
+  act.battler = id
+  if not act.locked then act.target = tonumber(msg and msg.target) end
+  return act
+end
+
+local function link_pending_party(st, side)
+  if side == "player" then return st and st.playerParty end
+  return st and st.foeParty
+end
+
+-- pokefirered/src/battle_controllers.c:248
+local function link_canon(st, id)
+  id = tonumber(id)
+  if id == nil then return nil end
+  if st and st.multi and st.linkSeatOf then return st.linkSeatOf[id] end
+  if st and st.linkMaster == false then return (id % 2 == 0) and (id + 1) or (id - 1) end
+  return id
+end
+
+local function link_local(st, id)
+  id = tonumber(id)
+  if id == nil then return nil end
+  if st and st.multi and st.linkLocalOf then return st.linkLocalOf[id] end
+  return link_canon(st, id)
+end
+
+local function multi_remote(st, id)
+  return st and st.multi and (st.spectate or id ~= st.linkOwn) and true or false
+end
+
 -- pokefirered/data/battle_scripts_1.s:2837 switchhandleorder BS_FAINTED
-local function link_peer_replacement(st)
+local function link_replacement(st, side, battler)
   local LB = link_battle()
   if not LB then return nil end
-  local slot = LB.peerSwitch()
+  local slot
+  if st and st.multi and battler ~= nil then
+    slot = LB.seatSwitch(st.linkSeatOf[battler])
+  elseif side == "player" then
+    slot = LB.ownSwitch and LB.ownSwitch() or nil
+  else
+    slot = LB.peerSwitch()
+  end
   if not slot then return nil end
-  local mon = st and st.foeParty and st.foeParty[slot]
-  if not (mon and (tonumber(mon.hp) or 0) > 0) then return nil end
+  local party = link_pending_party(st, side)
+  local mon = party and party[slot]
+  if not (mon and (tonumber(mon.hp) or 0) > 0)
+      or (battler ~= nil and not State.ownsSlot(st, battler, slot)) then
+    LB.protocolError("switch")
+    return nil
+  end
   return slot
+end
+
+local function link_wait_seat(st, side, battler)
+  if st and st.multi and battler ~= nil then return st.linkSeatOf[battler] end
+  if st and st.spectate then return (side == "player") and 0 or 1 end
+  return nil
 end
 
 local function link_switch_step()
   local pending = Battle._linkSwitch
   if not pending then return true end
   local st = Battle._st
-  local slot = link_peer_replacement(st)
+  local slot = link_replacement(st, pending.side or "enemy", pending.battler)
   local LB = link_battle()
   if not slot then
-    if LB and LB.linkOpen() then return false end
+    if LB and LB.isActive() then
+      if not LB.linkOpen() then
+        -- pokefirered/src/cable_club.c:1002
+        LB.peerDropped()
+      elseif LB.peerAhead(link_wait_seat(st, pending.side, pending.battler), st and st.turn) then
+        -- pokefirered/src/battle_main.c:3097
+        LB.protocolError("switch")
+      end
+      return false
+    end
     slot = pending.fallback
   end
   Battle._linkSwitch = nil
@@ -800,23 +958,53 @@ end
 
 Battle._linkSwitchStep = link_switch_step
 
-local function with_link_replacement(st, fallback, cb)
+local function with_link_replacement(st, fallback, cb, side, battler)
   local LB = st and st.link and link_battle() or nil
-  if not (LB and LB.isActive() and LB.linkOpen()) then return cb(fallback) end
-  Battle._linkSwitch = { cb = cb, fallback = fallback }
+  if not (LB and LB.isActive()) then return cb(fallback) end
+  Battle._linkSwitch = { cb = cb, fallback = fallback, side = side or "enemy", battler = battler }
   Battle._phase = "linkswitch"
   link_switch_step()
+end
+
+-- pokefirered/src/battle_main.c:4287
+local function link_run_result(mine, theirs)
+  if mine and theirs then return "draw" end
+  if mine then return "run" end
+  if theirs then return "win" end
+  return nil
+end
+
+local function link_run_end(st, result)
+  st.over = true
+  st.result = result
+  st.linkRan = true
+  st.endReason = "link_run"
+  Battle._actions = {}
+  Battle._metaAct = nil
+  Battle._midTurn = nil
+  local shown = (result == "run") and "lose" or result
+  Ui.push(Battle.linkEndText(st, shown, true))
+  Battle._pendingEnd = result
+  Battle._phase = "ending"
 end
 
 local function resolve_turn(playerAct, enemyAct)
   local st = Battle._st
   local ad = Battle._adapter
   local actions, meta = Engine.planTurnFromActions(st, ad, playerAct, enemyAct)
+  local first = actions and actions[1]
+  if meta and st.link and st.linkMaster == false and first and first.battler == 1
+      and (first.kind == "switch" or first.kind == "item") then
+    -- pokefirered/src/battle_main.c:3586
+    table.insert(actions, 2, { kind = "player_meta", meta = meta, battler = 0 })
+    meta = nil
+  end
   open_turn(st, playerAct, enemyAct, nil)
   Battle._actions = actions
   Battle._actionI = 1
   Battle._metaAct = meta
   Battle._phase = "actions"
+  Battle._midTurn = true
   local evs = focus_punch_prelude()
   if evs and #evs > 0 then
     if Battle._headless then
@@ -830,6 +1018,67 @@ local function resolve_turn(playerAct, enemyAct)
   end
 end
 
+-- pokefirered/src/battle_main.c:3097
+local function multi_turn_step()
+  local st = Battle._st
+  local LB = link_battle()
+  local got = {}
+  for id = 0, 3 do
+    if State.battler(st, id) and not State.isAbsent(st, id) and multi_remote(st, id) then
+      local msg = LB.seatAction(st.linkSeatOf[id], st.turn)
+      if not msg then
+        -- pokefirered/src/cable_club.c:1002
+        if not LB.linkOpen() then
+          LB.peerDropped()
+        elseif LB.peerAhead(st.linkSeatOf[id], st.turn) then
+          LB.protocolError("action")
+        end
+        return false
+      end
+      got[id] = msg
+    end
+  end
+  local chosen = Battle._linkAct or {}
+  Battle._linkAct = nil
+  Battle._linkMulti = nil
+  st.monToSwitchInto = st.monToSwitchInto or {}
+  for id = 0, 3 do
+    local msg = got[id]
+    if msg then
+      LB.forgetSeatAction(st.linkSeatOf[id], st.turn)
+      -- pokefirered/src/battle_main.c:3182
+      if msg.kind == "list" or msg.kind == "bag" or msg.kind == "item" or msg.actions ~= nil then
+        LB.protocolError("action")
+        return false
+      end
+      local side = State.sideOf(id)
+      local act = link_side_action(st, msg, id, side)
+      act.user = nil
+      act.battler = id
+      if not act.locked then act.target = link_local(st, msg.target) end
+      if act.kind == "switch" then
+        local party = link_pending_party(st, side)
+        local mon = party and act.slot and party[act.slot]
+        if not (mon and (tonumber(mon.hp) or 0) > 0 and State.ownsSlot(st, id, act.slot)) then
+          LB.protocolError("switch")
+          return false
+        end
+        st.monToSwitchInto[id] = act.slot
+      end
+      chosen[id] = act
+    end
+  end
+  local function ran(a) return a ~= nil and a.kind == "run" end
+  -- pokefirered/src/battle_main.c:4283
+  local result = link_run_result(ran(chosen[0]) or ran(chosen[2]), ran(chosen[1]) or ran(chosen[3]))
+  if result then
+    link_run_end(st, result)
+    return true
+  end
+  D.resolveDoubleTurn(chosen)
+  return true
+end
+
 local function link_turn_step()
   local st = Battle._st
   local LB = link_battle()
@@ -837,10 +1086,15 @@ local function link_turn_step()
     Battle._phase = "command"
     return false
   end
+  if Battle._linkMulti then return multi_turn_step() end
   local msg = LB.peerAction(st.turn)
   if not msg then
     -- pokefirered/src/cable_club.c:1002 Task_WaitForLinkPlayerConnection
-    if not LB.linkOpen() then LB.peerDropped() end
+    if not LB.linkOpen() then
+      LB.peerDropped()
+    elseif LB.peerAhead(st.spectate and 1 or nil, st.turn) then
+      LB.protocolError("action")
+    end
     return false
   end
   LB.forgetAction(st.turn)
@@ -849,20 +1103,112 @@ local function link_turn_step()
   if Battle._linkDouble then
     Battle._linkDouble = nil
     local chosen = playerAct or {}
-    local list = msg.actions or { msg }
-    local i = 1
-    for _, id in ipairs({ 1, 3 }) do
+    local list = msg.actions
+    if msg.kind ~= "list" or type(list) ~= "table" or #list ~= 2 then
+      LB.protocolError("action")
+      return false
+    end
+    local mineRun = (chosen[0] and chosen[0].kind == "run") or (chosen[2] and chosen[2].kind == "run")
+    local theirRun = false
+    st.monToSwitchInto = st.monToSwitchInto or {}
+    -- pokefirered/src/battle_main.c:3226
+    for i, id in ipairs({ 1, 3 }) do
       if State.battler(st, id) and not State.isAbsent(st, id) then
-        chosen[id] = link_enemy_action_for(st, list[i] or list[1], id)
-        i = i + 1
+        chosen[id] = link_enemy_action_for(st, list[i], id)
+        if chosen[id] and chosen[id].kind == "run" then theirRun = true end
+        if chosen[id] and chosen[id].kind == "switch" then st.monToSwitchInto[id] = chosen[id].slot end
       end
+    end
+    local ran = link_run_result(mineRun, theirRun)
+    if ran then
+      link_run_end(st, ran)
+      return true
     end
     D.resolveDoubleTurn(chosen)
     return true
   end
-  resolve_turn(playerAct, link_enemy_action(st, msg))
+  if msg.kind == "list" then
+    LB.protocolError("action")
+    return false
+  end
+  local enemyAct = link_enemy_action(st, msg)
+  local ran = link_run_result(playerAct and playerAct.kind == "run", enemyAct and enemyAct.kind == "run")
+  if ran then
+    link_run_end(st, ran)
+    return true
+  end
+  resolve_turn(playerAct, enemyAct)
   return true
 end
+
+local function spectate_turn_step()
+  local st = Battle._st
+  local LB = link_battle()
+  if not (st and LB and LB.ownAction) then return false end
+  local turn = st.turn + 1
+  if st.multi then
+    for id = 0, 3 do
+      if State.battler(st, id) and not State.isAbsent(st, id) and not LB.seatAction(st.linkSeatOf[id], turn) then
+        if not LB.linkOpen() then
+          LB.peerDropped()
+        elseif LB.peerAhead(st.linkSeatOf[id], turn) then
+          LB.protocolError("action")
+        end
+        return false
+      end
+    end
+    LB.beginSpectatedTurn(turn)
+    st.monToSwitchInto = {}
+    st.turn = turn
+    Battle._linkAct = {}
+    Battle._linkMulti = true
+    Battle._phase = "linkwait"
+    return link_turn_step()
+  end
+  local msg = LB.ownAction(turn)
+  if not msg then
+    if not LB.linkOpen() then
+      LB.peerDropped()
+    elseif LB.peerAhead(0, turn) then
+      LB.protocolError("action")
+    end
+    return false
+  end
+  if st.double then
+    local list = msg.actions
+    if msg.kind ~= "list" or type(list) ~= "table" or #list ~= 2 then
+      LB.protocolError("action")
+      return false
+    end
+    local chosen = {}
+    for i, id in ipairs({ 0, 2 }) do
+      if State.battler(st, id) and not State.isAbsent(st, id) then
+        chosen[id] = link_own_action_for(st, list[i], id)
+        if chosen[id] and chosen[id].kind == "switch" then
+          st.monToSwitchInto = st.monToSwitchInto or {}
+          st.monToSwitchInto[id] = chosen[id].slot
+        end
+      end
+    end
+    st.monToSwitchInto = st.monToSwitchInto or {}
+    st.turn = turn
+    Battle._linkAct = chosen
+    Battle._linkDouble = true
+    Battle._phase = "linkwait"
+    return link_turn_step()
+  end
+  if msg.kind == "list" then
+    LB.protocolError("action")
+    return false
+  end
+  local act = link_side_action(st, msg, 0, "player")
+  st.turn = turn
+  Battle._linkAct = act
+  Battle._phase = "linkwait"
+  return link_turn_step()
+end
+
+Battle._spectateTurnStep = spectate_turn_step
 
 Battle._linkTurnStep = link_turn_step
 Battle._linkBattle = link_battle
@@ -873,32 +1219,51 @@ local function refuse_link_item(input)
   if not (input and st and st.link) then return false end
   if Ui._mode ~= "menu" or not input:wasPressed("a") then return false end
   if Commands.MENU[Ui._menuIndex or 1] ~= "BAG" then return false end
-  -- pokefirered/src/battle_message.c:251
-  Ui.push(Strings("Items can't be used now."))
+  Ui.refuseItems()
   return true
 end
 
 Battle._refuseLinkItem = refuse_link_item
+
+local function auto_player_action(st)
+  if st and st.oldManTutorial then
+    return { kind = "bag", itemId = 4, user = "player" }
+  end
+  -- pokefirered/src/battle_controller_pokedude.c:2429 PokedudeSimulateInputChooseAction
+  if st and st.pokedude then return Pokedude.autoPlayerAction(st) end
+  return Commands.playerAction(st, 1, 1)
+end
 
 local function begin_turn_with(playerAct)
   local st = Battle._st
   if st and st.double then return D.startSelection() end
   if st and st.link and playerAct and playerAct.kind == "bag" then
     -- pokefirered/src/battle_main.c:3182
-    Ui.push(Strings("Items can't be used now."))
+    Ui.refuseItems()
     Battle._phase = "command"
     return
   end
-  st.turn = st.turn + 1
   local LB = st.link and link_battle() or nil
   if LB and LB.isActive() then
+    local pb = st.player
+    if pb and (pb.expLockedMove or pb.expMustRecharge) then
+      -- pokefirered/src/battle_main.c:3125
+      playerAct = D.lockedAction(st, 0)
+      playerAct.user = "player"
+    end
+  end
+  st.turn = st.turn + 1
+  if LB and LB.isActive() then
     LB.sendAction(st.turn, playerAct)
+    if st.over or not Battle._active then return end
     Battle._linkAct = playerAct
     Battle._phase = "linkwait"
     link_turn_step()
     return
   end
-  resolve_turn(playerAct, Commands.enemyAction(st))
+  -- pokefirered/src/battle_controllers.c:93
+  local enemyAct = st.pokedude and Pokedude.enemyAction(st) or Commands.enemyAction(st)
+  resolve_turn(playerAct, enemyAct)
 end
 
 local function choice_hooks()
@@ -927,10 +1292,12 @@ local function begin_evo_or_end()
     local Pokemon = require("src.core.game3.pokemon")
     for _, entry in ipairs(pending) do
       local fromName = Pokemon.displayMonName(entry.mon)
-      local intoName = Pokemon.name(entry.toSpecies) or "?"
-      Ui.push(Strings("What?\n%s is evolving!", fromName))
+      local intoName = Pokemon.name(entry.toSpecies)
+      -- pokefirered/src/evolution_scene.c:678
+      Ui.push(RomText.ascii("gText_PkmnIsEvolving", { stringVars = { fromName } }))
       Evolution.apply(entry.mon, entry.toSpecies, session)
-      Ui.push(Strings("Congratulations! Your %s\nevolved into %s!", fromName, intoName))
+      -- pokefirered/src/evolution_scene.c:775
+      Ui.push(RomText.ascii("gText_CongratsPkmnEvolved", { stringVars = { fromName, intoName } }))
     end
     Battle._phase = "ending"
     return
@@ -945,17 +1312,15 @@ local function begin_evo_or_end()
   end
 end
 
-local function send_out_enemy_next(nextEnemyIdx)
+local resume_turn
+
+local function send_out_enemy_next(nextEnemyIdx, after)
   local st = Battle._st
   if not st then return end
   local pushFn = function(text) Ui.push(text) end
   local onDone = function()
-    Battle._phase = "command"
-    if Battle._auto then
-      begin_turn_with(Commands.playerAction(st, 1, 1))
-    else
-      Ui.openMenu()
-    end
+    if after then return after() end
+    resume_turn()
   end
   if Battle._headless or Battle._auto then
     SwitchSeq.beginSendOut(st, "enemy", nextEnemyIdx, {
@@ -973,6 +1338,17 @@ local function send_out_enemy_next(nextEnemyIdx)
   end
 end
 
+-- pokefirered/src/battle_script_commands.c:3413
+function D.linkDraw(st)
+  st.over = true
+  st.result = "draw"
+  Battle._actions = {}
+  Battle._pendingEnd = "draw"
+  Battle._phase = "ending"
+  -- pokefirered/data/battle_scripts_1.s:2984
+  Ui.push(Battle.linkEndText(st, "draw"))
+end
+
 -- pokefirered/src/battle_main.c:3781
 function D.pushBattleLost(st)
   if st and st.link then
@@ -987,8 +1363,20 @@ function D.pushBattleLost(st)
     Oak.say(st, "howDisappointing")
     if st.rivalHealAfter then return end
   end
-  Ui.push(Strings("You have no more\nPOKéMON left!"))
-  Ui.push(Strings("%s blacked out!", ((st and st.playerName) or "PLAYER")))
+  local session = st and st.session
+  local money = tonumber(session and session.money) or 0
+  -- pokefirered/src/battle_script_commands.c:5379
+  local loss = math.min(require("src.core.game3.battle_bridge").calcMoneyLossFrlg(session), money)
+  local fill = Adapter.fill(st, { buff1 = tostring(loss) })
+  if st and st.wild then
+    -- pokefirered/data/battle_scripts_1.s:2932
+    Ui.push(BattleText.get("STRINGID_PLAYERWHITEOUT", fill))
+    Ui.push(BattleText.get(loss > 0 and "STRINGID_PLAYERWHITEOUT2" or "STRINGID_PLAYERWHITEDOUT", fill))
+  else
+    -- pokefirered/data/battle_scripts_1.s:2940
+    Ui.push(BattleText.get("STRINGID_PLAYERLOSTAGAINSTENEMYTRAINER", fill))
+    Ui.push(BattleText.get(loss > 0 and "STRINGID_PLAYERPAIDPRIZEMONEY" or "STRINGID_PLAYERWHITEDOUT", fill))
+  end
 end
 
 local function handle_player_faint(opts)
@@ -1000,10 +1388,29 @@ local function handle_player_faint(opts)
   end
   local hasLiving = Engine.hasLivingMons(st.playerParty)
   if not hasLiving then
+    if st.link and st.enemy and st.foeParty then State.syncBattlerToParty(st.enemy, st.foeParty) end
+    if st.link and not Engine.hasLivingMons(st.foeParty) then return D.linkDraw(st) end
     Battle._pendingEnd = "lose"
     Battle._phase = "ending"
     D.pushBattleLost(st)
     return
+  end
+
+  local onDone = function()
+    if opts.after then return opts.after() end
+    resume_turn()
+  end
+
+  if st.spectate then
+    local nextI = Engine.nextLivingMonIndex(st.playerParty, st.player and st.player.partyIndex) or 1
+    return with_link_replacement(st, nextI, function(slot)
+      SwitchSeq.beginSendOut(st, "player", slot, {
+        headless = Battle._headless,
+        pushMsg = function(t) Ui.push(t) end,
+        onDone = onDone,
+      })
+      if not Battle._headless then Battle._phase = "switching" end
+    end, "player")
   end
 
   if Battle._headless or Battle._auto then
@@ -1015,14 +1422,7 @@ local function handle_player_faint(opts)
     SwitchSeq.beginSendOut(st, "player", nextI, {
       headless = true,
       pushMsg = function(t) Ui.push(t) end,
-      onDone = function()
-        Battle._phase = "command"
-        if Battle._auto then
-          begin_turn_with(Commands.playerAction(st, 1, 1))
-        else
-          Ui.openMenu()
-        end
-      end,
+      onDone = onDone,
     })
     return
   end
@@ -1048,10 +1448,7 @@ local function handle_player_faint(opts)
       SwitchSeq.beginSendOut(st, "player", slot, {
         headless = false,
         pushMsg = function(t) Ui.push(t) end,
-        onDone = function()
-          Battle._phase = "command"
-          Ui.openMenu()
-        end,
+        onDone = onDone,
       })
       Battle._phase = "switching"
     end,
@@ -1067,15 +1464,13 @@ local function begin_trainer_win(st)
   else
     role, fallback = Trainers.getVictoryMusicRole(st and st.trainerId)
   end
-  Audio.playSong(Audio.role(role) or fallback)
+  -- pokefirered/src/battle_script_commands.c:3216
+  if not st.pokedude then Audio.playSong(Audio.role(role) or fallback) end
 
-  local pname = st.playerName or "PLAYER"
+  local pname = st.playerName
   local function push_defeated()
-    local trName = (st.trainerClassName and st.trainerClassName ~= "")
-      and (st.trainerClassName .. " " .. (st.trainerName or ""))
-      or (st.trainerName or "TRAINER")
     -- pokefirered/data/battle_scripts_1.s:2912
-    Ui.push(Strings("%s defeated\n%s!", pname, trName))
+    Ui.push(BattleText.get("STRINGID_PLAYERDEFEATEDTRAINER1", Adapter.fill(st)))
   end
   -- pokefirered/data/battle_scripts_1.s:2991 BattleScript_BattleTowerTrainerBattleWon
   local facilityTrainer = (st.trainerTower or st.eReader) and true or false
@@ -1123,7 +1518,7 @@ local function begin_trainer_win(st)
     if bonus > 0 then
       Ui.push(Prize.payDayMessage((session and session.name) or pname, bonus))
     end
-    Prize.pickup((session and session.party) or st.playerParty)
+    Prize.pickup(st.playerParty or (session and session.party))
   end
 
   if st.link then
@@ -1162,20 +1557,21 @@ local function push_awards_headless(awards)
     if (r.gained or 0) > 0 then
       local name = entry.battler and State.displayName(entry.battler)
         or Pokemon.displayMonName(entry.mon)
-      if entry.boosted then
-        Ui.push(Strings("%s gained a boosted\n%s EXP. Points!", name, tostring(r.gained)))
-      else
-        Ui.push(Strings("%s gained\n%s EXP. Points!", name, tostring(r.gained)))
-      end
+      -- pokefirered/src/battle_script_commands.c:3265
+      Ui.push(BattleText.get("STRINGID_PKMNGAINEDEXP", { buff1 = name,
+        buff2 = BattleText.get(entry.boosted and "STRINGID_ABOOSTED" or "STRINGID_EMPTYSTRING4"),
+        buff3 = tostring(r.gained) }))
       for _, lv in ipairs(r.levels or {}) do
-        Ui.push(Strings("%s grew to\nLV. %s!", name, tostring(lv)))
+        -- pokefirered/src/battle_script_commands.c:3307
+        Ui.push(BattleText.get("STRINGID_PKMNGREWTOLV", { buff1 = name, buff2 = tostring(lv) }))
         Battle._leveledUp[entry.partyIndex or 1] = true
       end
       for _, lv in ipairs(r.levels or {}) do
         for _, mv in ipairs(Pokemon.movesLearnedAt(
           tonumber(entry.mon and entry.mon.species), lv)) do
           if Pokemon.teachMove(entry.mon, mv) then
-            Ui.push(Strings("%s learned\n%s!", name, Pokemon.moveName(mv)))
+            -- pokefirered/data/battle_scripts_1.s:3143
+            Ui.push(BattleText.get("STRINGID_PKMNLEARNEDMOVE", { buff1 = name, buff2 = Pokemon.moveName(mv) }))
           end
         end
       end
@@ -1208,7 +1604,7 @@ local function handle_enemy_faint(opts)
   end
   Battle._leveledUp = {}
   local nextEnemyIdx = (not st.wild) and Engine.nextLivingMonIndex(st.foeParty, st.enemy and st.enemy.partyIndex)
-  if nextEnemyIdx then
+  if nextEnemyIdx and not st.link then
     -- pokefirered/src/battle_controller_opponent.c:1416
     local okS, pick = pcall(Engine.mostSuitableMon, st, Battle._adapter, "enemy")
     if okS and pick and st.foeParty[pick] and (tonumber(st.foeParty[pick].hp) or 0) > 0 then
@@ -1220,13 +1616,7 @@ local function handle_enemy_faint(opts)
     if not nextEnemyIdx then
       begin_trainer_win(st)
     else
-      if opts.onFinished then
-        with_link_replacement(st, nextEnemyIdx, function(slot)
-          send_out_enemy_next(slot)
-          opts.onFinished()
-        end)
-        return
-      end
+      if opts.onFinished then return opts.onFinished(nextEnemyIdx) end
       local okO, Options = pcall(require, "src.core.game3.options")
       local okR, Runtime = pcall(require, "src.core.game3.runtime")
       local session = okR and Runtime.getSession and Runtime.getSession()
@@ -1240,10 +1630,8 @@ local function handle_enemy_faint(opts)
         local nextSp = nextMon and (nextMon.species or nextMon.speciesId)
         local Pokemon = require("src.core.game3.pokemon")
         local nextName = Pokemon.name(nextSp)
-        local trName = (st.trainerClassName and st.trainerClassName ~= "")
-          and (st.trainerClassName .. " " .. (st.trainerName or ""))
-          or (st.trainerName or "TRAINER")
-        Ui.push(Strings("%s is\nabout to use %s.\\pWill %s change\nPOKéMON?", trName, nextName, (st.playerName or "PLAYER")))
+        -- pokefirered/data/battle_scripts_1.s:2846
+        Ui.push(BattleText.get("STRINGID_ENEMYABOUTTOSWITCHPKMN", Adapter.fill(st, { buff2 = nextName })))
         Battle._shiftEnemyIdx = nextEnemyIdx
         Battle._shiftAsked = false
         Battle._phase = "shift_prompt"
@@ -1252,6 +1640,15 @@ local function handle_enemy_faint(opts)
   end
 
   local hooks = choice_hooks()
+  if st.pokedude then
+    for _, entry in ipairs(awards) do
+      if entry.result and (entry.result.gained or 0) > 0 then
+        -- pokefirered/src/battle_script_commands.c:3265
+        Pokedude.event(st, "printstring", "player", "STRINGID_PKMNGAINEDEXP")
+        break
+      end
+    end
+  end
   if Battle._headless then
     push_awards_headless(awards)
     onAwardsFinished()
@@ -1288,8 +1685,16 @@ local function check_faints_and_end()
       handle_enemy_faint({ mutual = true })
       return true
     else
-      handle_enemy_faint({ mutual = true, onFinished = function()
-        handle_player_faint()
+      -- pokefirered/src/battle_util.c:1195
+      handle_enemy_faint({ mutual = true, onFinished = function(nextEnemyIdx)
+        if st.link and not st.linkMaster then
+          return with_link_replacement(st, nextEnemyIdx, function(slot)
+            send_out_enemy_next(slot, function() handle_player_faint() end)
+          end)
+        end
+        handle_player_faint({ after = function()
+          with_link_replacement(st, nextEnemyIdx, send_out_enemy_next)
+        end })
       end })
       return true
     end
@@ -1308,13 +1713,12 @@ local function check_faints_and_end()
   elseif endResult == "lose" then
     handle_player_faint()
     return true
+  elseif endResult == "draw" and st.link then
+    D.linkDraw(st)
+    return true
   end
 
   return false
-end
-
-local function begin_win_award()
-  handle_enemy_faint()
 end
 
 local function after_actions()
@@ -1322,6 +1726,7 @@ local function after_actions()
   local ad = Battle._adapter
   if st and st.double then return D.afterActions() end
   if end_if_over() then return end
+  Battle._midTurn = nil
   local events = Engine.collectResidualEvents(st, ad)
   close_turn(st)
   Battle._residualEvents = events
@@ -1338,7 +1743,7 @@ local function after_actions()
     end
     Battle._phase = "command"
     if Battle._auto then
-      begin_turn_with(Commands.playerAction(Battle._st, 1, 1))
+      begin_turn_with(auto_player_action(Battle._st))
     end
     return
   end
@@ -1349,6 +1754,24 @@ local function after_actions()
   end
   AnimSeq.beginEvents(stream, seq_push)
   Battle._phase = "residuals"
+end
+
+-- pokefirered/src/battle_main.c:4433
+resume_turn = function()
+  local st = Battle._st
+  if not st then return end
+  if Battle._midTurn then
+    -- pokefirered/data/battle_scripts_1.s:2886 cancelallactions
+    Battle._actions = {}
+    Battle._phase = "actions"
+    return after_actions()
+  end
+  Battle._phase = "command"
+  if Battle._auto then
+    begin_turn_with(auto_player_action(st))
+  else
+    Ui.openMenu()
+  end
 end
 
 local function battle_session(st)
@@ -1377,7 +1800,7 @@ end
 local function safari_out_of_balls(st)
   if not (st and st.safari and st.safariState) then return false end
   if (tonumber(st.safariState.balls) or 0) > 0 then return false end
-  Ui.push(Strings("ANNOUNCER: You're out of\nSAFARI BALLS! Game over!"))
+  Ui.push(BattleText.get("STRINGID_OUTOFSAFARIBALLS"))
   Battle._actions = {}
   st.over = true
   -- pokefirered/data/battle_scripts_2.s:112
@@ -1433,8 +1856,6 @@ local function step_safari(meta)
   if meta.action == "ball" then return step_safari_ball() end
   local sf = st.safariState
   local session = battle_session(st)
-  local playerName = (session and (session.name or session.playerName)) or st.playerName or "RED"
-  local ename = State.displayName(st.enemy)
   local rng = (ad and ad.rng and ad:rng()) or st.rng
   local mark = ad:eventMark()
   local prev = ad._say
@@ -1442,11 +1863,11 @@ local function step_safari(meta)
   if meta.action == "rock" then
     -- pokefirered/src/battle_main.c:4398
     Rules.safari.throwRock(sf, rng)
-    ad:say(Strings("%s threw a ROCK\nat the %s!", playerName, ename))
+    ad:sayText("STRINGID_THREWROCK", { playerName = (session and session.name) or st.playerName, opponentMon1 = st.enemy })
     ad:playAnim("general", "ROCK_THROW", st.player, st.enemy)
   else
     Rules.safari.throwBait(sf, rng)
-    ad:say(Strings("%s threw some BAIT\nat the %s!", playerName, ename))
+    ad:sayText("STRINGID_THREWBAIT", { playerName = (session and session.name) or st.playerName, opponentMon1 = st.enemy })
     ad:playAnim("general", "BAIT_THROW", st.player, st.enemy)
   end
   ad._say = prev
@@ -1464,13 +1885,12 @@ end
 -- pokefirered/src/battle_main.c:4334
 local function step_safari_enemy(act)
   local st, ad = Battle._st, Battle._adapter
-  local ename = State.displayName(st.enemy)
   local mark = ad:eventMark()
   local prev = ad._say
   ad._say = function() end
   if act.kind == "run" then
-    -- pokefirered/src/battle_message.c:323
-    ad:say(Strings("Wild %s fled!", ename))
+    -- pokefirered/src/battle_main.c:3819
+    ad:sayText("STRINGID_WILDPKMNFLED", { buff1 = State.displayName(st.enemy) })
     st.over = true
     st.result = "run"
     st.endReason = "enemy_fled"
@@ -1478,13 +1898,14 @@ local function step_safari_enemy(act)
     local reaction = Rules.safari.watchStep(st.safariState)
     if reaction == "angry" then
       st.safariReaction = 1
-      ad:say(Strings("%s is angry!", ename))
+      -- pokefirered/src/battle_message.c:1188
+      ad:sayText("STRINGID_PKMNANGRY", { opponentMon1 = st.enemy })
     elseif reaction == "eating" then
       st.safariReaction = 2
-      ad:say(Strings("%s is eating!", ename))
+      ad:sayText("STRINGID_PKMNEATING", { opponentMon1 = st.enemy })
     else
       st.safariReaction = 0
-      ad:say(Strings("%s is watching\ncarefully!", ename))
+      ad:sayText("STRINGID_PKMNWATCHINGCAREFULLY", { opponentMon1 = st.enemy })
     end
     ad:playAnim("general", "SAFARI_REACTION", st.enemy, st.enemy)
   end
@@ -1500,6 +1921,70 @@ local function step_safari_enemy(act)
   AnimSeq.beginEvents(evs, seq_push)
   Battle._phase = "animating"
 end
+
+local function step_enemy_flee(act)
+  local st, ad = Battle._st, Battle._adapter
+  if not st or not st.enemy then return end
+  if State.isFainted(st.enemy) then
+    if not Battle._actions[Battle._actionI] then after_actions() end
+    return
+  end
+  if ad:hasStatus(st.enemy, "SLP") or ad:hasStatus(st.enemy, "FRZ") then
+    if not Battle._actions[Battle._actionI] then after_actions() end
+    return
+  end
+  local canEscape = Engine.canSwitch(st, ad, st.enemy)
+  if not canEscape then
+    local mark = ad:eventMark()
+    local prev = ad._say
+    ad._say = function() end
+    -- pokefirered/src/battle_main.c:4321, battle_message.c:909
+    ad:sayText("STRINGID_ATTACKERCANTESCAPE", { atk = st.enemy })
+    ad._say = prev
+    local evs = ad:eventsSince(mark)
+    if Battle._headless then
+      for _, e in ipairs(evs) do
+        if e.kind == "msg" then Ui.push(e.text) end
+      end
+      if not Battle._actions[Battle._actionI] then after_actions() end
+      return
+    end
+    AnimSeq.beginEvents(evs, seq_push)
+    Battle._phase = "animating"
+    return
+  end
+
+  local mark = ad:eventMark()
+  local prev = ad._say
+  ad._say = function() end
+  -- pokefirered/src/battle_main.c:3819
+  local monName = State.displayName(st.enemy) or "The wild Pokémon"
+  ad:sayText("STRINGID_WILDPKMNFLED", { buff1 = monName })
+  ad._say = prev
+  local evs = ad:eventsSince(mark)
+  pcall(function()
+    local SE = require("src.core.game3.se_ids")
+    if SE and SE.SE_FLEE then
+      require("src.core.game3.audio").playSe(SE.SE_FLEE)
+    end
+  end)
+  st.over = true
+  st.result = "fled"
+  st.endReason = "enemy_fled"
+  if Battle._headless then
+    for _, e in ipairs(evs) do
+      if e.kind == "msg" then Ui.push(e.text) end
+    end
+    Battle._pendingEnd = "fled"
+    Battle._phase = "ending"
+    return
+  end
+  AnimSeq.beginEvents(evs, seq_push)
+  Battle._pendingEnd = "fled"
+  Battle._phase = "ending"
+end
+
+local open_pending_choice
 
 local function step_action()
   local st = Battle._st
@@ -1537,13 +2022,13 @@ local function step_action()
         st.endReason = "flee"
       end
       -- pokefirered/src/battle_message.c:320
-      local function flee_push(text)
+      local function flee_push(text, _, id)
         if fled then
           pcall(function()
             require("src.core.game3.audio").playSe(require("src.core.game3.se_ids").SE_FLEE)
           end)
         end
-        seq_push(text)
+        seq_push(text, nil, id)
       end
       if Battle._headless then
         for _, e in ipairs(evs) do
@@ -1582,21 +2067,24 @@ local function step_action()
         end
       elseif Catching.isBall(meta.itemId) then
         if not st.wild then
-          Ui.push(Strings("The TRAINER blocked\nthe BALL!"))
+          -- pokefirered/data/battle_scripts_2.s:118
+          Ui.push(BattleText.get("STRINGID_TRAINERBLOCKEDBALL"))
           Battle._actions = {}
           Battle._phase = "command"
           Ui.openMenu()
           return
         end
         local Bag = require("src.core.game3.bag")
-        if not bag or not Bag.has(bag, meta.itemId, 1) then
+        if not st.oldManTutorial and (not bag or not Bag.has(bag, meta.itemId, 1)) then
           Ui.push(Strings("You don't have that item."))
           Battle._actions = {}
           Battle._phase = "command"
           Ui.openMenu()
           return
         end
-        Bag.remove(bag, meta.itemId, 1)
+        if not st.oldManTutorial then
+          Bag.remove(bag, meta.itemId, 1)
+        end
         local rng = ad and ad.rng and ad:rng() or st.rng
         local caught, shakes = Catching.tryCatch(meta.itemId, st.enemy, st, session, rng)
         local pushFn = function(text) Ui.push(text) end
@@ -1623,10 +2111,16 @@ local function step_action()
           Battle._phase = "catching"
           return
         end
+      elseif meta.pokedudeUsed or meta.usedInMenu then
+        -- pokefirered/data/battle_scripts_2.s:130 BattleScript_PlayerUseItem
+        Anim.syncDisplayFromState(st)
+        if meta.usedInMenu then
+          require("src.core.game3.battle.items").afterPlayerItem(st, ad, meta.itemId)
+        end
       else
         local BattleItems = require("src.core.game3.battle.items")
         local result, _msgs, endsTurn, endsBattle = BattleItems.use(
-          st, ad, bag, session, meta.itemId, meta.partySlot)
+          st, ad, bag, session, meta.itemId, meta.partySlot, nil, meta.moveSlot)
         if endsBattle then
           Battle._actions = {}
           if result == "catch" then
@@ -1654,61 +2148,58 @@ local function step_action()
             Anim.tweenHp("player", p.displayHp, logical, st.player.mon.maxHp)
           end
         end
+        if result == "heal" then BattleItems.afterPlayerItem(st, ad, meta.itemId) end
       end
     elseif meta.kind == "switch" then
-      -- Pursuit interrupt check
-      local enemyAct = nil
-      local enemyActIdx = nil
-      for idx, a in ipairs(Battle._actions or {}) do
-        if a.user == "enemy" and a.kind == "move" then
-          enemyAct = a
-          enemyActIdx = idx
-          break
-        end
-      end
-      if enemyAct and Engine.isPursuit(enemyAct.move) and not State.isFainted(st.enemy) then
-        table.remove(Battle._actions, enemyActIdx)
-        local out = {}
-        Engine.resolveMove(enemyAct.user, st.player, enemyAct.move, enemyAct.slot, ad, st, out, { pursuitSwitch = true })
-        local animMeta = out._anim
-        if Battle._headless or not animMeta then
-          push_msgs(out)
-          if State.isFainted(st.player) then
-            Battle._actions = {}
-            handle_player_faint()
-            return
-          end
-        else
-          AnimSeq.begin(animMeta, seq_push)
-          Battle._phase = "animating"
-          return
-        end
-      end
-
       local newSlot = meta.slot or 1
       local pushFn = function(text) Ui.push(text) end
-      local onDone = function()
-        Battle._phase = "actions"
-        if not Battle._actions or not Battle._actions[Battle._actionI] then
-          after_actions()
+      local function switch_out()
+        if State.isFainted(st.player) then
+          Battle._actions = {}
+          handle_player_faint()
+          return true
         end
-      end
-      if Battle._headless then
-        SwitchSeq.beginPlayerSwitch(st, newSlot, {
-          headless = true,
-          pushMsg = pushFn,
-          onDone = onDone,
-        })
-        -- Fall through to enemy action list
-      else
+        if Battle._headless then
+          SwitchSeq.beginPlayerSwitch(st, newSlot, {
+            headless = true,
+            pushMsg = pushFn,
+            onDone = function() Battle._phase = "actions" end,
+          })
+          return false
+        end
         SwitchSeq.beginPlayerSwitch(st, newSlot, {
           headless = false,
           pushMsg = pushFn,
-          onDone = onDone,
+          onDone = function()
+            Battle._phase = "actions"
+            if not Battle._actions or not Battle._actions[Battle._actionI] then
+              after_actions()
+            end
+          end,
         })
         Battle._phase = "switching"
-        return
+        return true
       end
+      -- pokefirered/src/battle_script_commands.c:8337
+      local enemyAct = D.pursuitRow(st, 1, 0)
+      if enemyAct then
+        for i = #(Battle._actions or {}), 1, -1 do
+          if Battle._actions[i] == enemyAct then table.remove(Battle._actions, i) end
+        end
+        enemyAct.done = true
+        local out = {}
+        Engine.resolveMove(st.enemy, st.player, enemyAct.move, enemyAct.slot, ad, st, out, { pursuitSwitch = true })
+        local animMeta = out._anim
+        if Battle._headless or not animMeta then
+          push_msgs(out)
+        else
+          AnimSeq.begin(animMeta, seq_push)
+          Battle._phase = "animating"
+          Battle._singleAfterAnim = function() switch_out() end
+          return
+        end
+      end
+      if switch_out() then return end
     end
   end
 
@@ -1719,8 +2210,15 @@ local function step_action()
   end
   Battle._actionI = Battle._actionI + 1
 
+  if act.kind == "player_meta" then
+    Battle._metaAct = act.meta
+    return step_action()
+  end
   if st.safari and (act.kind == "watch" or act.kind == "run") then
     return step_safari_enemy(act)
+  end
+  if (act.kind == "run" or act.kind == "flee") and (act.battler == 1 or act.user == "enemy" or (type(act.user) == "table" and act.user.side == "enemy")) then
+    return step_enemy_flee(act)
   end
   if act.meta then
     if not Battle._actions[Battle._actionI] then after_actions() end
@@ -1740,13 +2238,21 @@ local function step_action()
   end
 
   local out = {}
-  st.interactiveChoices = not (Battle._headless or Battle._auto)
+  st.interactiveChoices = st.link or not (Battle._headless or Battle._auto)
+  st.pdActor = (type(act.user) == "table" and act.user.side) or act.user
   Engine.resolveMove(act.user, act.target, act.move, act.slot, ad, st, out)
   st.interactiveChoices = nil
   Battle._pendingChoice = out.pendingChoice
   local animMeta = out._anim
   if Battle._headless or not animMeta then
-    push_msgs(out)
+    if st.pokedude and animMeta and animMeta.events then
+      for _, e in ipairs(animMeta.events) do
+        if e.kind == "msg" then seq_push(e.text, e.wait, e.id) end
+      end
+    else
+      push_msgs(out)
+    end
+    if Battle._pendingChoice then return open_pending_choice() end
     if end_if_over() then return end
   else
     AnimSeq.begin(animMeta, seq_push)
@@ -1763,7 +2269,7 @@ local function step_action()
 end
 
 -- pokefirered/src/battle_script_commands.c:4626
-local function open_pending_choice()
+open_pending_choice = function()
   local st, ad = Battle._st, Battle._adapter
   local req = Battle._pendingChoice
   Battle._pendingChoice = nil
@@ -1781,6 +2287,26 @@ local function open_pending_choice()
       for _, t in ipairs(out or {}) do Ui.push(t) end
       Battle._phase = "actions"
       if st.double and not Battle._pendingChoice then D.afterEach() end
+    end
+  end
+  local LB = st.link and link_battle() or nil
+  if LB and LB.isActive() and req and req.kind == "baton_pass" then
+    local cands = req.candidates or {}
+    local bpId = tonumber(req.battler) or uid
+    if st.multi and multi_remote(st, bpId) then
+      return with_link_replacement(st, cands[1], resume, State.sideOf(bpId), bpId)
+    end
+    if req.side == "enemy" or st.spectate then
+      return with_link_replacement(st, cands[1], resume, req.side == "enemy" and "enemy" or "player")
+    end
+    if Battle._headless or Battle._auto then
+      LB.sendSwitch(cands[1])
+      return resume(cands[1])
+    end
+    local chosen = resume
+    resume = function(slot)
+      LB.sendSwitch(slot)
+      return chosen(slot)
     end
   end
   if Battle._headless or Battle._auto or not (req and req.kind == "baton_pass") then
@@ -1854,8 +2380,10 @@ function D.reset()
   Battle._dblAfterAnim = nil
   Battle._dblLeveled = nil
   Battle._singleAfterAnim = nil
+  Battle._midTurn = nil
   Battle._linkAct = nil
   Battle._linkDouble = nil
+  Battle._linkMulti = nil
   Battle._linkSwitch = nil
 end
 
@@ -1883,25 +2411,12 @@ end
 function D.headlessIntro(st, trainerId, rivalName)
   local strings = Trainers.introStrings(trainerId, State.displayName(st.enemy), { rivalName = rivalName })
   local out = { strings.wants }
-  local b3 = not State.isAbsent(st, 3) and State.battler(st, 3)
-  if b3 then
-    local info = strings.info or {}
-    local class = info.className or Strings("POKéMON TRAINER")
-    local first, second = State.displayName(st.enemy), State.displayName(b3)
-    if info.name and info.name ~= "" then
-      out[#out + 1] = Strings("%s %s sent\nout %s and %s!", class, info.name, first, second)
-    else
-      out[#out + 1] = Strings("%s sent\nout %s and %s!", class, first, second)
-    end
+  if not State.isAbsent(st, 3) then
+    out[#out + 1] = IntroSeq.sendOutText(st, "enemy")
   else
     out[#out + 1] = strings.sentOut
   end
-  local b2 = not State.isAbsent(st, 2) and State.battler(st, 2)
-  if b2 then
-    out[#out + 1] = Strings("Go! %s and\n%s!", State.displayName(st.player), State.displayName(b2))
-  else
-    out[#out + 1] = Strings("Go! %s!", State.displayName(st.player))
-  end
+  out[#out + 1] = IntroSeq.sendOutText(st, "player")
   return out
 end
 
@@ -1974,6 +2489,10 @@ function D.startSelection()
   local st = Battle._st
   st.monToSwitchInto = {}
   Battle._phase = "command"
+  if st.spectate then
+    Battle._dblSel = nil
+    return
+  end
   Battle._dblSel = { chosen = {}, pos = 1 }
   return D.advanceSelection()
 end
@@ -1985,7 +2504,8 @@ function D.advanceSelection()
   while sel.pos <= #SEL_ORDER do
     local id = SEL_ORDER[sel.pos]
     local b = State.battler(st, id)
-    if not b or State.isAbsent(st, id) then
+    -- pokefirered/src/battle_controllers.c:231
+    if not b or State.isAbsent(st, id) or multi_remote(st, id) then
       sel.pos = sel.pos + 1
     else
       local locked = D.lockedAction(st, id)
@@ -2024,7 +2544,9 @@ end
 
 function D.openMenu(id)
   local sel = Battle._dblSel
-  return Ui.openMenu(id, { partnerAction = (id == 2 and sel) and sel.chosen[0] or nil })
+  local st = Battle._st
+  local partner = (id == 2 and sel and not (st and st.multi)) and sel.chosen[0] or nil
+  return Ui.openMenu(id, { partnerAction = partner })
 end
 
 function D.commit(cmd)
@@ -2040,7 +2562,7 @@ function D.onCommand(cmd)
   if not sel or not sel.active then return end
   local id = sel.active
   if cmd.kind == "cancel_partner" then
-    if id == 2 and not State.isAbsent(st, 0) then return D.cancelPartner() end
+    if id == 2 and not State.isAbsent(st, 0) and not st.multi then return D.cancelPartner() end
     return D.openMenu(id)
   end
   local b = State.battler(st, id)
@@ -2121,10 +2643,24 @@ function D.finishSelection()
   Battle._dblSel = nil
   st.activeBattler = nil
   local LB = st.link and Battle._linkBattle() or nil
-  if LB and LB.isActive() and LB.linkOpen() then
+  if st.multi and LB and LB.isActive() then
+    -- pokefirered/src/battle_main.c:3097
+    st.turn = st.turn + 1
+    local own = st.linkOwn
+    local act = own ~= nil and chosen[own] or nil
+    LB.sendMultiAction(st.turn, act, act and link_canon(st, act.target) or nil)
+    if st.over or not Battle._active then return end
+    Battle._linkAct = chosen
+    Battle._linkMulti = true
+    Battle._phase = "linkwait"
+    Battle._linkTurnStep()
+    return
+  end
+  if LB and LB.isActive() then
     -- pokefirered/src/battle_main.c:3226 both of this machine's actions go out together
     st.turn = st.turn + 1
     LB.sendActionList(st.turn, { chosen[0], chosen[2] })
+    if st.over or not Battle._active then return end
     Battle._linkAct = chosen
     Battle._linkDouble = true
     Battle._phase = "linkwait"
@@ -2177,7 +2713,7 @@ function D.stepAction()
   if act.kind == "move" then
     if not user or State.isFainted(user) then return D.afterEach() end
     local out = {}
-    st.interactiveChoices = not (Battle._headless or Battle._auto)
+    st.interactiveChoices = st.link or not (Battle._headless or Battle._auto)
     Engine.resolveMove(act.battler, act.target, act.move, act.slot, ad, st, out)
     st.interactiveChoices = nil
     Battle._pendingChoice = out.pendingChoice
@@ -2286,6 +2822,11 @@ function D.faintStep()
   if F.stage == "check" then
     -- pokefirered/data/battle_scripts_1.s:2825
     local res = Engine.checkEnd(st, ad)
+    if res == "draw" and st.link then
+      Battle._dblFaint = nil
+      stop_low_hp_song()
+      return D.linkDraw(st)
+    end
     if res == "win" or res == "lose" then
       Battle._dblFaint = nil
       Battle._actions = {}
@@ -2299,7 +2840,7 @@ function D.faintStep()
     F.stage = "repl"
   end
   if F.stage == "repl" then
-    for id = 0, 3 do
+    for _, id in ipairs(State.battlerOrder(st)) do
       local b = State.battler(st, id)
       if b and not State.isAbsent(st, id) and State.isFainted(b) then
         local cands = Engine.replacementCandidates(st, id)
@@ -2340,6 +2881,27 @@ function D.pickReplacement(id, cands)
   local function go(slot)
     st.monToSwitchInto[id] = slot
     return D.sendOut(id, slot)
+  end
+  local LB = st.link and Battle._linkBattle() or nil
+  if LB and LB.isActive() and st.multi and multi_remote(st, id) then
+    return with_link_replacement(st, cands[1], go, State.sideOf(id), id)
+  end
+  if LB and LB.isActive() then
+    if State.sideOf(id) == "enemy" then
+      return with_link_replacement(st, cands[1], go, "enemy")
+    end
+    if st.spectate then
+      return with_link_replacement(st, cands[1], go, "player")
+    end
+    if Battle._headless or Battle._auto then
+      LB.sendSwitch(cands[1])
+      return go(cands[1])
+    end
+    local sendOut = go
+    go = function(slot)
+      LB.sendSwitch(slot)
+      return sendOut(slot)
+    end
   end
   if State.sideOf(id) == "enemy" then
     -- pokefirered/src/battle_controller_opponent.c:1410
@@ -2538,17 +3100,21 @@ function D.useBag(act)
   if Catching.isBall(act.itemId) then
     local Bag = require("src.core.game3.bag")
     if bag and Bag.has(bag, act.itemId, 1) then Bag.remove(bag, act.itemId, 1) end
-    local okI, Items = pcall(require, "src.core.game3.items")
-    local iname = okI and Items.displayName and Items.displayName(act.itemId) or "POKé BALL"
-    -- pokefirered/data/battle_scripts_2.s:54
-    Ui.push(Strings("%s used\n%s!", st.playerName or "PLAYER", iname))
+    local fill = Adapter.fill(st, { lastItem = act.itemId })
+    -- pokefirered/data/battle_scripts_2.s:57
+    Ui.push(BattleText.get("STRINGID_PLAYERUSEDITEM", fill))
     -- pokefirered/data/battle_scripts_2.s:116
-    Ui.push(Strings("The TRAINER blocked the BALL!"))
-    Ui.push(Strings("Don't be a thief!"))
+    Ui.push(BattleText.get("STRINGID_TRAINERBLOCKEDBALL", fill))
+    Ui.push(BattleText.get("STRINGID_DONTBEATHIEF", fill))
     return D.afterEach()
   end
   local BattleItems = require("src.core.game3.battle.items")
-  local result = BattleItems.use(st, ad, bag, session, act.itemId, act.partySlot, act.battler)
+  if act.usedInMenu then
+    -- pokefirered/data/battle_scripts_2.s:130 BattleScript_PlayerUseItem
+    Anim.syncDisplayFromState(st)
+    return D.afterEach()
+  end
+  local result = BattleItems.use(st, ad, bag, session, act.itemId, act.partySlot, act.battler, act.moveSlot)
   if result == "heal" then
     for _, id in ipairs(SEL_ORDER) do
       local b = State.battler(st, id)
@@ -2590,8 +3156,9 @@ local function finish_catch_flow(catchRes, ename, nicknamed)
     local Runtime = package.loaded["src.core.game3.runtime"]
     local session = Runtime and Runtime.getSession and Runtime.getSession()
     local Storage = require("src.core.game3.storage")
+    require("src.core.game3.battle.catching").givePending(session, catchRes)
     -- pokefirered/src/battle_script_commands.c:9617
-    local page = Storage.pcTransferMessage(session, ename or "POKéMON")
+    local page = Storage.pcTransferMessage(session, ename)
     if not nicknamed then
       Battle._phase = "catch_pc_msg"
       Ui.push(page)
@@ -2604,7 +3171,13 @@ local function finish_catch_flow(catchRes, ename, nicknamed)
 end
 
 local function start_post_catch_flow(catchRes)
-  if Battle._headless then
+  -- pokefirered/data/battle_scripts_2.s:99 BattleScript_OldMan_Pokedude_CaughtMessage
+  if Battle._headless or (Battle._st and (Battle._st.oldManTutorial or Battle._st.pokedude)) then
+    if catchRes and catchRes.pending then
+      local Runtime = package.loaded["src.core.game3.runtime"]
+      require("src.core.game3.battle.catching").givePending(
+        Runtime and Runtime.getSession and Runtime.getSession(), catchRes)
+    end
     Battle._actions = {}
     Battle._pendingEnd = "catch"
     Battle._phase = "ending"
@@ -2617,14 +3190,14 @@ local function start_post_catch_flow(catchRes)
     or (catchRes and catchRes.mon and (catchRes.mon.species or catchRes.mon.speciesId))
     or (enemy and enemy.species) or 1
   local ename = (mon and (mon.nickname ~= "" and mon.nickname or mon.name))
-    or Pokemon.name(sp) or "POKéMON"
+    or Pokemon.name(sp)
   local gender = (mon and (mon.gender or (mon.isFemale and 1))) or (enemy and enemy.gender) or 0
   local personality = (mon and mon.personality) or 0
 
   local function prompt_nickname()
     Battle._phase = "catch_nickname_prompt"
     -- pokefirered/src/battle_message.c:477
-    Ui.askYesNo(Strings("Give a nickname to the\ncaptured %s?", ename), function(yes)
+    Ui.askYesNo(BattleText.get("STRINGID_GIVENICKNAMECAPTURED", { opponentMon1 = ename }), function(yes)
       if yes then
         local okN, Naming = pcall(require, "src.ui.game3.naming")
         if okN and Naming and Naming.open then
@@ -2679,7 +3252,47 @@ end
 Battle.startPostCatchFlow = start_post_catch_flow
 Battle.finishCatchFlow = finish_catch_flow
 
+-- pokefirered/src/battle_main.c:1455
+-- pokefirered/src/party_menu.c:2063 PartyMenuHandlePokedudeCancel
+function Battle.quitPokedude()
+  local pst = Battle._st
+  if not (pst and pst.pokedude) or Battle._phase == "fade_out" then return false end
+  pst.over = true
+  pst.result = "draw"
+  pst.pdEnded = true
+  Battle._phase = "fade_out"
+  if Battle._headless then
+    finish("draw")
+    return true
+  end
+  Fade.begin(Fade.MODE.TO_BLACK, 1, function() finish("draw") end)
+  return true
+end
+
+local update_body
+
 function Battle.update(dt, game)
+  if not Battle._active then return end
+  local st = Battle._st
+  if not (st and st.link) then return update_body(dt, game) end
+  local ok, err = xpcall(function() return update_body(dt, game) end, debug.traceback)
+  if ok then return end
+  print("[game3/battle] link battle step failed: " .. tostring(err))
+  local again = Battle._linkFault
+  Battle._linkFault = true
+  local LB = link_battle()
+  local Guard = require("src.core.game3.battle.link_guard")
+  local where = Guard.tripped
+  Guard.tripped = nil
+  if not again and LB and LB.desync then
+    LB.desync(LB._turn or st.turn or 0, where and ("rng:" .. tostring(where)) or "engine")
+  end
+  if Battle._active and (again or Battle._phase ~= "ending") then
+    finish("draw")
+  end
+end
+
+update_body = function(dt, game)
   if not Battle._active then return end
 
   -- A stat window whose phase can no longer dismiss it must not linger (#2324).
@@ -2691,6 +3304,13 @@ function Battle.update(dt, game)
   end
 
   local input = game and game.input
+  local pst = Battle._st
+  -- pokefirered/src/battle_main.c:1455 JOY_HELD(B_BUTTON)
+  if pst and pst.pokedude and not Battle._headless and input and input:isDown("b")
+      and Battle._phase ~= "fade_out" and not (pst.pd and pst.pd.menu) then
+    Battle.quitPokedude()
+    return
+  end
   local Pokedex = package.loaded["src.ui.game3.pokedex"]
   if Pokedex and Pokedex.isOpen and Pokedex.isOpen() then
     if input then Pokedex.handleInput(input) end
@@ -2724,8 +3344,19 @@ function Battle.update(dt, game)
     return
   end
 
+  if Battle._phase == "command" and Battle._st and Battle._st.spectate then
+    spectate_turn_step()
+    return
+  end
+
   if Battle._phase == "command" and not Battle._auto and Battle._st and Battle._st.double then
     D.commandUpdate(input)
+    return
+  end
+
+  if Battle._phase == "command" and not Battle._auto and Battle._st and Battle._st.pokedude then
+    local cmd = Pokedude.commandStep(Battle._st, Ui, input)
+    if cmd then begin_turn_with(cmd) end
     return
   end
 
@@ -2771,7 +3402,10 @@ function Battle.update(dt, game)
       and not Battle._auto and game and game.input then
     local EvolutionScene = package.loaded["src.ui.game3.evolution_scene"]
     if EvolutionScene and EvolutionScene.isOpen and EvolutionScene.isOpen() then
-      EvolutionScene.handleInput(game.input)
+      local EvoSummary = package.loaded["src.ui.game3.summary_menu"]
+      if EvoSummary and EvoSummary.isOpen and EvoSummary.isOpen() then
+        EvoSummary.handleInput(game.input)
+      end
       return
     end
     local StatGrowth = package.loaded["src.ui.game3.stat_growth"]
@@ -2807,7 +3441,7 @@ function Battle.update(dt, game)
       if begin_start_effects() then return end
       Battle._phase = "command"
       if Battle._auto then
-        begin_turn_with(Commands.playerAction(Battle._st, 1, 1))
+        begin_turn_with(auto_player_action(Battle._st))
       else
         Ui.openMenu()
       end
@@ -2821,7 +3455,7 @@ function Battle.update(dt, game)
     if AnimSeq.update() then
       Battle._phase = "command"
       if Battle._auto then
-        begin_turn_with(Commands.playerAction(Battle._st, 1, 1))
+        begin_turn_with(auto_player_action(Battle._st))
       else
         Ui.openMenu()
       end
@@ -2885,10 +3519,7 @@ function Battle.update(dt, game)
                 SwitchSeq.beginShiftSwitch(st, pSlot, nextEnemyIdx, {
                   headless = false,
                   pushMsg = function(t) Ui.push(t) end,
-                  onDone = function()
-                    Battle._phase = "command"
-                    Ui.openMenu()
-                  end,
+                  onDone = resume_turn,
                 })
                 Battle._phase = "switching"
               end
@@ -2999,9 +3630,6 @@ function Battle.update(dt, game)
   if Battle._phase == "evolving" then
     local EvolutionScene = package.loaded["src.ui.game3.evolution_scene"]
     if EvolutionScene and EvolutionScene.isOpen and EvolutionScene.isOpen() then
-      if not Battle._auto and game and game.input then
-        EvolutionScene.handleInput(game.input)
-      end
       return
     end
     if Ui.choiceActive and Ui.choiceActive() then return end
@@ -3029,7 +3657,7 @@ function Battle.update(dt, game)
     end
     Battle._phase = "command"
     if Battle._auto then
-      begin_turn_with(Commands.playerAction(Battle._st, 1, 1))
+      begin_turn_with(auto_player_action(Battle._st))
     else
       Ui.openMenu()
     end
@@ -3048,6 +3676,12 @@ function Battle.update(dt, game)
   end
 
   if Battle._phase == "ending" then
+    local est = Battle._st
+    if est and est.pokedude and not est.pdEnded then
+      est.pdEnded = true
+      -- pokefirered/data/battle_scripts_2.s:102 endlinkbattle
+      if Pokedude.event(est, "endlinkbattle", "player") and not Battle._headless then return end
+    end
     if Battle._headless or not Battle._fade then
       finish(Battle._pendingEnd or "win")
     else
@@ -3073,7 +3707,7 @@ function Battle.update(dt, game)
   end
 
   if Battle._phase == "command" and Battle._auto then
-    begin_turn_with(Commands.playerAction(Battle._st, 1, 1))
+    begin_turn_with(auto_player_action(Battle._st))
   end
 end
 
@@ -3111,6 +3745,68 @@ end
 
 function Battle.abort(result)
   if Battle._active then finish(result or "run") end
+end
+
+-- pokefirered/src/main.c:480
+function Battle.reset()
+  stop_low_hp_song()
+  require("src.core.game3.battle.link_guard").disarm()
+  Battle._active = false
+  Battle._st = nil
+  Battle._adapter = nil
+  Battle._phase = nil
+  Battle._onDone = nil
+  Battle._onExpDone = nil
+  Battle._pendingEnd = nil
+  Battle._pendingChoice = nil
+  Battle._actions = nil
+  Battle._actionI = 1
+  Battle._metaAct = nil
+  Battle._auto = false
+  Battle._headless = false
+  Battle._fade = true
+  Battle._residualEvents = nil
+  Battle._residualIndex = 1
+  Battle._residualStepState = nil
+  D.reset()
+  AnimSeq.reset()
+  CatchSeq.reset()
+  ExpSeq.reset()
+  EvoSeq.reset()
+  IntroSeq.reset()
+  LearnMove.reset()
+  SwitchSeq.reset()
+  Anim.reset({ headless = true })
+  if Ui.clearLinger then Ui.clearLinger() end
+end
+
+function Battle.linkEnd(result, text, reason)
+  if not Battle._active then return false end
+  local st = Battle._st
+  if not st then return false end
+  result = result or "draw"
+  st.over = true
+  st.result = result
+  st.endReason = reason or "link"
+  D.reset()
+  Battle._dblFaint = nil
+  Battle._actions = {}
+  Battle._actionI = 1
+  Battle._metaAct = nil
+  Battle._residualEvents = nil
+  Battle._pendingChoice = nil
+  AnimSeq.reset()
+  SwitchSeq.reset()
+  for _, name in ipairs({ "src.ui.game3.party_menu", "src.ui.game3.bag_menu", "src.ui.game3.summary_menu" }) do
+    local M = package.loaded[name]
+    if M and M.isOpen and M.isOpen() and M.close then pcall(M.close) end
+  end
+  if Ui.clearLinger then Ui.clearLinger() end
+  if text and text ~= "" then Ui.push(text) end
+  Battle._pendingEnd = result
+  Battle._phase = "ending"
+  if Battle._headless then finish(result) end
+  return true
 end
 
 return Battle

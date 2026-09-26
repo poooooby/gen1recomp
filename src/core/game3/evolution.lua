@@ -251,7 +251,7 @@ end
 function Evolution.renameMon(mon, preSpecies, postSpecies)
   if not mon then return end
   local preName = Pokemon.name(preSpecies) or ""
-  local newName = Pokemon.name(postSpecies) or "POKéMON"
+  local newName = Pokemon.name(postSpecies)
   local function trim(s)
     if type(s) ~= "string" then return "" end
     return (s:gsub("%z+", ""):match("^%s*(.-)%s*$")) or ""
@@ -303,8 +303,9 @@ function Evolution.apply(mon, newSpecies, session, bag, via)
   local shedId = (preRows[1] and row_method(preRows[1]) == Evolution.EVO_LEVEL_NINJASK
     and preRows[2] and row_target(preRows[2])) or 0
   if shedId > 0 and session then
-    local party = session.party or (session.save and session.save.party)
-    if party and #party < 6 then
+    session.party = session.party or (session.save and session.save.party) or {}
+    local party = session.party
+    if #party < 6 then
       local shedinja = {}
       for k, v in pairs(mon) do
         if type(v) == "table" then
@@ -318,8 +319,8 @@ function Evolution.apply(mon, newSpecies, session, bag, via)
       shedinja.species = shedId
       shedinja.speciesId = shedId
       Pokemon.tagNumbering(shedinja, Pokemon.NUMBERING_INTERNAL)
-      shedinja.name = Pokemon.name(shedId) or "SHEDINJA"
-      shedinja.nickname = Pokemon.name(shedId) or "SHEDINJA"
+      shedinja.name = Pokemon.name(shedId)
+      shedinja.nickname = Pokemon.name(shedId)
       shedinja.heldItem = 0
       shedinja.item = 0
       shedinja.status = 0

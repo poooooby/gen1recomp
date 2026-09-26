@@ -1,3 +1,5 @@
+local RomText = require("src.core.game3.rom_text")
+
 local Status = {}
 
 -- pokefirered/src/wireless_communication_status_screen.c:27
@@ -110,19 +112,39 @@ function Status.entries()
 end
 
 -- pokefirered/src/wireless_communication_status_screen.c:127 sHeaderTexts
-Status.LABELS = {
-  "People trading:",
-  "People battling:",
-  "People in the UNION ROOM:",
-  "People communicating:",
-}
-Status.TITLE = "Wireless Communication Status"
+Status.HEADER = RomText.lazy({
+  [0] = "sHeaderTexts[0]",
+  "sHeaderTexts[1]",
+  "sHeaderTexts[2]",
+  "sHeaderTexts[3]",
+  "sHeaderTexts[4]",
+})
+
+-- pokefirered/src/wireless_communication_status_screen.c:505
+function Status.fromPlaza(pc)
+  local G = Status.GROUPTYPE
+  local counts = { 0, 0, 0, 0 }
+  if type(pc) == "table" then
+    counts[G.TRADE] = math.max(0, math.floor(tonumber(pc.trade) or 0))
+    counts[G.BATTLE] = math.max(0, math.floor(tonumber(pc.battle) or 0))
+    counts[G.UNION] = math.max(0, math.floor(tonumber(pc.union) or 0))
+    counts[G.TOTAL] = math.max(0, math.floor(tonumber(pc.total)
+      or (counts[G.TRADE] + counts[G.BATTLE] + counts[G.UNION])))
+  end
+  return counts
+end
+
+function Status.relayCounts()
+  local L = link()
+  if not L.adapterConnected() then return nil end
+  return Status.fromPlaza(L.clientCall("plazaCounts"))
+end
 
 function Status.rows()
-  local counts = Status.counts(Status.entries())
+  local counts = Status.relayCounts() or Status.counts(Status.entries())
   local out = {}
   for i = 1, Status.NUM_GROUPTYPES do
-    out[i] = { label = Status.LABELS[i], count = counts[i] or 0, total = i == Status.GROUPTYPE.TOTAL }
+    out[i] = { label = Status.HEADER[i], count = counts[i] or 0, total = i == Status.GROUPTYPE.TOTAL }
   end
   return out
 end

@@ -18,6 +18,7 @@ local NPC = require("src.world.NPC")
 local PaletteFX = require("src.render.PaletteFX")
 local Pipelines = require("src.render.Pipelines")
 local Player = require("src.world.Player")
+local Renderer = require("src.render.Renderer")
 local Runtime = require("src.mods.Runtime")
 local Screens = require("src.ui.Screens")
 local ScriptRunner = require("src.script.ScriptRunner")
@@ -32,6 +33,33 @@ local Strings = require("src.core.Strings")
 
 -- isOverworld marks the live world state for WorldAPI's stack scan
 local OverworldState = { isOpaque = true, isOverworld = true }
+
+-- The pipeline's own target, not the playfield: a pipeline with a render
+-- scale draws smaller and lets endFrame scale it up.
+local function overrideCanvasHeight()
+  local bound = love.graphics.getCanvas()
+  if bound and not bound.getHeight then bound = bound[1] end      -- several bound
+  if bound and not bound.getHeight then bound = bound.canvas end  -- one face of one
+  return bound and bound.getHeight and bound:getHeight()
+end
+
+-- Run a block of field FX the way the composite expects them.  Where endFrame
+-- mirrors the override, these are the one part of that canvas the mirror would
+-- invert rather than right: the pipeline's pass went in pre-flipped, these are
+-- ordinary 2D.  project() already answers in screen rows, so mirroring the
+-- block about the bound canvas is the whole correction, and project is left
+-- alone -- fixing it too would move each anchor twice.  Exposed for tests.
+local function withOverrideMirror(draw)
+  local height = Renderer.mirrorsWorldOverride() and overrideCanvasHeight()
+  if not height then return draw() end
+  love.graphics.push()
+  love.graphics.translate(0, height)
+  love.graphics.scale(1, -1)
+  draw()
+  love.graphics.pop()
+end
+
+OverworldState.withOverrideMirror = withOverrideMirror
 
 local Game -- set on enter (avoids circular require at load time)
 
@@ -93,6 +121,7 @@ local TELEPORT_IN_FRAMES = 43
 -- engine/overworld/player_animations.asm:22-25
 local TELEPORT_IN_PAD_HOLDS = { 3, 3, 3, 3, 3, 3, 0 }
 local TELEPORT_IN_PAD_FRAMES = 18
+local BOLT_WHITE_VEIL = { 1, 0.8 }
 local SPIN_DOWN_STEPS = 6
 -- engine/overworld/player_animations.asm:41-45
 local HOLE_IN_HOLDS = { 3, 3, 3, 3, 3, 0 }
@@ -582,6 +611,7 @@ function OverworldState:setMap(mapId, x, y, facing, opts)
   -- crossConnection re-arms this after setMap; clear so a warp/reload
   -- cannot leave a stale deferred PlayMapMusic pending
   self.pendingSeamMusic = nil
+  self.seamPalette = nil
   self.entities = { self.player }
   for _, n in ipairs(self.npcs) do table.insert(self.entities, n) end
   -- Yellow's companion Pikachu trails the player (never in
@@ -869,6 +899,14 @@ function OverworldState:paletteNameFor(map)
   return Runtime.call("map.palette", samePalette, name, map, { tod = tod })
 end
 
+-- home/overworld.asm:675
+function OverworldState:screenPaletteName()
+  if self.seamPalette and not OverworldState.perMapWorldPalettes() then
+    return self.seamPalette
+  end
+  return self:paletteNameFor(self.map)
+end
+
 -- UI-pass palette (text boxes and menus tint with the current map).  OG RED
 -- resolves every name to the one global red BG palette inside PaletteFX.pal,
 -- so this needs no mode-specific branch.
@@ -880,7 +918,7 @@ end
 -- that zone the pic wears the route/town palette and looks washed out.
 function OverworldState:sgbPalettes()
   local PaletteFX = require("src.render.PaletteFX")
-  local mapName = self:paletteNameFor(self.map)
+  local mapName = self:screenPaletteName()
   if self.emote and self.emote.pikaPic then
     local base = PaletteFX.pal(Game.data, mapName)
     if not base then return nil end
@@ -919,7 +957,7 @@ function OverworldState:sgbWorldZones()
   if PaletteFX.usesGbcPack() and self.map.renderer and self.map.renderer.gbcAtlas then
     return {}
   end
-  local base = PaletteFX.pal(Game.data, self:paletteNameFor(self.map))
+  local base = PaletteFX.pal(Game.data, self:screenPaletteName())
   if not base then return nil end
   local vw, vh = Game.renderer:worldViewSize()
   local cam = self.camera
@@ -1468,6 +1506,9 @@ function OverworldState:update(dt)
 
   -- the emotion-bubble pause holds the world for a beat
   if self.emote then
+    if self.emote.boltAt then
+      require("src.world.PikachuFollower").tickBolt(Game, self, self.emote)
+    end
     self.emote.frames = self.emote.frames - 1
     -- PikaPicAnimTimerAndJoypad (engine/pikachu/pikachu_pic_animation.asm)
     -- cuts a pikapic beat short on A or B; the "!" bubble hold has no such
@@ -1547,6 +1588,8 @@ function OverworldState:update(dt)
   if entry and (self.player.cellX ~= entry.x or self.player.cellY ~= entry.y) then
     self.warpEntryCell = nil
   end
+  -- home/overworld.asm:679
+  if stepped then self.seamPalette = nil end
   -- deferred PlayMapMusic from crossConnection (issue #93)
   if stepped and self.pendingSeamMusic then
     local mapId = self.pendingSeamMusic
@@ -2043,9 +2086,11 @@ function OverworldState:crossConnection(dir, conn)
   local PikachuFollower = require("src.world.PikachuFollower")
   local pika = PikachuFollower.current(self)
   local fromX, fromY = p.cellX, p.cellY
+  local seamPal = self:paletteNameFor(self.map)
   self:setMap(conn.map, x, y, p.facing,
               { seamless = true, keepMusic = true, keepPikachu = pika })
   self.pendingSeamMusic = conn.map
+  self.seamPalette = seamPal
   -- place the player one cell before the seam (their old world spot,
   -- which the neighbor strip renders identically) and start the step
   -- into the new map RIGHT NOW so there is no one-frame stall at the
@@ -3003,6 +3048,9 @@ function OverworldState:billsHousePC()
       { "wait", 32 },
       { "play_sound", "Get_Item1" }, { "wait_sound" },
     }, { onDone = function()
+      -- bills_house_pc.asm:38
+      require("src.core.Music").playMap(Game.data, self.map.id,
+                                        Game.save.onBike, self.player.surfing)
       -- bills_house_pc.asm:39
       flags.EVENT_USED_CELL_SEPARATOR_ON_BILL = true
       self:billsHouseBillExits()
@@ -3040,23 +3088,24 @@ function OverworldState:billsHousePokemonList()
 end
 
 -- BillsHouseBillExitsMachineScript: human Bill appears inside the machine
--- at (1,2) and walks out to his spot at (4,4); the map music resumes and
--- EVENT_MET_BILL / EVENT_MET_BILL_2 arm the SS-Ticket dialogue.  The Eevee
+-- at (1,2) and walks out to his spot at (4,4); EVENT_MET_BILL /
+-- EVENT_MET_BILL_2 arm the SS-Ticket dialogue.  The Eevee
 -- PC list arms later, on the first Route 25 load after the ticket
 -- (EVENT_LEFT_BILLS_HOUSE_AFTER_HELPING).
 function OverworldState:billsHouseBillExits()
   local Commands = require("src.script.Commands")
   local ctx = { game = Game, save = Game.save, overworld = self }
   Commands.show_object(ctx, "BILLS_HOUSE", "BILLSHOUSE_BILL1")
-  require("src.world.PikachuFollower").onBillExitedMachine(Game, self)
   local bill
   local function done()
     Game.save.flags.EVENT_MET_BILL = true
     Game.save.flags.EVENT_MET_BILL_2 = true
-    require("src.core.Music").playMap(Game.data, self.map.id,
-                                      Game.save.onBike, self.player.surfing)
     self:billsHouseSSTicketScene(bill)
   end
+  -- scripts/BillsHouse.asm:81
+  self.emote = { frames = 8, bubble = false, onDone = function()
+    require("src.world.PikachuFollower").onBillExitedMachine(Game, self)
+  end }
   for _, n in ipairs(self.npcs) do
     if n.def and n.def.name == "BILLSHOUSE_BILL1" then bill = n break end
   end
@@ -4975,7 +5024,6 @@ function OverworldState:boulderIntoHole(npc)
   for _, entry in ipairs(self:seafoamHolesFor(self.map.id)) do
     local h = entry.hole
     if npc.cellX == h.x and npc.cellY == h.y then
-      require("src.core.Sound").play(Game.data, "Faint_Thud")
       Flags.set(Game.save, h.boulderEvent)
       local toggles = Game.save.objectToggles or {}
       Game.save.objectToggles = toggles
@@ -4999,7 +5047,6 @@ function OverworldState:boulderIntoHole(npc)
       for i = #self.entities, 1, -1 do
         if self.entities[i] == npc then table.remove(self.entities, i) end
       end
-      Game.stack:push(TextBox.new(Game, Strings("The boulder fell\nthrough the hole!")))
       return true
     end
   end
@@ -5814,9 +5861,36 @@ function OverworldState:drawWorld()
     local fadeObp = fade.obp0 and fade:obp0() or fadeBgp
     PaletteFX.setFadeObp(Transition.shadeMapFor(fadeObp))
     fade.paletteStepped = true
+  elseif self.emote and self.emote.bgp and not battleOverWorld then
+    -- engine/pikachu/pikachu_pic_animation.asm:847
+    PaletteFX.setShadeMap(Transition.shadeMapFor(self.emote.bgp))
   else
     PaletteFX.setShadeMap((self.dark and not battleOverWorld)
                           and PaletteFX.DARK_BGP or self:poisonShadeMap())
+  end
+  local tiles = self.map and self.map.renderer
+  self.boltBaked = nil
+  if tiles and tiles.setBgp then
+    local e = self.emote
+    -- engine/pikachu/pikachu_pic_animation.asm:790
+    local prebake = e and e.boltAt and not e.boltDone and (e.boltT or 0) > e.boltAt
+    local bolt = e and not battleOverWorld and e.bgp or nil
+    local neighbors = self.neighbors
+    for i = 1, neighbors and #neighbors or 0 do
+      local r = neighbors[i].map.renderer
+      if r and r.setBgp then
+        if prebake then
+          r:bgpImage(0xC0)
+          r:bgpImage(0xE4)
+        end
+        r:setBgp(bolt)
+      end
+    end
+    if prebake then
+      tiles:bgpImage(0xC0)
+      tiles:bgpImage(0xE4)
+    end
+    self.boltBaked = tiles:setBgp(bolt) and bolt or nil
   end
   -- advance the water/flower tile animation (runs under dialogs too).
   -- TileRenderer.tick uses wall-clock 60Hz steps so display refresh rate
@@ -6192,27 +6266,29 @@ function OverworldState:drawWorld()
         love.graphics.pop()
         if shader then love.graphics.setShader() end
       end
-      -- ground-hugging effects sit on the cell they belong to
-      if self.dustAnim then
-        local da = self.dustAnim
-        at(fxDust, da.x * 16 + 8 + (da.ox or 0), da.y * 16 + 8 + (da.oy or 0))
-      end
-      if self.cutAnim then
-        at(fxCutTree, self.cutAnim.x * 16 + 8, self.cutAnim.y * 16 + 16)
-      end
-      if self.healAnim then
-        at(fxHeal, self.healAnim.px + 8, self.healAnim.py + 16)
-      end
-      -- standing effects anchor at the foot of whoever they belong to
-      if self.emote and self.emote.npc then
-        at(fxEmote, self.emote.npc.px + 8, self.emote.npc.py + 16)
-      end
-      if self.flyAnim then
-        at(fxBird, self.player.px + 8, self.player.py + 16)
-      end
-      if self.fishing then
-        at(fxRod, self.player.px + 8, self.player.py + 16)
-      end
+      withOverrideMirror(function()
+        -- ground-hugging effects sit on the cell they belong to
+        if self.dustAnim then
+          local da = self.dustAnim
+          at(fxDust, da.x * 16 + 8 + (da.ox or 0), da.y * 16 + 8 + (da.oy or 0))
+        end
+        if self.cutAnim then
+          at(fxCutTree, self.cutAnim.x * 16 + 8, self.cutAnim.y * 16 + 16)
+        end
+        if self.healAnim then
+          at(fxHeal, self.healAnim.px + 8, self.healAnim.py + 16)
+        end
+        -- standing effects anchor at the foot of whoever they belong to
+        if self.emote and self.emote.npc then
+          at(fxEmote, self.emote.npc.px + 8, self.emote.npc.py + 16)
+        end
+        if self.flyAnim then
+          at(fxBird, self.player.px + 8, self.player.py + 16)
+        end
+        if self.fishing then
+          at(fxRod, self.player.px + 8, self.player.py + 16)
+        end
+      end)
     end
     override = Pipelines.drawWorld(pipelineId, ctx)
     -- world post-processes (a miniature-diorama blur, a colour grade) fold
@@ -6387,28 +6463,27 @@ function OverworldState:drawUI()
   -- TalkToPikachu's picture box (engine/pikachu/pikachu_pic_animation.asm
   -- PlacePikapicTextBoxBorder: TextBoxBorder at (6,5) with b,c = 5,5, so a
   -- 7x7 box holding the 5x5 pic at (7,6) -- PikaAnimTilemap_1).  The
-  -- script's base frame is ripped as pikachu/pikapic_N.png (#561) but the
-  -- pikaframe overlays on top of it are not, so PikachuFollower
-  -- .picLift lifts the base on the runs that draw the alternate pose, and the
   -- script's own duration times the beat (#407, #424).  Palette zone
   -- PAL_PIKACHU_PORTRAIT covers (7,6)-(11,10) via sgbPalettes above.
   if self.emote and self.emote.pikaPic then
     require("src.render.Font").drawBox(6, 5, 7, 7)
-    -- one image per path, cached: this draws every frame of the hold, and
-    -- a mod skin can move the path between talks
-    if self.pikaPicPath ~= self.emote.pikaPic then
-      local ok, loaded = pcall(love.graphics.newImage, self.emote.pikaPic)
-      self.pikaPicImg = ok and loaded or nil
-      self.pikaPicPath = self.emote.pikaPic
+    local path, lift = require("src.world.PikachuFollower").picFrame(self.emote)
+    self.pikaPicImgs = self.pikaPicImgs or {}
+    local img = path and self.pikaPicImgs[path]
+    if path and img == nil then
+      local ok, loaded = pcall(love.graphics.newImage, path)
+      img = ok and loaded or false
+      self.pikaPicImgs[path] = img
     end
-    local img = self.pikaPicImg
+    self.pikaPicDrawn = img and path or nil
     if img then
       love.graphics.setColor(1, 1, 1, 1)
       local w, h = img:getDimensions()
-      local lift = require("src.world.PikachuFollower").picLift(self.emote)
       love.graphics.draw(img, math.floor(56 + (40 - w) / 2),
-                         math.floor(48 + (40 - h) / 2) - lift)
+                         math.floor(48 + (40 - h) / 2) - (lift or 0))
     end
+  else
+    self.pikaPicDrawn = nil
   end
 
   -- engine/gfx/screen_effects.asm:1-12
@@ -6427,6 +6502,13 @@ function OverworldState:drawUI()
       love.graphics.rectangle("fill", 0, 0, 160, 144)
       love.graphics.setColor(1, 1, 1, 1)
     end
+  end
+
+  -- engine/pikachu/pikachu_pic_animation.asm:847
+  local bolt = self.emote and self.emote.bgp
+  if bolt and bolt ~= 0xE4 and Game and Game.renderer and self.boltBaked ~= bolt
+     and (self:bakedWorldColors() or not PaletteFX.shader()) then
+    Game.renderer.screenVeil = BOLT_WHITE_VEIL
   end
 end
 

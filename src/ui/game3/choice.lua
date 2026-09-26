@@ -2,7 +2,7 @@
 
 local Window = require("src.ui.game3.window")
 local Display = require("src.core.game3.display")
-local Strings = require("src.core.Strings")
+local RomText = require("src.core.game3.rom_text")
 
 local Choice = {}
 
@@ -42,15 +42,17 @@ function Choice.yesNo(cb, layout)
   Choice.style = layout.style
   if layout.style == "battle" then
     -- pokefirered/src/battle_message.c:1288
-    Choice.options = { Strings("Yes"), Strings("No") }
+    local yes, no = RomText.plain("gText_BattleYesNoChoice"):match("^(.-)\n(.*)$")
+    Choice.options = { yes, no }
   else
-    Choice.options = { Strings("YES"), Strings("NO") }
+    -- pokefirered/src/strings.c:414
+    Choice.options = { RomText.plain("gText_Yes"), RomText.plain("gText_No") }
   end
   Choice.cursor = 1
   Choice.done = cb
-  -- pret WIN_INTRO_YESNO at tiles (2,2); field default near dialogue right.
-  Choice.left = tonumber(layout.left) or (Display.COLS - 8)
-  Choice.top = tonumber(layout.top) or 8
+  -- pokefirered/src/new_menu_helpers.c:48
+  Choice.left = tonumber(layout.left) or 21
+  Choice.top = tonumber(layout.top) or 9
   Choice.maxRight = nil
   Choice.cols = 1
   Choice.ignoreBPress = layout.ignoreBPress or false
@@ -179,6 +181,18 @@ function Choice.draw()
       if i == Choice.cursor then Window.cursorPx(L * 8, rowPx) end
       -- pokefirered/src/battle_message.c:2574
       Window.printPx(lab, (L + 1) * 8, rowPx + 2)
+    end
+    return
+  end
+
+  if Choice.kind == "yesno" then
+    -- pokefirered/src/menu.c:531
+    local L, Tp = Choice.left, Choice.top
+    Window.stdFrame(Window.template(L, Tp, 6, 4))
+    for i, lab in ipairs(Choice.options) do
+      local rowPx = Tp * 8 + 2 + (i - 1) * 14
+      if i == Choice.cursor then Window.cursorPx(L * 8, rowPx) end
+      Window.printPx(lab, L * 8 + 8, rowPx)
     end
     return
   end

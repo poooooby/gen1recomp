@@ -1208,7 +1208,12 @@ function Game2:load(opts)
     self:showCopyright()
   end
 
+  local stepBody
   FixedStep:init(function(dt)
+    stepBody(dt)
+    self:_speedLockEdge()
+  end)
+  stepBody = function(dt)
     -- Tool mods (autoplay, accessibility drivers, input visualizers) act on the
     -- same fixed-step boundary a physical controller does.  Raised HERE, ahead
     -- of both the AUTO_INPUT arm and Input:step, for the reason Gen 1 raises it
@@ -1270,7 +1275,7 @@ function Game2:load(opts)
       self.world:interact()
     end
     self.world:step()
-  end)
+  end
 end
 
 function Game2:inFillBoot()
@@ -1279,7 +1284,28 @@ function Game2:inFillBoot()
   return self.phase == "boot" and self.stack:top() ~= nil
 end
 
+function Game2:speedLocked()
+  if self.linkSession or (self.linkNet and not self.linkNet.closed) then
+    return true, "link"
+  end
+  local states = self.stack and self.stack.states
+  for i = #(states or {}), 1, -1 do
+    local state = states[i]
+    if state and (state.isFixedSpeed or state.isMinigame) then
+      return true, "minigame"
+    end
+  end
+  return false
+end
+
+function Game2:_speedLockEdge()
+  if (self._frameSpeed or 1) > 1 and self:speedLocked() then
+    FixedStep:endFrame()
+  end
+end
+
 function Game2:logicSpeed()
+  if self:speedLocked() then return 1 end
   return math.max(1,
     tonumber(self.speedOverride) or tonumber(self.options and self.options.speed)
     or 1)
@@ -1310,13 +1336,14 @@ function Game2:update(dt)
   -- driver/CLI hook and wins over the saved option.
   -- pokegold engine/menus/intro_menu.asm:848 IntroSequence: boot cinema runs on the same clock as the overworld
   local speed = self:logicSpeed()
+  self._frameSpeed = speed
   if self.phase == "boot" then
-    FixedStep.maxAccum = FixedStep.catchupLimit(speed)
+    FixedStep.maxAccum = FixedStep.catchupLimit(speed, dt)
     FixedStep:update(dt, speed)
     return
   end
   if not self.world or not self.world.map then return end
-  FixedStep.maxAccum = FixedStep.catchupLimit(speed)
+  FixedStep.maxAccum = FixedStep.catchupLimit(speed, dt)
   FixedStep:update(dt, speed)
 end
 
@@ -1520,7 +1547,9 @@ end
 function Game2:fxWorldOrigin(w, h, scale)
   local cam = self.world and self.world.camera
   if not cam then return nil end
-  local fx, fy = Playfield.rect(w, h)
+  local fx, fy, fw, fh = Playfield.rect(w, h)
+  local bx, by = Game2.faithfulBox(fw, fh)
+  if bx then fx, fy = fx + bx, fy + by end
   return fx + math.floor(-cam.x * scale), fy + math.floor(-cam.y * scale)
 end
 
@@ -1554,6 +1583,13 @@ end
 -- the grid itself.
 function Game2:drawViewportFrame()
   local G = love.graphics
+  local serial = require("src.core.FaithfulRes").modeSerial
+  if serial ~= (self.modeSerial or 0) then
+    if self.world and self.world.map then
+      self.world:dropBakes()
+    end
+    self.modeSerial = serial
+  end
   local w, h = GameViewport.dimensions()
   local ShaderFX = require("src.render.ShaderFX")
   local GbcPalette = require("src.render.GbcPalette")
@@ -1730,8 +1766,31 @@ function Game2:textboxPaper()
   return nil
 end
 
+function Game2.faithfulBox(w, h)
+  if not require("src.core.FaithfulRes").scaleCap() then return nil end
+  local s = math.max(1, math.floor(math.min(w / 160, h / 144)))
+  local bw, bh = 160 * s, 144 * s
+  local lift = 0
+  local ScreenPosition = require("src.core.ScreenPosition")
+  if not ScreenPosition.skinActive(w, h) then
+    lift = ScreenPosition.lift(h, bh, ScreenPosition.safeTop())
+  end
+  return math.floor((w - bw) / 2), math.floor((h - bh) / 2) - lift, bw, bh
+end
+
 function Game2:drawContained(w, h)
-  local pw, ph = Playfield.push(w, h)
+  local pw, ph, px, py = Playfield.push(w, h)
+  local bx, by, bw, bh = Game2.faithfulBox(pw, ph)
+  if bx then
+    local G = love.graphics
+    G.setColor(0, 0, 0, 1)
+    G.rectangle("fill", 0, 0, pw, ph)
+    G.setColor(1, 1, 1, 1)
+    G.setScissor(px + bx, py + by, bw, bh)
+    G.translate(bx, by)
+    Playfield.enter(px + bx, py + by, bw, bh)
+    pw, ph = bw, bh
+  end
   local ok, err = pcall(self.drawScene, self, pw, ph)
   Playfield.pop()
   if not ok then error(err, 0) end
@@ -2014,6 +2073,7 @@ function Game2:hotkey(key)
     if self.save then self.save.options = options end
     self:persistOptions()
   end
+  local hk = Input.hotkeyKey(key)
   if key == "f1" then
     if not self:quickSaveAllowed() then return true end
     self:writeSave()
@@ -2023,19 +2083,20 @@ function Game2:hotkey(key)
     local loaded = Save.load()
     if loaded then self:continueGame(loaded) end
     return true
-  elseif key == "1" then
+  elseif hk == "1" then
+    if self:speedLocked() then return true end
     local GameSpeed = require("src.core.GameSpeed")
     options.speed = GameSpeed.cycle(options.speed, 1)
     persist()
     return true
-  elseif key == "2" then
+  elseif hk == "2" then
     local GbcPalette = require("src.render.GbcPalette")
     GbcPalette.setMode(options.color or "gbc")
     options.color = GbcPalette.cycle(1)
     options.palette = ""
     persist()
     return true
-  elseif key == "3" then
+  elseif hk == "3" then
     local Tilt = require("src.render.Tilt")
     options.tilt = Tilt.cycle()
     persist()
@@ -2050,7 +2111,7 @@ function Game2:hotkey(key)
   elseif key == "=" or key == "kp+" then
     self:zoomStep(1)
     return true
-  elseif key == "4" then
+  elseif hk == "4" then
     self.world:zoomCycle()
     self:storeZoom()
     return true
@@ -2327,6 +2388,7 @@ function Game2:applyOptions()
     hotbar = options.hotbar,
   })
   require("src.core.VideoMode").applyOptions(options)
+  require("src.core.FaithfulRes").applyOptions(options)
   require("src.core.ScreenPosition").applyOptions(options)
   require("src.core.VSync").applyOptions(options)
   require("src.core.FrameCap").applyOptions(options)
@@ -2357,6 +2419,7 @@ function Game2:applyOptions()
 end
 
 function Game2:_cycleSpeed(dir)
+  if self:speedLocked() then return end
   local GameSpeed = require("src.core.GameSpeed")
   self.options.speed = GameSpeed.cycle(self.options.speed, dir)
   if self.save then self.save.options = self.options end
@@ -2418,6 +2481,7 @@ end
 -- own comment (src/core/Game.lua) for why, and for the precedent this
 -- restores.
 function Game2:gamepadpressed(joystick, button)
+  Input:padEventSeen(button)
   local function vanilla()
     padPressedBody(self, joystick, button)
   end

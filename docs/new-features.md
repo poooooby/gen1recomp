@@ -11,6 +11,8 @@ Features intentionally added beyond the original Pokémon Red, Blue, and Yellow 
 * **LOGIC CLOCK option** (60HZ or the cart's 59.73HZ vblank rate) on every game's options screen
 * **Peer-to-peer LAN link play** for trades and battles between Red, Blue, and Yellow
 * **Online lobby** in the launcher for battles, spectating and tournaments
+* **FireRed/LeafGreen online** over the relay (Union Room, Direct Corner, wireless minigames, PIN-locked private matches, launcher and in-game invites)
+* **FireRed/LeafGreen Mystery Gift** on the main menu after the first save: WONDER NEWS right away, WONDER CARDS once the questionnaire passphrase is in
 * **Persistent custom options** stored separately from game saves
 * **Optional widescreen battle layout**
 * **Mobile touch controls** with editable layouts, vibration, and orientation settings
@@ -25,9 +27,14 @@ Features intentionally added beyond the original Pokémon Red, Blue, and Yellow 
 * **Filter Find mods by game**, a generation or single-game filter of its own, with every listing showing the games and tags it declares
 * **Update all** in one press from the MODS tab, installing every outdated mod and every installed cart the index lists ahead of it, with a summary of what failed
 * **Rebindable GAME SPEED shortcuts**, SPEED - / SPEED + rows in CONTROLS that move the shoulder hotkeys to any pad button or switch them off
+* **Fast-forward locks to 1X in link play**, every link or online battle, link session and the FireRed/LeafGreen Union Room on every game
+* **40-player Union Room** on FireRed and LeafGreen online, a larger square room where every trainer keeps a fixed spot and anyone can be talked to
 * **Key bar on the touch pad**, a corner toggle that slides out SAVE, LOAD, SPEED, COLOR, TILT and ZOOM for phones with no keyboard
 * **Save editor item verbs**, sorting the bag and PC by item number or name, filling one stack or every stack to x99, and a coin editor on every game
+* **Save editor bag / PC move**, a PC / BAG button on every item row that moves the stack across, clamped to the stack and slot caps
 * **Shortcuts sync before they boot**, a `--game` launch syncing saves (and, with `--update`, taking a release) first, skippable with any button
+* **`--update-mods`**, a launch flag that runs Update all before the game boots
+* **Mod load order**, a Load order sort in the launcher MODS tab and LOAD EARLIER / LATER in the in-game manager, no manifest editing
 
 ## Gen 2 Specifics
 

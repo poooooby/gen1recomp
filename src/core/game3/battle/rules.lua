@@ -43,11 +43,6 @@ Rules.POST_PHASES_ORDER = {
   "perish_song",
 }
 
-Rules.PHASE_ORDER = {}
-for _, p in ipairs(Rules.FIELD_PHASES_ORDER) do Rules.PHASE_ORDER[#Rules.PHASE_ORDER + 1] = p end
-for _, p in ipairs(Rules.BATTLER_PHASES_ORDER) do Rules.PHASE_ORDER[#Rules.PHASE_ORDER + 1] = p end
-for _, p in ipairs(Rules.POST_PHASES_ORDER) do Rules.PHASE_ORDER[#Rules.PHASE_ORDER + 1] = p end
-
 Rules.FAINT_HALT_PHASES = {
   ingrain = true,
   leech_seed = true,
@@ -57,34 +52,12 @@ Rules.FAINT_HALT_PHASES = {
   partial_trap_chip = true,
 }
 
-Rules.FIELD_PHASES = {}
-for _, p in ipairs(Rules.FIELD_PHASES_ORDER) do Rules.FIELD_PHASES[p] = true end
-
-Rules.POST_PHASES = {}
-for _, p in ipairs(Rules.POST_PHASES_ORDER) do Rules.POST_PHASES[p] = true end
-
-function Rules.isFieldPhase(phase)
-  return Rules.FIELD_PHASES[phase] == true
-end
-
-function Rules.isPostPhase(phase)
-  return Rules.POST_PHASES[phase] == true
-end
-
-function Rules.phaseOrder()
-  return Rules.PHASE_ORDER
-end
-
 function Rules.shouldHaltBattlerOnFaint(phase)
   return Rules.FAINT_HALT_PHASES[phase] == true
 end
 
 local function fallback_rng(lo, hi)
-  local okR, Rng = pcall(require, "src.core.game3.rng")
-  if okR and Rng and Rng.compat then
-    return Rng.compat(lo, hi)
-  end
-  return math.random(lo, hi)
+  return require("src.core.game3.battle.link_guard").fallback("rules.roll", lo, hi)
 end
 
 -- Partial trap (Gen3)
@@ -295,7 +268,10 @@ function Rules.crit.roll(attacker, moveOrId, highCrit, rng, st)
   if Oak.active(st) and not Oak.testFlag(st, Oak.FLAG_INFLICT_DMG) then return false end
   local stage = Rules.crit.stage(attacker, moveOrId, highCrit)
   local den = Rules.crit.CHANCE[stage] or 2
-  return rollZeroTo(rng, den) == 0
+  local hit = rollZeroTo(rng, den) == 0
+  -- pokefirered/src/battle_script_commands.c:1201
+  if st and st.pokedude then return false end
+  return hit
 end
 
 function Rules.crit.multiplier()
