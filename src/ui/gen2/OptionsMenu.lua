@@ -215,7 +215,11 @@ local ROWS = {
     step = function(g, dir)
       local o = g.options
       o.performance = Performance.cycle(o.performance, dir)
-      g:applyOptions()
+      if g.applyPerformanceOptions then
+        g:applyPerformanceOptions()
+      else
+        g:applyOptions()
+      end
       return true
     end },
   { label = Strings.source("GAME SPEED"), key = "speed", port = true,
@@ -227,6 +231,15 @@ local ROWS = {
       local speed = tonumber(options.speed) or 1
       if speed == 1 then return Strings("NORMAL") end
       return Strings("%dX", speed)
+    end },
+  { label = Strings.source("ORIENTATION"), key = "orientation", port = true,
+    cycle = function(options, delta)
+      local Orientation = require("src.core.Orientation")
+      options.orientation = Orientation.cycle(options.orientation, delta)
+      Orientation.apply(options.orientation)
+    end,
+    text = function(options)
+      return Strings(require("src.core.Orientation").modeLabel(options.orientation))
     end },
   { label = Strings.source("ZOOM"), key = "zoom", port = true,
     cycle = function(options, delta, game)
@@ -496,7 +509,7 @@ local GROUPS = {
   { id = "group.speed", label = Strings.source("SPEED"),
     members = { "textSpeed", "speed" } },
   { id = "group.video", label = Strings.source("VIDEO"),
-    members = { "videoMode", "faithfulRes", "screenPos", "fpsCap", "vsync",
+    members = { "videoMode", "orientation", "faithfulRes", "screenPos", "fpsCap", "vsync",
       "logicClock" } },
   { id = "group.graphics", label = Strings.source("GRAPHICS"),
     members = { "color", "uiLetterbox", "shaderfx", "shaderfx2", "frame" } },
@@ -582,6 +595,7 @@ local function buildRows()
     -- The descriptor and the save key stay, so a build that grows a printer
     -- only has to drop this test.
     local hidden = row.key == "print"
+      or (row.key == "orientation" and osName ~= "Android" and osName ~= "iOS")
       or (isNX and row.key == "videoMode")
       or (not showTouch and (row.id == "touchControls"
           or row.id == "touchLayout" or row.id == "haptics"

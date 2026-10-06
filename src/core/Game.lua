@@ -72,7 +72,7 @@ function Game:load(opts)
   require("src.battle.TypeChart").load(Data)
 
   self.input = Input
-  Input:init()
+  Input:init(false)
 
   self.touchControls = TouchControls
   TouchControls:init()
@@ -309,6 +309,10 @@ function Game:breakLink(err, source)
 end
 
 function Game:step(dt)
+  -- A monotonic count of fixed logic steps, for presentation counters that
+  -- are sampled from draw code but must advance at the 60Hz step rate
+  -- rather than the display refresh (Player:pose's surf bob).
+  Game.logicStep = (Game.logicStep or 0) + 1
   -- Tool mods (autoplay, accessibility drivers, input visualizers) act on
   -- the same fixed-step boundary as a physical controller.  Run them before
   -- Input:step promotes queued edges so a button chosen here is visible to
@@ -413,6 +417,13 @@ function Game:logicSpeed()
     resolveLogicSpeedVanilla, self))
 end
 
+-- Discord Rich Presence tick, pcall'd by Game:update: a named function so
+-- the per-frame call builds no closure (the require stays inside the pcall,
+-- so a missing/broken module still soft-fails exactly as before)
+local function discordPresenceUpdate(dt)
+  require("src.core.DiscordPresence").update(dt)
+end
+
 function Game:update(dt)
   -- Fast-forward scales only the logic clock (see src/core/GameSpeed.lua).
   -- Give the accumulator room for one full frame at the current speed,
@@ -437,7 +448,7 @@ function Game:update(dt)
   -- mod render pipelines tween on the same real-frame clock, for the same
   -- reason: they are presentational, so fast-forward must not speed them up
   require("src.render.Pipelines").update(dt)
-  pcall(function() require("src.core.DiscordPresence").update(dt) end)
+  pcall(discordPresenceUpdate, dt)
   self:updateSync(dt)
   -- Steady-state memory backstop: advance the incremental collector one
   -- small step every few rendered frames.  The heavy GPU objects are now
@@ -534,22 +545,11 @@ function Game.wideBattleInStack(stack)
   return nil
 end
 
--- Which of "battle"/"overworld"/"menu" per-category GAME SPEED (RFC 0007)
--- applies right now. Whole-stack, the same idiom as fillScaleInStack/
--- wideBattleInStack above: an overlay with neither marker (PartyMenu,
--- ChoiceBox, a NamingScreen, a text box) is transparent to the walk and
--- inherits whatever is under it, making the category a property of the
--- STACK POSITION the overlay sits over, not of the overlay itself. A
--- scripted sequence (script.started/ended) never pushes a state of its
--- own either -- it runs through the owning overworld/battle state's own
--- script runner or message queue -- so it inherits the same way. Nothing
--- identifying as either (the title screen, credits, an intro cutscene
--- with nothing under it) falls to "menu", the bucket every non-gameplay
--- screen gets; see the RFC's Decisions section for the full reasoning.
 function Game.speedCategoryInStack(stack)
   local states = stack and stack.states
   for i = #(states or {}), 1, -1 do
     local state = states[i]
+    if state and state.isMenu then return "menu" end
     if state and state.isBattle then return "battle" end
     if state and state.isOverworld then return "overworld" end
   end
@@ -812,7 +812,10 @@ function Game:_cycleSpeed(dir)
   if busy then return end
   local GameSpeed = require("src.core.GameSpeed")
   local key = GameSpeed.optionKey(Game.speedCategoryInStack(self.stack))
-  self.save.options[key] = GameSpeed.cycle(self.save.options[key], dir)
+  local nextSpeed = GameSpeed.cycle(self.save.options[key], dir)
+  for _, c in ipairs(GameSpeed.CATEGORIES) do
+    self.save.options[GameSpeed.optionKey(c)] = nextSpeed
+  end
   self:writeOptions()
 end
 
@@ -1065,6 +1068,7 @@ local function isRawStick(joystick)
 end
 
 function Game:joystickpressed(joystick, button)
+  if GamepadMap.ignoreRawForJoystick(joystick) then return end
   if isAccelerometer(joystick) then return end
   TouchControls:noteGamepad()
   local top = self.stack and self.stack:top()

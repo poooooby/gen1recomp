@@ -9,6 +9,8 @@ local SE = require("src.core.game3.se_ids")
 local RomText = require("src.core.game3.rom_text")
 local BattleText = require("src.core.game3.battle.battle_text")
 local Adapter = require("src.core.game3.battle.adapter")
+local ShinySeq = require("src.core.game3.battle.shiny_seq")
+local MonAnimBattle = require("src.core.game3.battle.mon_anim_battle")
 
 local IntroSeq = {}
 
@@ -18,6 +20,7 @@ IntroSeq._waiting = false
 IntroSeq._pushMsg = nil
 IntroSeq._headless = false
 IntroSeq._opts = nil
+IntroSeq._st = nil
 
 function IntroSeq.reset()
   IntroSeq._steps = nil
@@ -30,7 +33,9 @@ function IntroSeq.reset()
   IntroSeq._pendingSlideIn = nil
   IntroSeq._pushMsg = nil
   IntroSeq._opts = nil
+  IntroSeq._st = nil
   IntroSeq._cryQueue = nil
+  IntroSeq._waitingMonAnim = nil
 end
 
 function IntroSeq.busy()
@@ -193,7 +198,7 @@ local function build_wild(st, opts)
   local function add(kind, data)
     steps[#steps + 1] = { kind = kind, data = data or {} }
   end
-  local playerGender = (st.oldManTutorial and 5) or opts.playerGender or 0
+  local playerGender = (st.oldManTutorial and 5) or (st.backPicOverride) or opts.playerGender or 0
   add("fade", { mode = "FROM_BLACK", instant = true })
   -- pret: player back sprite slides in with the BG intro even in wild battles
   -- (BattleIntroDrawTrainersOrMonsSprites → EmitDrawTrainerPic for PLAYER_LEFT).
@@ -211,6 +216,7 @@ local function build_wild(st, opts)
     darken = 10 / 16,
     gender = playerGender,
   })
+  add("shiny_check", { side = "enemy" })
   add("cry", { side = "enemy" })  add("undarken", { side = "enemy", frames = 10 })
   add("healthbox", { side = "enemy", frames = 23, from = -115 })
   -- pokefirered/src/battle_message.c:1551
@@ -240,6 +246,7 @@ local function build_wild(st, opts)
   -- pokefirered/src/battle_message.c:1592
   add("msg", { text = IntroSeq.sendOutText(st, "player"), linger = true })
   add("player_throw", {})
+  add("shiny_check", { side = "player" })
   add("healthbox", { side = "player", frames = 23, from = 115 })
   add("wait", { frames = 3 })
   return steps
@@ -272,6 +279,16 @@ local function build_trainer(st, opts)
     { rivalName = opts.rivalName })
   local info = strings.info or {}
   local enemyBalls = enemy_party_balls(st.foeParty, info.partySize or (st.foeParty and #st.foeParty) or 1)
+  if st.trainerB and st.foeHalf then
+    -- pokeemerald/src/battle_interface.c:1597
+    local slots = {}
+    for i = 1, 3 do slots[i] = (i <= st.foeHalf) and st.foeParty[i] or false end
+    for i = 1, 3 do slots[3 + i] = st.foeParty[st.foeHalf + i] or false end
+    for i = 1, 6 do enemyBalls[7 - i] = slots[i] and ball_status(slots[i]) or "empty" end
+    strings.wants = IntroSeq.introText(st)
+  elseif st.frontierTrainer and not (opts.trainerId or st.trainerId) then
+    strings.wants, strings.sentOut = IntroSeq.introText(st), IntroSeq.sendOutText(st, "enemy")
+  end
   local playerBalls = player_party_balls(st.playerParty or (st.player and { st.player.mon }))
 
   add("fade", { mode = "FROM_BLACK", instant = true })
@@ -308,10 +325,12 @@ local function build_trainer(st, opts)
     add("msg", { text = strings.wants })
     add("msg", { text = sentOut })
     add("opponent_sendout", { toX = 280, frames = 35, ids = foeIds })
+    add("shiny_check", { ids = foeIds })
     add("cry", { side = "enemy", release = true, ids = foeIds })
     add("healthbox", { side = "enemy", frames = 23, from = -115, ids = foeIds })
     add("msg", { text = goText, linger = true })
     add("player_throw", { ids = plIds })
+    add("shiny_check", { ids = plIds })
     add("healthbox", { side = "player", frames = 23, from = 115, ids = plIds })
     add("wait", { frames = 3 })
     return steps
@@ -319,10 +338,12 @@ local function build_trainer(st, opts)
   add("msg", { text = strings.wants })
   add("msg", { text = strings.sentOut })
   add("opponent_sendout", { toX = 280, frames = 35 })
+  add("shiny_check", { side = "enemy" })
   add("cry", { side = "enemy", release = true })
   add("healthbox", { side = "enemy", frames = 23, from = -115 })
   add("msg", { text = IntroSeq.sendOutText(st, "player"), linger = true })
   add("player_throw", {})
+  add("shiny_check", { side = "player" })
   add("healthbox", { side = "player", frames = 23, from = 115 })
   add("wait", { frames = 3 })
   return steps
@@ -334,10 +355,13 @@ function IntroSeq.multiTrainerPics(st, playerGender)
   local own = tonumber(st.linkOwn) or 0
   local g = st.linkGenders
   local function front(gender) return (gender == 1) and LB.TRAINER_PIC_LEAF or LB.TRAINER_PIC_RED end
+  local towerA = st.towerLinkMulti and st.trainerPicId or nil
+  local towerB = st.towerLinkMulti and st.trainerB and st.trainerB.pic or nil
   return {
     -- pokefirered/src/battle_controller_link_opponent.c:1133
-    enemyPic = front(g[1]), enemyX = 200,
-    enemyPic2 = front(g[3]), enemyX2 = 152,
+    -- pokeemerald/src/battle_controller_link_opponent.c:1228
+    enemyPic = towerA or front(g[1]), enemyX = 200,
+    enemyPic2 = towerB or front(g[3]), enemyX2 = 152,
     -- pokefirered/src/battle_controller_player.c:2171
     gender = g[own] or playerGender or 0, x = (own == 2) and 90 or 32,
     -- pokefirered/src/battle_controller_link_partner.c:1106
@@ -350,6 +374,7 @@ function IntroSeq.begin(st, opts)
   opts = opts or {}
   IntroSeq.reset()
   IntroSeq._opts = opts
+  IntroSeq._st = st
   IntroSeq._pushMsg = opts.pushMsg
   IntroSeq._headless = opts.headless and true or false
   if IntroSeq._headless or not st then
@@ -384,7 +409,7 @@ function IntroSeq.begin(st, opts)
     end
   end
 
-  local playerGender = (st.oldManTutorial and 5) or opts.playerGender or 0
+  local playerGender = (st.oldManTutorial and 5) or (st.backPicOverride) or opts.playerGender or 0
   s.bgSlide = { enemyOx = -240, playerOx = 240 }
   s.trainer.player.visible = true
   s.trainer.player.gender = playerGender
@@ -404,14 +429,25 @@ function IntroSeq.begin(st, opts)
     s.trainer.enemy.x, s.trainer.enemy.pic2, s.trainer.enemy.x2 = nil, nil, nil
     s.trainer.player.x, s.trainer.player.gender2, s.trainer.player.x2 = nil, nil, nil
     local pics = IntroSeq.multiTrainerPics(st, playerGender)
+    if st.trainerB then
+      -- pokeemerald/src/battle_controller_opponent.c:1296
+      s.trainer.enemy.x = 200
+      s.trainer.enemy.pic2, s.trainer.enemy.x2 = st.trainerB.pic, 152
+    end
     if pics then
       s.trainer.enemy.picId, s.trainer.enemy.x = pics.enemyPic, pics.enemyX
       s.trainer.enemy.pic2, s.trainer.enemy.x2 = pics.enemyPic2, pics.enemyX2
       s.trainer.player.gender, s.trainer.player.x = pics.gender, pics.x
       s.trainer.player.gender2, s.trainer.player.x2 = pics.partnerGender, pics.partnerX
     end
+    if st.partner and st.partner.backPic then
+      -- pokeemerald/src/battle_controller_player_partner.c:1304
+      s.trainer.player.x = 32
+      s.trainer.player.gender2, s.trainer.player.x2 = st.partner.backPic, 90
+    end
     IntroSeq._steps = build_trainer(st, opts)
   end
+  IntroSeq._steps = MonAnimBattle.introSteps(IntroSeq._steps, st.wild)
   IntroSeq._i = 1
   return true
 end
@@ -424,6 +460,38 @@ local function run_step(step)
   local kind = step.kind
   local d = step.data or {}
   local s = stage()
+
+  if kind == "mon_anim" then
+    for _, key in ipairs(d.ids or {}) do
+      MonAnimBattle.start(key, d.kind, { st = IntroSeq._st, noCry = d.noCry })
+    end
+    advance()
+    return
+  end
+
+  if kind == "mon_anim_wait" then
+    IntroSeq._waitingMonAnim = d.ids
+    return
+  end
+
+  if kind == "shiny_check" then
+    local Battle = package.loaded["src.core.game3.battle"]
+    local st = IntroSeq._st or (Battle and Battle._st)
+    local keys = d.ids or { d.id ~= nil and d.id or d.side or "enemy" }
+    local battlers = {}
+    for _, key in ipairs(keys) do
+      battlers[#battlers + 1] = battler_of(st, key)
+    end
+    if ShinySeq.startMany(battlers, keys) then
+      -- FireRed starts shiny sparkle tasks before the healthbox animation and
+      -- waits for both to drain. Advancing here lets the next healthbox step
+      -- schedule its tween while the shared animation VM remains busy.
+      advance()
+      return
+    end
+    advance()
+    return
+  end
 
   if kind == "fade" then
     local okF, Fade = pcall(require, "src.ui.game3.fade")
@@ -706,7 +774,7 @@ local function run_step(step)
           ball.frame = 1
           if not openedSe then
             openedSe = true
-            pcall(function() Audio.playSe(SE.SE_BALL_OPEN, { pan = 63 }) end)
+            pcall(function() Audio.playSe(SE.SE_BALL_OPEN) end)
           end
           local p = present_of(m.key)
           if p then
@@ -774,7 +842,7 @@ local function run_step(step)
       local pcx, pcy = center_of(st, key)
       mons[n] = { key = key, ball = ball_for(s, key, st), tx = pcx, ty = pcy + 24 }
     end
-    local threwSe, openedSe = false, false
+    local openedSe = false
     wait_busy()
     Anim.tweenStage(57, function(u, t)
       local f = t.frames
@@ -807,10 +875,6 @@ local function run_step(step)
           ball.y = oy
           ball._sx, ball._sy = ox, oy
           ball._tx, ball._ty = m.tx, m.ty
-          if not threwSe then
-            threwSe = true
-            pcall(function() Audio.playSe(SE.SE_BALL_THROW, { pan = -64 }) end)
-          end
         end
         -- pret SpriteCB_PlayerMonSendOut_1 / 2: 25 frames arc flight with affine rotation
         if f > 32 and f <= 57 and ball.visible then
@@ -828,7 +892,7 @@ local function run_step(step)
       tr.ox = exitTo
       if not openedSe then
         openedSe = true
-        pcall(function() Audio.playSe(SE.SE_BALL_OPEN, { pan = -64 }) end)
+        pcall(function() Audio.playSe(SE.SE_BALL_OPEN) end)
       end
       for _, m in ipairs(mons) do
         m.ball.frame = 1
@@ -1029,6 +1093,12 @@ function IntroSeq.update()
     end
   end
 
+  if IntroSeq._waitingMonAnim then
+    if MonAnimBattle.busy(IntroSeq._waitingMonAnim) then return false end
+    IntroSeq._waitingMonAnim = nil
+    advance()
+  end
+
   -- Hold on intro dialog until the battle UI queue is drained (wants / sent out).
   if IntroSeq._waitingMsg then
     local Ui = require("src.core.game3.battle.ui")
@@ -1059,7 +1129,8 @@ function IntroSeq.update()
   while IntroSeq._steps and IntroSeq._i <= #IntroSeq._steps do
     run_step(IntroSeq._steps[IntroSeq._i])
     if IntroSeq._waiting or IntroSeq._waitingFade or IntroSeq._waitingCry
-        or IntroSeq._waitingMsg or IntroSeq._pendingSlideIn or IntroSeq._cryQueue then
+        or IntroSeq._waitingMsg or IntroSeq._pendingSlideIn or IntroSeq._cryQueue
+        or IntroSeq._waitingMonAnim then
       return false
     end
   end

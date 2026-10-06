@@ -353,6 +353,7 @@ Save.DEFAULT_OPTIONS = {
   haptics = "light",
   touchControls = { enabled = true },
   screenPos = "center",
+  orientation = "auto",
 }
 
 function Save.defaultOptions()
@@ -374,7 +375,7 @@ Save.OPTIONS_KEY = "gold"
 
 local SHARED_KEYS = {
   touchControls = true, haptics = true, screenPos = true,
-  videoMode = true, faithfulRes = true,
+  videoMode = true, faithfulRes = true, orientation = true,
   mods = true, modsByVersion = true, modsGen2 = true,
   modOptions = true, modProfiles = true, modProfilesSeeded = true,
   activeProfile = true,
@@ -400,6 +401,7 @@ function Save.loadOptions(fs)
       end
     end
   end
+  options.orientation = require("src.core.Orientation").normalize(options.orientation)
   return options
 end
 
@@ -413,7 +415,8 @@ function Save.saveOptions(options, fs)
   local block = {}
   for key, value in pairs(options) do
     if SHARED_KEYS[key] then
-      file[key] = value
+      file[key] = key == "orientation"
+        and require("src.core.Orientation").normalize(value) or value
     else
       block[key] = value
     end
@@ -1018,6 +1021,8 @@ end
 function Save.tickPlayTime(save)
   local t = save and save.playTime
   if not t then return end
+  -- pokecrystal home/game_time.asm:40
+  if t.capped then return end
   t.frames = (t.frames or 0) + 1
   if t.frames < 60 then return end
   t.frames = 0
@@ -1027,9 +1032,15 @@ function Save.tickPlayTime(save)
   t.minutes = (t.minutes or 0) + 1
   if t.minutes < 60 then return end
   t.minutes = 0
-  -- The cart caps at 999:59 and stops counting; do the same rather than
-  -- letting the trainer card overflow its field.
-  t.hours = math.min((t.hours or 0) + 1, 999)
+  local hours = (t.hours or 0) + 1
+  -- pokecrystal home/game_time.asm:96
+  if hours >= 1000 then
+    t.capped = true
+    t.minutes = 59
+    t.seconds = 59
+    return
+  end
+  t.hours = hours
 end
 
 return Save

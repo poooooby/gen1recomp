@@ -138,6 +138,8 @@ function TextBox.new(game, text, onDone, opts)
   self.money = opts and opts.money
   -- scripts/MtMoonPokecenter.asm:30
   self.moneyWithChoice = opts and opts.moneyWithChoice
+  -- engine/events/vending_machine.asm:4
+  self.moneyOnShown = opts and opts.moneyOnShown
   self.auto = opts and opts.auto
   self.stay = opts and opts.stay
   -- engine/events/hidden_events/cinnabar_gym_quiz.asm:119
@@ -166,10 +168,16 @@ function TextBox.new(game, text, onDone, opts)
   self.textX = (self.boxTx + 1) * 8
   self.line1Y = (self.boxTy + 2) * 8
   self.line2Y = (self.boxTy + 4) * 8
+  local doubleLine = game and game.data and game.data.text
+    and text == game.data.text._OaksLabGivePokeballsExplanationText
   text = TextBox.substitute(game, text)
   local marks
   text, marks = stripPauses(text)
-  self.pages = TextBox.paginate(text, self.maxCols)
+  local save = game and game.save
+  self.fixedGen1Rows = not (save and (save.generation == 2 or save.generation == 3
+      or save.version == "gold"))
+    and require("src.core.GameVersion").generation() == 1
+  self.pages = TextBox.paginate(text, self.maxCols, doubleLine and self.fixedGen1Rows)
   -- opts.pauseSounds[i] is the sfx the i-th marker fires once its wait is
   -- over (text_asm SFX_SWAP, engine/pokemon/learn_move.asm:210-213)
   self.pauseSounds = opts and opts.pauseSounds
@@ -181,6 +189,7 @@ function TextBox.new(game, text, onDone, opts)
   self.lineIndex = 1
   self.charIndex = 0
   self.shown = {} -- visible lines (max 2), each a list of glyph codes
+  self.shownSource = {}
   self.waiting = false
   self.contAdvance = false
   self.done = false
@@ -195,9 +204,12 @@ function TextBox.new(game, text, onDone, opts)
     -- twice, then the next line is written at TEXTBOX_INNERY + 2, i.e. the
     -- bottom row.  Taking the first two would walk the text backwards the
     -- instant the prompt appears.
-    for index = math.max(1, #page - 1), #page do
-      self.shown[#self.shown + 1] = Font.encode(page[index])
+    for index = 1, #page do
+      self.lineIndex = index
+      self:beginLine()
+      self.shown[#self.shown] = self.codes
     end
+    self.scrollPx = nil
     self.lineIndex = #page
     self.codes = self.shown[#self.shown] or {}
     self.charIndex = #self.codes
@@ -286,7 +298,7 @@ end
 -- additional lines on the same page (the box scrolls them).
 -- pages.contBefore[p][i] is true when line i was preceded by \v (cont):
 -- pokered ContText waits for A/B + ▼ before scrolling that line in.
-function TextBox.paginate(text, maxCols)
+function TextBox.paginate(text, maxCols, gen1)
   maxCols = maxCols or (Theme.textBox and Theme.textBox.maxCols) or MAX_COLS
   text = TextBox.strip(text)
   -- maxCols is a column count, so the budget is that many vanilla 8px
@@ -320,18 +332,31 @@ function TextBox.paginate(text, maxCols)
     table.insert(lines, line)
     table.insert(conts, wait)
   end
+  local function overlay(base, over)
+    local b, o = Font.split(base), Font.split(over)
+    if #o >= #b then return over end
+    return over .. base:sub(b[#o].to + 1)
+  end
   for pageText in (text .. "\f"):gmatch("(.-)\f") do
     if pageText ~= "" then
       local lines, conts = {}, {}
-      local pos, waitNext = 1, false
+      local pos, waitNext, afterNl = 1, false, false
+      local function addSegment(seg)
+        if gen1 and afterNl and #lines == 2 and not conts[2] then
+          lines[2] = overlay(lines[2], seg) -- home/text.asm:76-81
+        else
+          pushLine(lines, conts, seg, waitNext)
+        end
+      end
       while true do
         local npos = pageText:find("[\n\v]", pos)
         if not npos then
-          pushLine(lines, conts, pageText:sub(pos), waitNext)
+          addSegment(pageText:sub(pos))
           break
         end
-        pushLine(lines, conts, pageText:sub(pos, npos - 1), waitNext)
+        addSegment(pageText:sub(pos, npos - 1))
         waitNext = pageText:sub(npos, npos) == "\v"
+        afterNl = not waitNext
         pos = npos + 1
       end
       if lines[#lines] == "" then
@@ -359,19 +384,27 @@ end
 function TextBox:beginLine()
   self.charIndex = 0
   self.codes = Font.encode(self:currentLine())
+  local conts = self.pages.contBefore and self.pages.contBefore[self.pageIndex]
+  -- pokered/home/text.asm:262
+  if self.fixedGen1Rows and conts and conts[self.lineIndex] and #self.shown == 1 then
+    table.insert(self.shown, {})
+    table.insert(self.shownSource, false)
+  end
   if #self.shown >= 2 then
     table.remove(self.shown, 1)
+    table.remove(self.shownSource, 1)
     self.scrollPx = 8 -- pixel scroll-up (ScrollTextUpOneLine)
   end
   table.insert(self.shown, {})
+  table.insert(self.shownSource, self.lineIndex)
 end
 
 function TextBox:visibleText()
   local page = self.pages[self.pageIndex]
   if not page then return nil end
-  local out, count = {}, #(self.shown or {})
-  for i = math.max(1, self.lineIndex - count + 1), self.lineIndex do
-    if page[i] ~= nil then out[#out + 1] = page[i] end
+  local out = {}
+  for _, source in ipairs(self.shownSource) do
+    out[#out + 1] = source and page[source] or ""
   end
   return #out > 0 and out or nil
 end
@@ -411,13 +444,44 @@ function TextBox:arrowPos()
     gold and (self.boxTy + self.boxTh - 1) * 8 or self.line2Y
 end
 
+-- home/text.asm:270
+function TextBox:blankArrowCell()
+  if not self.fixedGen1Rows then return end
+  local line = self.shown[#self.shown]
+  if not line or #self.shown < 2 then return end
+  local ax = self:arrowPos()
+  local pen = self.textX
+  for i, code in ipairs(line) do
+    if pen == ax then
+      line[i] = 0x7F
+      return
+    end
+    pen = pen + Font.advanceOf(code)
+  end
+end
+
 -- scripts/MtMoonPokecenter.asm:30
 function TextBox:moneyVisible()
   if not self.money then return false end
+  if self.moneyOnShown and not self.stayShown then return false end
   return not self.moneyWithChoice or not not self.choicePushed
 end
 
+local step
+
+-- One logic frame.  The ScrollTextUpOneLine slide advances here, after the
+-- step (so a line begun this frame is first drawn 2px into its slide, as it
+-- was when draw advanced it), and not in draw, whose rate follows the
+-- display's refresh rather than the 60Hz logic clock.
 function TextBox:update(dt)
+  step(self, dt)
+  if self.scrollPx and self.scrollPx > 0 then
+    self.scrollPx = self.scrollPx - 2
+    if self.scrollPx <= 0 then self.scrollPx = nil end
+  end
+end
+
+function step(self, dt)
   local input = self.game.input
   self.blink = (self.blink + 1) % 480
   -- home/text.asm:506
@@ -592,6 +656,7 @@ function TextBox:update(dt)
       if self.contAdvance then
         -- ContText / ManualTextScroll: keep the box, scroll one line
         self.contAdvance = false
+        self:blankArrowCell()
         self.lineIndex = self.lineIndex + 1
         self:beginLine()
         -- ScrollTextUpOneLine is 5 blocking frames and, as its own comment
@@ -599,6 +664,7 @@ function TextBox:update(dt)
         self.holdFrames = Timing.TEXT_SCROLL_PAIR
       else
         self.shown = {}
+        self.shownSource = {}
         self.pageIndex = self.pageIndex + 1
         self.lineIndex = 1
         self:beginLine()
@@ -702,10 +768,6 @@ function TextBox:draw()
     Font.drawBox(self.boxTx, self.boxTy, self.boxTw, self.boxTh, paper)
     love.graphics.setColor(0, 0, 0, 1)
   end
-  if self.scrollPx and self.scrollPx > 0 then
-    self.scrollPx = self.scrollPx - 2
-    if self.scrollPx <= 0 then self.scrollPx = nil end
-  end
   -- Only the retained line carries the offset: it slides up from where it
   -- already sat (line2Y) to line1Y.  The incoming line is drawn at its home
   -- row instead, because offsetting it too put fresh glyphs 8px low -- on the
@@ -715,13 +777,20 @@ function TextBox:draw()
   -- nothing in the original is ever drawn between two rows.
   local off = self.scrollPx or 0
   local ys = { self.line1Y, self.line2Y }
+  -- home/text.asm:264
+  local coverX, coverY
+  if self.fixedGen1Rows and self:arrowVisible() then
+    coverX, coverY = arrowX, arrowY
+  end
   for i, line in ipairs(self.shown) do
     local y = (ys[i] or self.line2Y) + (i == 1 and off or 0)
     -- the pen advances per glyph, matching the pixel budget paginate
     -- measured with; every fixed-width page still lands on the 8px grid
     local pen = self.textX
     for _, code in ipairs(line) do
-      drawGlyph(code, pen, y)
+      if not (pen == coverX and y == coverY) then
+        drawGlyph(code, pen, y)
+      end
       pen = pen + Font.advanceOf(code)
     end
   end
@@ -737,14 +806,24 @@ function TextBox:draw()
       love.graphics.rectangle("fill", 13 * 8, 0, 5 * 8, 8)
       love.graphics.setColor(0, 0, 0, 1)
       local cap = 13 * 8
-      for _, code in ipairs(Font.encode("MONEY")) do
+      if not self.moneyLabel or self.moneyRev ~= Font.revision then
+        self.moneyLabel, self.moneyAmount = Font.encode("MONEY"), nil
+        self.moneyRev = Font.revision
+      end
+      for _, code in ipairs(self.moneyLabel) do
         drawGlyph(code, cap, 0)
         cap = cap + Font.advanceOf(code)
       end
     end
-    local money = ("¥%d"):format(self.money() or 0)
-    local pen = 152 - Font.width(money)
-    for _, code in ipairs(Font.encode(money)) do
+    -- formatted and encoded only when the amount (or the font) changes
+    local amount = self.money() or 0
+    if amount ~= self.moneyAmount or self.moneyRev ~= Font.revision then
+      local money = ("¥%d"):format(amount)
+      self.moneyAmount, self.moneyRev = amount, Font.revision
+      self.moneyCodes, self.moneyWidth = Font.encode(money), Font.width(money)
+    end
+    local pen = 152 - self.moneyWidth
+    for _, code in ipairs(self.moneyCodes) do
       drawGlyph(code, pen, 8)
       pen = pen + Font.advanceOf(code)
     end

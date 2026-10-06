@@ -2,8 +2,15 @@
 -- Owns cell + pixel motion; does not call World:step or Player:tryMove.
 -- Collision via game3.collision (owned COLL_* grid from extract bake).
 
+local function lazyReq(name)
+  local m = package.loaded[name]
+  if type(m) == "table" then return m end
+  return require(name)
+end
+
 local Collision = require("src.core.game3.collision")
 local ModRuntime = require("src.mods.Runtime")
+local WarpArrow = require("src.core.game3.warp_arrow")
 
 local Player = {}
 
@@ -78,6 +85,25 @@ Player.elevation = 3
 -- pokefirered/src/field_player_avatar.c:1296
 Player.currentElevation = 0
 Player._logged = false
+-- pokeemerald/include/global.fieldmap.h:288
+Player.bikeType = nil
+Player.moveDir = "down"
+Player.facingLocked = false
+Player.action = nil
+Player.jumpType = nil
+Player.acroAnim = nil
+
+-- pokeemerald/src/event_object_movement.c:8424
+local JUMP_Y = {
+  high = JUMP_Y_HIGH,
+  low = { 0, -2, -3, -4, -5, -6, -6, -6, -5, -5, -4, -3, -2, 0, 0, 0 },
+  normal = { -2, -4, -6, -8, -9, -10, -10, -10, -9, -8, -6, -5, -3, -2, 0, 0 },
+}
+
+local function rseBike()
+  local Bike = package.loaded["src.core.game3.bike"] or lazyReq("src.core.game3.bike")
+  return Bike.rse()
+end
 
 function Player.setVisible(vis)
   Player.visible = (vis ~= false)
@@ -97,6 +123,21 @@ end
 local function log(msg)
 
   print("[game3/player] " .. tostring(msg))
+end
+
+local EMPTY = {}
+
+local function sessionFlags(session)
+  local Profile = package.loaded["src.core.game3.profile"] or lazyReq("src.core.game3.profile")
+  local Flags = package.loaded["src.core.game3.scripting.flags"] or lazyReq("src.core.game3.scripting.flags")
+  local row = Profile.forSession(type(session) == "table" and session.version and session or nil)
+  return Flags.forVersion(row.id)
+end
+
+local function fieldBlock()
+  local Profile = package.loaded["src.core.game3.profile"] or lazyReq("src.core.game3.profile")
+  local ok, row = pcall(Profile.forSession)
+  return ok and row and row.field or EMPTY
 end
 
 local function dirs_from_input(input)
@@ -120,6 +161,9 @@ function Player.reset(x, y, facing)
   end
   Player.cellX = tonumber(x) or 0
   Player.cellY = tonumber(y) or 0
+  Player._scriptedStep = nil
+  -- pokeemerald/src/field_player_avatar.c:1402
+  WarpArrow.hide()
   Player.px = Player.cellX * CELL
   Player.py = Player.cellY * CELL
   local Collision = package.loaded["src.core.game3.collision"]
@@ -157,6 +201,15 @@ function Player.reset(x, y, facing)
   Player.walkInPlaceFast = false
   Player.boulderPush = nil
   Player.currentElevation = 0
+  Player.moveDir = Player.facing
+  Player.facingLocked = false
+  Player.fixedPriority = nil
+  Player.subpriority = nil
+  Player.action = nil
+  Player.jumpType = nil
+  Player.acroAnim = nil
+  local BikeRse = package.loaded["src.core.game3.bike.rse"]
+  if BikeRse then BikeRse.clearState(0, 0) end
   if not Player._logged then
     log(string.format("avatar ready @ %d,%d %s",
       Player.cellX, Player.cellY, Player.facing))
@@ -170,6 +223,12 @@ function Player.syncFromSession(session)
   if session.elevation ~= nil then
     Player.elevation = tonumber(session.elevation) or 3
   end
+  if session.biking ~= nil then
+    Player.biking = (session.biking == true)
+  end
+  if session.bikeType ~= nil then
+    Player.bikeType = session.bikeType
+  end
 end
 
 function Player.syncFromHost(game)
@@ -180,6 +239,10 @@ function Player.syncFromHost(game)
   if p.elevation ~= nil then
     Player.elevation = tonumber(p.elevation) or 3
   end
+  local save = game and game.save
+  if save and save.biking ~= nil then
+    Player.biking = (save.biking == true)
+  end
 end
 
 --- Write avatar coords into save.position (ferry / host save). No host entity mirror.
@@ -189,10 +252,15 @@ function Player.syncSavePosition(game)
   save.position.x = Player.cellX
   save.position.y = Player.cellY
   save.position.facing = Player.facing
+  save.position.biking = (Player.biking == true)
+  save.biking = (Player.biking == true)
   local session = package.loaded["src.core.game3.runtime"]
   session = session and session.getSession and session.getSession()
-  if session and session.map then
-    save.position.map = session.map
+  if session then
+    session.biking = (Player.biking == true)
+    if session.map then
+      save.position.map = session.map
+    end
   end
 end
 
@@ -270,6 +338,12 @@ function Player.jumpSpriteY()
   if not Player.jumping then return 0 end
   local progress = Player.progress or 0
   if progress < 1 then return 0 end
+  if Player.jumpType then
+    -- pokeemerald/src/event_object_movement.c:8462 DoJumpSpriteMovement
+    local idx = (Player.stepFrames or 16) >= 32 and math.floor((progress - 1) / 2) or (progress - 1)
+    local t = JUMP_Y[Player.jumpType] or JUMP_Y_HIGH
+    return t[idx + 1] or 0
+  end
   if Player.surfHopping or Player.dismounting then
     local idx = math.min(progress, #SURF_HOP_Y)
     return SURF_HOP_Y[idx] or 0
@@ -290,6 +364,12 @@ function Player.updateElevation(curX, curY, prevX, prevY)
 end
 
 local function beginStep(tx, ty, run, ledge)
+  local mdx, mdy = tx - Player.cellX, ty - Player.cellY
+  if mdx ~= 0 or mdy ~= 0 then
+    Player.moveDir = (mdx > 0 and "right") or (mdx < 0 and "left") or (mdy > 0 and "down") or "up"
+  end
+  Player.jumpType = nil
+  Player.acroAnim = nil
   Player.updateElevation(tx, ty, Player.cellX, Player.cellY)
   Player.prevCellX = Player.cellX
   Player.prevCellY = Player.cellY
@@ -314,7 +394,7 @@ local function beginStep(tx, ty, run, ledge)
   Player.animClock = 0
 
   -- pret GroundEffect_StepOnTallGrass when entering a grass cell.
-  local okFx, FieldEffects = pcall(require, "src.core.game3.field_effects")
+  local okFx, FieldEffects = pcall(lazyReq, "src.core.game3.field_effects")
   if okFx and FieldEffects then
     if Collision.isGrass and Collision.isGrass(tx, ty) then
       FieldEffects.tallGrassAt(tx, ty, false)
@@ -322,6 +402,115 @@ local function beginStep(tx, ty, run, ledge)
       FieldEffects.leaveTallGrass()
     end
   end
+end
+
+local function stairTrigger(game, dir)
+  -- pokefirered/src/field_player_avatar.c:556
+  local stair = Collision.isStairWarp
+    and Collision.isStairWarp(game, Player.cellX, Player.cellY, dir)
+  if stair then
+    local Warp = lazyReq("src.core.game3.warp")
+    if Warp.isBusy() then return "stair_busy" end
+    local Runtime = package.loaded["src.core.game3.runtime"]
+    local mod = Runtime and Runtime._mod
+    local g = game or (Runtime and Runtime._game)
+    Warp.startStairWarp(mod, g, stair.destMap, stair.destX, stair.destY, stair.behavior)
+    return "stair"
+  end
+  return nil
+end
+
+local function stepTriggers(game, dir, wasFacing, tx, ty)
+  if dir == "up" then
+    -- pokeemerald/src/field_control_avatar.c:837
+    if lazyReq("src.core.game3.field_moves").isRse()
+        and lazyReq("src.core.game3.rse.init").call("secretBase", "tryDoorWarp", nil, nil, game, tx, ty) then
+      return "secret_base_door"
+    end
+    local doorWarp = Collision.isDoorWarp and Collision.isDoorWarp(game, tx, ty)
+    if doorWarp then
+      local Warp = lazyReq("src.core.game3.warp")
+      if not Warp.isBusy() then
+        local Runtime = package.loaded["src.core.game3.runtime"]
+        local mod = Runtime and Runtime._mod
+        local g = game or (Runtime and Runtime._game)
+        Warp.startDoorEntrance(mod, g, doorWarp.destMap, doorWarp.destX, doorWarp.destY, tx, ty)
+        return "door"
+      end
+      return "door_busy"
+    end
+  end
+
+  if dir == "down" and wasFacing == "down" and Collision.arrowWarpDir(Collision.behavior(Player.cellX, Player.cellY)) == "down" then
+    -- pokeruby/src/overworld.c:1984
+    local Link = package.loaded["src.core.game3.link"] or package.loaded["src.core.game3.link.init"]
+    local Space = package.loaded["src.core.game3.scripting.space"]
+    local key = Space and Space.vm and (Space.scriptKey("TradeRoom_PromptToCancelLink")
+      or Space.scriptKey("EventScript_ConfirmLeaveCableClubRoom")
+      or Space.scriptKey("TradeCenter_ConfirmLeaveRoom"))
+    if key and Link and Link.link and Link.link:isOpen() and Link.inLinkRoom(Space.vm.ctx) then
+      local Audio = lazyReq("src.core.game3.audio")
+      if Audio.playSe then Audio.playSe(lazyReq("src.core.game3.se_ids").SE_WIN_OPEN) end
+      if Space.startScript(key) then return "link_room_exit" end
+    end
+  end
+
+  if dir == "down" then
+    local exitWarp = Collision.isExitWarp and Collision.isExitWarp(game, Player.cellX, Player.cellY)
+    if exitWarp then
+      local Warp = lazyReq("src.core.game3.warp")
+      if not Warp.isBusy() then
+        local Runtime = package.loaded["src.core.game3.runtime"]
+        local mod = Runtime and Runtime._mod
+        local g = game or (Runtime and Runtime._game)
+        Warp.startDoorExit(mod, g, exitWarp.destMap, exitWarp.destX, exitWarp.destY, Player.cellX, Player.cellY)
+        return "exit_door"
+      end
+      return "door_busy"
+    end
+  end
+
+  local escWarp = Collision.isEscalatorWarp and Collision.isEscalatorWarp(game, tx, ty, dir)
+  if escWarp then
+    local Warp = lazyReq("src.core.game3.warp")
+    if not Warp.isBusy() then
+      local Runtime = package.loaded["src.core.game3.runtime"]
+      local mod = Runtime and Runtime._mod
+      local g = game or (Runtime and Runtime._game)
+      Warp.startEscalator(mod, g, escWarp.destMap, escWarp.destX, escWarp.destY, escWarp.escDir, dir, tx, ty)
+      return "escalator"
+    end
+    return "escalator_busy"
+  end
+
+  -- pokefirered/src/field_control_avatar.c:825 TryArrowWarp
+  if Collision.isArrowWarp
+      and Collision.isArrowWarp(game, Player.cellX, Player.cellY, dir) then
+    local Warp = lazyReq("src.core.game3.warp")
+    if Warp.isBusy() then return "arrow_busy" end
+    if Collision.tryWarpAt(game, Player.cellX, Player.cellY, dir, { arrow = true }) then
+      return "arrow_warp"
+    end
+  end
+
+  -- pokefirered/src/field_control_avatar.c:262
+  local Field = package.loaded["src.core.game3.field"]
+  if Field and Field.tryWalkIntoSign then
+    -- pokefirered/src/field_control_avatar.c:260
+    if wasFacing ~= dir then
+      if Field.tryWalkIntoSign(game, dir, true) then return "sign_turn" end
+    elseif Field.tryWalkIntoSign(game, dir) then
+      return "sign"
+    end
+  end
+  return nil
+end
+
+function Player.fieldTriggers(game, dir)
+  local d = DELTA[dir]
+  if not d then return nil end
+  return stairTrigger(game, dir)
+    or stepTriggers(game, dir, Player.facing, Player.cellX + d[1], Player.cellY + d[2])
 end
 
 function Player.tryMove(dir, game, run)
@@ -339,18 +528,8 @@ function Player.tryMove(dir, game, run)
   end
   if Player.turnTimer > 0 then return nil end
 
-  -- pokefirered/src/field_player_avatar.c:556
-  local stair = Collision.isStairWarp
-    and Collision.isStairWarp(game, Player.cellX, Player.cellY, dir)
-  if stair then
-    local Warp = require("src.core.game3.warp")
-    if Warp.isBusy() then return "stair_busy" end
-    local Runtime = package.loaded["src.core.game3.runtime"]
-    local mod = Runtime and Runtime._mod
-    local g = game or (Runtime and Runtime._game)
-    Warp.startStairWarp(mod, g, stair.destMap, stair.destX, stair.destY, stair.behavior)
-    return "stair"
-  end
+  local trig = stairTrigger(game, dir)
+  if trig then return trig end
 
   local d = DELTA[dir]
   local tx = Player.cellX + d[1]
@@ -362,93 +541,32 @@ function Player.tryMove(dir, game, run)
   if lx then
     beginStep(lx, ly, false, true)
     pcall(function()
-      local Audio = require("src.core.game3.audio")
-      local SE = require("src.core.game3.se_ids")
+      local Audio = lazyReq("src.core.game3.audio")
+      local SE = lazyReq("src.core.game3.se_ids")
       if Audio.playSe and SE.SE_LEDGE then Audio.playSe(SE.SE_LEDGE) end
     end)
     return "ledge"
   end
 
-  if dir == "up" then
-    local doorWarp = Collision.isDoorWarp and Collision.isDoorWarp(game, tx, ty)
-    if doorWarp then
-      local Warp = require("src.core.game3.warp")
-      if not Warp.isBusy() then
-        local Runtime = package.loaded["src.core.game3.runtime"]
-        local mod = Runtime and Runtime._mod
-        local g = game or (Runtime and Runtime._game)
-        Warp.startDoorEntrance(mod, g, doorWarp.destMap, doorWarp.destX, doorWarp.destY, tx, ty)
-        return "door"
-      end
-      return "door_busy"
-    end
-  end
-
-  if dir == "down" then
-    local exitWarp = Collision.isExitWarp and Collision.isExitWarp(game, Player.cellX, Player.cellY)
-    if exitWarp then
-      local Warp = require("src.core.game3.warp")
-      if not Warp.isBusy() then
-        local Runtime = package.loaded["src.core.game3.runtime"]
-        local mod = Runtime and Runtime._mod
-        local g = game or (Runtime and Runtime._game)
-        Warp.startDoorExit(mod, g, exitWarp.destMap, exitWarp.destX, exitWarp.destY, Player.cellX, Player.cellY)
-        return "exit_door"
-      end
-      return "door_busy"
-    end
-  end
-
-  local escWarp = Collision.isEscalatorWarp and Collision.isEscalatorWarp(game, tx, ty, dir)
-  if escWarp then
-    local Warp = require("src.core.game3.warp")
-    if not Warp.isBusy() then
-      local Runtime = package.loaded["src.core.game3.runtime"]
-      local mod = Runtime and Runtime._mod
-      local g = game or (Runtime and Runtime._game)
-      Warp.startEscalator(mod, g, escWarp.destMap, escWarp.destX, escWarp.destY, escWarp.escDir, dir, tx, ty)
-      return "escalator"
-    end
-    return "escalator_busy"
-  end
-
-  -- pokefirered/src/field_control_avatar.c:825 TryArrowWarp
-  if Collision.isArrowWarp
-      and Collision.isArrowWarp(game, Player.cellX, Player.cellY, dir) then
-    local Warp = require("src.core.game3.warp")
-    if Warp.isBusy() then return "arrow_busy" end
-    if Collision.tryWarpAt(game, Player.cellX, Player.cellY, dir, { arrow = true }) then
-      return "arrow_warp"
-    end
-  end
-
-  -- pokefirered/src/field_control_avatar.c:262
-  local Field = package.loaded["src.core.game3.field"]
-  if Field and Field.tryWalkIntoSign then
-    -- pokefirered/src/field_control_avatar.c:260
-    if wasFacing ~= dir then
-      if Field.tryWalkIntoSign(game, dir, true) then return "sign_turn" end
-    elseif Field.tryWalkIntoSign(game, dir) then
-      return "sign"
-    end
-  end
+  trig = stepTriggers(game, dir, wasFacing, tx, ty)
+  if trig then return trig end
 
   local ok, why = Collision.canEnter(game, tx, ty, {
     fromX = Player.cellX,
     fromY = Player.cellY,
     dir = dir,
-    surfing = Player.surfing,
+    surfing = Player.surfing or Player.underwater,
     elevation = Player.currentElevation,
   })
 
   if not ok then
     if why == "entity" then
       local Space = package.loaded["src.core.game3.scripting.space"]
-      local Flags = require("src.core.game3.scripting.flags")
-      local FieldMoves = require("src.core.game3.field_moves")
+      local Flags = lazyReq("src.core.game3.scripting.flags")
+      local FieldMoves = lazyReq("src.core.game3.field_moves")
       local isStrengthActive = Space and Space.store and Flags.getFlag(Space.store, nil, FieldMoves.SYS_FLAGS.USE_STRENGTH)
       if isStrengthActive then
-        local Objects = require("src.core.game3.objects")
+        local Objects = lazyReq("src.core.game3.objects")
         local obj = Objects.at(tx, ty)
         if obj and (obj.def and (obj.def.graphicsId == FieldMoves.GFX_IDS.PUSHABLE_BOULDER or obj.def.gfx == FieldMoves.GFX_IDS.PUSHABLE_BOULDER)) then
           -- pokefirered/src/field_player_avatar.c:638
@@ -468,9 +586,9 @@ function Player.tryMove(dir, game, run)
             Player.walkInPlaceFast = false
             Player.animClock = 0
             Objects.pushStep(obj, dir, WALK_FRAMES * 2)
-            local FieldEffects = require("src.core.game3.field_effects")
+            local FieldEffects = lazyReq("src.core.game3.field_effects")
             FieldEffects.startDust(tx, ty)
-            require("src.core.game3.audio").playSe(require("src.core.game3.se_ids").SE_M_STRENGTH)
+            lazyReq("src.core.game3.audio").playSe(lazyReq("src.core.game3.se_ids").SE_M_STRENGTH)
             if ModRuntime.wants("world.boulder_moved") then
               local Map = package.loaded["src.core.game3.map"]
               ModRuntime.emit("world.boulder_moved", {
@@ -489,10 +607,21 @@ function Player.tryMove(dir, game, run)
     end
     return "blocked", why
   end
-  local isDismount = Player.surfing and (not (Collision.isWater and Collision.isWater(tx, ty)))
+  local RG = package.loaded["src.core.game3.rotating_gate"]
+  if RG and RG.active() and RG.checkCollision(dir, tx, ty) then
+    -- pokeemerald/src/field_player_avatar.c:709
+    return "blocked", "rotating_gate"
+  end
+  local BikeRse = rseBike()
+  if BikeRse and BikeRse.acroCollision(Collision.behavior(tx, ty)) ~= 0 then
+    -- pokeemerald/src/field_player_avatar.c:711
+    return "blocked", "acro"
+  end
+  local isDismount = Player.surfing and not Player.underwater
+    and Collision.isSurfDismount(tx, ty, Player.currentElevation)
   if isDismount then
     Player.dismounting = true
-    require("src.core.game3.audio").stopSurfMusic()
+    lazyReq("src.core.game3.audio").stopSurfMusic()
   else
     Player.dismounting = false
   end
@@ -510,11 +639,57 @@ local function isCyclingRoadPullDown(beh)
     and beh <= MB_CYCLING_ROAD_PULL_DOWN_GRASS
 end
 
+function Player.isOnCyclingRoad(session, x, y, mapDef)
+  local cx = x or Player.cellX
+  local cy = y or Player.cellY
+  local beh
+  if mapDef then
+    beh = Collision.behaviorOn and Collision.behaviorOn(mapDef, cx, cy)
+  else
+    beh = Collision.behavior and Collision.behavior(cx, cy)
+  end
+  if isCyclingRoadPullDown(beh) then return true end
+  local Flags = package.loaded["src.core.game3.scripting.flags"]
+    or package.loaded["src.core.game3.flags"]
+    or lazyReq("src.core.game3.scripting.flags")
+  local cf = Flags and Flags.forVersion and sessionFlags(session).IDS.FLAG_SYS_ON_CYCLING_ROAD
+  if cf and Flags.getFlag then
+    local cfKey = tostring(cf)
+    local Live = package.loaded["src.core.game3.scripting.space"]
+    if Live and Live.active == true and Live.store then
+      return Flags.getFlag(Live.store, nil, cf) == true
+    end
+    if session and (session.store or session.flags) then
+      local st = session.store or session
+      if Flags.getFlag(st, nil, cf) == true or (session.flags and (session.flags[cf] == true or session.flags[cfKey] == true)) then
+        return true
+      end
+    end
+    local Space = package.loaded["src.core.game3.scripting.space"] or package.loaded["src.core.game3.space"]
+    if Space and Space.store and Flags.getFlag(Space.store, nil, cf) == true then
+      return true
+    end
+    local Runtime = package.loaded["src.core.game3.runtime"]
+    local s = Runtime and Runtime.getSession and Runtime.getSession()
+    if s and (s.store or s.flags) then
+      local st = s.store or s
+      if Flags.getFlag(st, nil, cf) == true or (s.flags and (s.flags[cf] == true or s.flags[cfKey] == true)) then
+        return true
+      end
+    end
+  end
+  return false
+end
+
 -- pokefirered/src/bike.c:215 GetBikeCollision
 local function bikeCanMove(game, dir)
   local d = DELTA[dir]
   if not d then return false end
-  return Collision.canEnter(game, Player.cellX + d[1], Player.cellY + d[2], {
+  local x, y = Player.cellX + d[1], Player.cellY + d[2]
+  local RG = package.loaded["src.core.game3.rotating_gate"]
+  -- pokeemerald/src/field_player_avatar.c:722
+  if RG and RG.active() and RG.checkCollision(dir, x, y, true) then return false end
+  return Collision.canEnter(game, x, y, {
     fromX = Player.cellX, fromY = Player.cellY, dir = dir, surfing = Player.surfing,
     elevation = Player.currentElevation,
   }) == true
@@ -586,10 +761,10 @@ function Player.forcedStep(dir, frames, opts)
     beginStep(opts.ledgeX, opts.ledgeY, false, true)
   else
     local tx, ty = Player.cellX + d[1], Player.cellY + d[2]
-    Player.dismounting = Player.surfing
-      and (not (Collision.isWater and Collision.isWater(tx, ty))) or false
+    Player.dismounting = Player.surfing and not Player.underwater
+      and Collision.isSurfDismount(tx, ty, Player.currentElevation) or false
     -- pokefirered/src/field_player_avatar.c:1609
-    if Player.dismounting then require("src.core.game3.audio").stopSurfMusic() end
+    if Player.dismounting then lazyReq("src.core.game3.audio").stopSurfMusic() end
     beginStep(tx, ty, false, false)
   end
   if frames and not opts.ledgeX and not Player.dismounting then
@@ -600,14 +775,33 @@ function Player.forcedStep(dir, frames, opts)
 end
 
 --- Forced script step (applymovement localId 0xFF) — skips collision.
-function Player.scriptStep(dir, run, slow)
+function Player.scriptStep(dir, run, slow, fast)
   if Player.moving then return false end
   local d = DELTA[dir or Player.facing]
   if not d then return false end
   Player.facing = dir or Player.facing
-  beginStep(Player.cellX + d[1], Player.cellY + d[2], run and true or false, false)
+  local tx, ty = Player.cellX + d[1], Player.cellY + d[2]
+  local Collision = package.loaded["src.core.game3.collision"]
+  if Collision and Collision._grid and Collision._grid[1] ~= nil and not Collision.inBounds(tx, ty) then
+    local session = package.loaded["src.core.game3.runtime"]
+    session = session and session.getSession and session.getSession()
+    local mapBlock = session and lazyReq("src.core.game3.profile").forSession(session).map
+    if mapBlock and mapBlock.scriptConnections then
+      -- pokeemerald/src/fieldmap.c:603
+      local lx, ly = Collision.scriptConnection(nil, Player.cellX, Player.cellY, Player.facing)
+      if lx then tx, ty = lx, ly end
+    end
+  end
+  beginStep(tx, ty, run and true or false, false)
+  Player._scriptedStep = true
+  -- pokeemerald/src/event_object_movement.c:5101
+  if Player.biking and not (Player.surfHopping or Player.dismounting) then
+    Player.stepFrames = run and RUN_FRAMES or WALK_FRAMES
+    Player.running = run and true or false
+  end
   -- pokefirered/src/event_object_movement.c:9029 UpdateRunSlowAnim
   if run and slow then Player.stepFrames = RUN_SLOW_FRAMES end
+  if fast then Player.stepFrames = RUN_FRAMES end
   return true
 end
 
@@ -619,16 +813,91 @@ function Player.scriptJump(dir, distance)
   if not d then return false end
   Player.facing = dir or Player.facing
   pcall(function()
-    local Audio = require("src.core.game3.audio")
-    local SE = require("src.core.game3.se_ids")
+    local Audio = lazyReq("src.core.game3.audio")
+    local SE = lazyReq("src.core.game3.se_ids")
     if Audio.playSe and SE.SE_LEDGE then Audio.playSe(SE.SE_LEDGE) end
   end)
   beginStep(Player.cellX + d[1] * distance, Player.cellY + d[2] * distance, false, true)
+  Player._scriptedStep = true
   return true
 end
 
 function Player.scriptFace(dir)
   if DELTA[dir] then Player.facing = dir end
+end
+
+-- pokeemerald/src/field_player_avatar.c:966 PlayerSetAnimId
+function Player.bikeStep(tx, ty, dir, frames, opts)
+  if Player.moving then return false end
+  opts = opts or {}
+  local face = Player.facing
+  beginStep(tx, ty, false, opts.jump ~= nil)
+  Player.facing = Player.facingLocked and face or dir
+  Player.moveDir = dir
+  Player.stepFrames = frames
+  Player.running = false
+  Player.jumping = opts.jump ~= nil
+  Player.jumpType = opts.jump
+  Player.acroAnim = opts.acroAnim
+  return true
+end
+
+-- pokeemerald/src/event_object_movement.c:5704 InitMoveInPlace
+function Player.startAction(opts)
+  Player.action = {
+    frames = opts.frames or 1,
+    t = 0,
+    jump = opts.jump,
+    turnTo = opts.turnTo,
+    walk = opts.walk,
+    done = opts.done,
+  }
+  Player.acroAnim = opts.acroAnim
+  if opts.walk then
+    Player.walkInPlace = true
+    Player.walkInPlaceFast = opts.walk == "fast"
+    Player.animClock = 0
+  end
+  return true
+end
+
+local function tickAction()
+  local a = Player.action
+  a.t = a.t + 1
+  if a.jump then
+    local t = JUMP_Y[a.jump] or JUMP_Y_HIGH
+    Player.spriteYOffset = t[a.t] or 0
+    -- pokeemerald/src/event_object_movement.c:5517
+    if a.turnTo and a.t == 8 then Player.facing = a.turnTo end
+  end
+  if a.t >= a.frames then
+    Player.action = nil
+    Player.spriteYOffset = 0
+    if a.walk then
+      Player.walkInPlace = false
+      Player.walkInPlaceFast = false
+    end
+    if a.done then a.done() end
+  end
+  return false
+end
+
+-- pokeemerald/src/data/object_events/object_event_anims.h:416
+local ACRO_FRAMES = {
+  back = { down = { 9, 10 }, up = { 13, 14 }, left = { 17, 18 }, right = { 17, 18 } },
+  standBack = { down = { 9, 0 }, up = { 13, 1 }, left = { 17, 2 }, right = { 17, 2 } },
+  pedal = { down = { 21, 10, 22, 10 }, up = { 23, 14, 24, 14 }, left = { 25, 18, 26, 18 }, right = { 25, 18, 26, 18 } },
+}
+
+function Player.acroFrame()
+  local a = Player.acroAnim
+  if not (a and Player.biking) then return nil end
+  local seq = ACRO_FRAMES[a.kind] and ACRO_FRAMES[a.kind][Player.facing]
+  if not seq then return nil end
+  if a.paused then return seq[1] end
+  local i = math.floor((a.clock or 0) / 4)
+  if a.kind == "pedal" then i = i % #seq else i = math.min(i, #seq - 1) end
+  return seq[i + 1]
 end
 
 --- Parabolic hop into water when initiating Surf.
@@ -639,8 +908,8 @@ function Player.startSurfing(game, onDone)
   Player.surfing = false
   Player.dismounting = false
   pcall(function()
-    local Audio = require("src.core.game3.audio")
-    local SE = require("src.core.game3.se_ids")
+    local Audio = lazyReq("src.core.game3.audio")
+    local SE = lazyReq("src.core.game3.se_ids")
     if Audio.playSe and SE.SE_LEDGE then Audio.playSe(SE.SE_LEDGE) end
   end)
   if not Player.forceStep(Player.facing, onDone) then
@@ -668,28 +937,35 @@ local function finishStep(game)
   Player.stepFlip = not Player.stepFlip
   Player.running = false
   Player.jumping = false
+  Player.jumpType = nil
   Player.spriteYOffset = 0
   Player.updateElevation(Player.cellX, Player.cellY)
   Player.syncSavePosition(game)
 
   -- Surf landing / dismount state transitions
+  local wasSurfing = Player.surfing or Player.dismounting
   if Player.surfHopping then
     Player.surfHopping = false
     Player.surfing = true
   elseif Player.dismounting then
     Player.dismounting = false
     Player.surfing = false
-  elseif Player.surfing then
-    local onWater = Collision.isWater and Collision.isWater(Player.cellX, Player.cellY)
-    if not onWater then
-      Player.surfing = false
-    end
   end
 
   local session = package.loaded["src.core.game3.runtime"]
   session = session and session.getSession and session.getSession()
   if session then
     session.x, session.y, session.facing = Player.cellX, Player.cellY, Player.facing
+  end
+
+  if wasSurfing and not Player.surfing and not Player.surfHopping then
+    if Player.isOnCyclingRoad(session, Player.cellX, Player.cellY) then
+      Player.biking = true
+      pcall(function()
+        local Audio = lazyReq("src.core.game3.audio")
+        Audio.bikeMusic(true, true)
+      end)
+    end
   end
 
   if ModRuntime.wants("world.stepped") then
@@ -708,20 +984,27 @@ local function finishStep(game)
     onDoneCb()
     return
   end
+  local scripted = Player._scriptedStep
+  Player._scriptedStep = nil
+  if scripted then
+    local mapBlock = session and lazyReq("src.core.game3.profile").forSession(session).map
+    -- pokeemerald/src/field_control_avatar.c:159
+    if mapBlock and mapBlock.scriptStepEvents == false then return end
+  end
 
   local ForcedMovement = package.loaded["src.core.game3.forced_movement"]
-    or require("src.core.game3.forced_movement")
+    or lazyReq("src.core.game3.forced_movement")
   -- pokefirered/src/field_control_avatar.c:136
   local onForcedTile =
     ForcedMovement.isForcedMovementTile(Collision.behavior(Player.cellX, Player.cellY))
 
   local Field = package.loaded["src.core.game3.field"]
-    or require("src.core.game3.field")
+    or lazyReq("src.core.game3.field")
 
   if not onForcedTile then
     -- Evaluate Overworld Step Events (Happiness, VS Seeker, Poison, Egg/Daycare, Repel)
     local StepEvents = package.loaded["src.core.game3.step_events"]
-      or require("src.core.game3.step_events")
+      or lazyReq("src.core.game3.step_events")
     if StepEvents and StepEvents.onStepTaken then
       StepEvents.onStepTaken(session, game)
     end
@@ -737,7 +1020,7 @@ local function finishStep(game)
 
   -- pokefirered/src/field_control_avatar.c:209
   if not Field.locked then
-    local okTs, TrainerSight = pcall(require, "src.core.game3.trainer_sight")
+    local okTs, TrainerSight = pcall(lazyReq, "src.core.game3.trainer_sight")
     if okTs and TrainerSight and TrainerSight.check then
       TrainerSight.check(game)
     end
@@ -751,7 +1034,7 @@ local function finishStep(game)
   -- pokefirered/src/wild_encounter.c:757
   local onGrass = Collision.isGrass and Collision.isGrass(Player.cellX, Player.cellY)
   local onWater = Player.surfing and (Collision.isWater and Collision.isWater(Player.cellX, Player.cellY))
-  local okE, Encounters = pcall(require, "src.core.game3.encounters")
+  local okE, Encounters = pcall(lazyReq, "src.core.game3.encounters")
   if okE and Encounters and Encounters.onStep and not onForcedTile then
     local Battle = package.loaded["src.core.game3.battle"]
     local busy = (Battle and Battle.isActive and Battle.isActive()) or Field.locked
@@ -768,7 +1051,7 @@ local function finishStep(game)
       local enc = Encounters.onStep(mapId, nil, { x = Player.cellX, y = Player.cellY })
       if enc then
         local Runtime = package.loaded["src.core.game3.runtime"]
-        local BattleBridge = require("src.core.game3.battle_bridge")
+        local BattleBridge = lazyReq("src.core.game3.battle_bridge")
         local mod = Runtime and Runtime._mod
         local g = game or (Runtime and Runtime._game)
         local okB, errB = BattleBridge.startWild(mod, g, enc, {})
@@ -782,7 +1065,7 @@ local function finishStep(game)
     Encounters.noteGrass(onGrass or onWater)
   end
   if onGrass then
-    local okFx, FieldEffects = pcall(require, "src.core.game3.field_effects")
+    local okFx, FieldEffects = pcall(lazyReq, "src.core.game3.field_effects")
     if okFx and FieldEffects and FieldEffects.tallGrassAt then
       FieldEffects.tallGrassAt(Player.cellX, Player.cellY, true)
     end
@@ -790,6 +1073,7 @@ local function finishStep(game)
 end
 
 function Player.tick(game)
+  if Player.acroAnim then Player.acroAnim.clock = (Player.acroAnim.clock or 0) + 1 end
   if Player.moving then
     Player.updateElevation(Player.targetX, Player.targetY, Player.cellX, Player.cellY)
   else
@@ -809,8 +1093,9 @@ function Player.tick(game)
         Player.stepFlip = not Player.stepFlip
       end
     end
+    if Player.action then return tickAction() end
     if Player.surfing and not Player.jumping then
-      local okFx, FieldEffects = pcall(require, "src.core.game3.field_effects")
+      local okFx, FieldEffects = pcall(lazyReq, "src.core.game3.field_effects")
       local clock = (okFx and FieldEffects and FieldEffects._surfClock) or 0
       Player.spriteYOffset = (math.floor(clock / 48) % 2 == 1) and -1 or 0
     elseif not Player.walkInPlace and not warp_owns_sprite() then
@@ -854,14 +1139,54 @@ function Player.canDash()
     -- Field not scripted yet — deny dash (shoes not granted).
     return false
   end
-  local Flags = require("src.core.game3.scripting.flags")
-  return Flags.getFlag(store, nil, Flags.IDS.SYS_B_DASH) == true
+  local Flags = lazyReq("src.core.game3.scripting.flags")
+  local rules = fieldBlock().running
+  if not rules then
+    return Flags.getFlag(store, nil, Flags.IDS.SYS_B_DASH) == true
+  end
+  if Flags.getFlag(store, nil, sessionFlags().IDS[rules.flag]) ~= true then return false end
+  if Player.underwater then return false end
+  return not Player.runningDisallowed(Player.cellX, Player.cellY)
+end
+
+-- pokeemerald/src/bike.c:1056
+function Player.runningDisallowed(cx, cy)
+  local rules = fieldBlock().running
+  if not rules then return false end
+  if rules.mapHeader then
+    local def = Collision._mapDef
+    if def and tonumber(def.allowRunning) == 0 then return true end
+  end
+  local beh = Collision.behavior and Collision.behavior(cx, cy)
+  if beh == nil then return false end
+  local MB = lazyReq("src.core.game3.mb")
+  for _, name in ipairs(rules.behaviors or {}) do
+    if beh == MB.id(name) then return true end
+  end
+  -- pokeemerald/src/bike.c:905
+  for _, name in ipairs(rules.evenElevation or {}) do
+    if beh == MB.id(name) and (tonumber(Player.currentElevation) or 0) % 2 == 0 then return true end
+  end
+  return false
 end
 
 --- Poll D-pad + B-run when field is free.
 function Player.update(game, input)
   Player.tick(game)
+  -- pokeemerald/src/field_player_avatar.c:336
+  if not Player._scriptedStep then WarpArrow.update(Player) end
+  if Player.biking and Player.bikeType == "acro" then
+    local BikeRse = rseBike()
+    -- pokeemerald/src/field_player_avatar.c:339
+    if BikeRse then BikeRse.historyUpdate(input) end
+  end
   if Player.moving then return end
+  if Player.action then return end
+  if Player.biking then
+    local BikeRse = rseBike()
+    -- pokeemerald/src/field_player_avatar.c:393 MovePlayerAvatarUsingKeypadInput
+    if BikeRse then return BikeRse.update(game, input) end
+  end
   local push = Player.boulderPush
   if push then
     if Player.walkInPlace and Player.animClock >= WALK_FRAMES then
@@ -870,7 +1195,7 @@ function Player.update(game, input)
     -- pokefirered/src/field_player_avatar.c:1445 DoBoulderFinish
     if Player.walkInPlace or push.obj.moving then return end
     Player.boulderPush = nil
-    local Field = require("src.core.game3.field")
+    local Field = lazyReq("src.core.game3.field")
     Field.onBoulderMoved(game, push.obj, push.obj.cellX, push.obj.cellY)
     return
   end
@@ -892,7 +1217,7 @@ function Player.update(game, input)
   end
 
   -- Menu Dismissal Frame Trap & Idle Sight Check: check sight before D-pad input polling
-  local okTs, TrainerSight = pcall(require, "src.core.game3.trainer_sight")
+  local okTs, TrainerSight = pcall(lazyReq, "src.core.game3.trainer_sight")
   if okTs and TrainerSight and TrainerSight.check then
     if TrainerSight.check(game) then
       return

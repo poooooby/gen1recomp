@@ -674,6 +674,11 @@ local function setup(s, vm, tmplName)
   s.affineAnimPaused = false
   s._mat = nil
   local tag = T.tag or s.tag
+  local opTag = s._op and s._op.tag
+  if type(T.tag) == "string" and opTag and vm and vm._pack and vm._pack.tags and not vm._pack.tags[T.tag]
+      and vm._pack.tags[opTag] then
+    tag = opTag
+  end
   if tag and vm then
     local img, frames = P.sheet(vm, tag, w, h)
     if img then s.image = img end
@@ -784,6 +789,7 @@ function P.CreateSprite(vm, tmplName, x, y, sub, fn, opts)
   s._op = nil
   s._vm = vm
   s._baseW, s._baseH = T.w or 32, T.h or 32
+  if opts.counted then s._g4counted = true end
   setup(s, vm, tmplName)
   s.x, s.y = x, y
   s.sub = sub or 2
@@ -1410,13 +1416,22 @@ local function overlayResources()
   return overlayRes
 end
 
+-- One quad re-pointed per draw (draw reads the viewport immediately).
+local windowSpriteQuad = nil
+
 local function drawWindowSprite(sp)
   local img = sp.image
   if not img or sp.invisible or not sp.active then return end
   local bw = sp._baseW or sp.w or 32
   local bh = sp._baseH or sp.h or 32
   local iw, ih = img:getDimensions()
-  local q = love.graphics.newQuad(sp.quadX or 0, sp.quadY or 0, bw, bh, iw, ih)
+  local q = windowSpriteQuad
+  if q then
+    q:setViewport(sp.quadX or 0, sp.quadY or 0, bw, bh, iw, ih)
+  else
+    q = love.graphics.newQuad(sp.quadX or 0, sp.quadY or 0, bw, bh, iw, ih)
+    windowSpriteQuad = q
+  end
   local sx = (sp.scaleX or 1) * (sp.hFlip and -1 or 1)
   local sy = (sp.scaleY or 1) * (sp.vFlip and -1 or 1)
   love.graphics.draw(img, q, math.floor(sp.x + (sp.ox or 0) + 0.5), math.floor(sp.y + (sp.oy or 0) + 0.5),

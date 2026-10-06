@@ -79,6 +79,7 @@ function Protocol.packMon(mon)
     exp = mon.exp,
     hp = mon.hp,
     status = mon.status,
+    sleepTurns = mon.status == "SLP" and mon.sleepTurns or nil,
     nickname = mon.nickname,
     dvs = mon.dvs,
     statExp = mon.statExp,
@@ -158,7 +159,9 @@ function Protocol.unpackMon(data, packed, opts)
   local forced = forceLevel
   local hp = forced and stats.hp
     or math.max(0, math.min(stats.hp, math.floor(num(packed.hp, stats.hp))))
-  local status = forced and nil or text(packed.status)
+  local status = not forced and text(packed.status) or nil
+  local sleepTurns = status == "SLP"
+    and math.max(1, math.min(7, math.floor(num(packed.sleepTurns, 1)))) or nil
   -- preserve the sender's original-trainer identity (party_struct MON_OTID +
   -- wPartyMonOT on a real cable), clamped/typed like every other field so a
   -- tampered packet can't inject a bad ID or a huge name.  Left nil when the
@@ -179,6 +182,7 @@ function Protocol.unpackMon(data, packed, opts)
     stats = stats,
     hp = hp,
     status = status,
+    sleepTurns = sleepTurns,
     nickname = text(packed.nickname),
     ot = ot,
     otId = otId,
@@ -341,7 +345,7 @@ function Protocol.unpackMon2(data, packed, opts)
   local forced = forceLevel
   local hp = forced and stats.hp
     or math.max(0, math.min(stats.hp, math.floor(num(packed.hp, stats.hp))))
-  local status = forced and nil or text(packed.status)
+  local status = not forced and text(packed.status) or nil
   local packedOtId = num(packed.otId)
   local otId = packedOtId
     and math.max(0, math.min(65535, math.floor(packedOtId))) or nil
@@ -587,6 +591,22 @@ function Protocol.packMon3(mon)
     evs[key] = clampInt(srcEvs[key], 0, 255, 0)
   end
   local egg = Pokemon.isEgg(mon) == true
+  -- pokeruby/include/pokemon.h:69
+  local contest = {}
+  for _, key in ipairs({ "cool", "beauty", "cute", "smart", "tough", "sheen" }) do
+    contest[key] = clampInt(type(mon.contest) == "table" and mon.contest[key], 0, 255, 0)
+  end
+  local ribbonWord = require("src.core.game3.rse.ribbons").word(mon)
+  if mon.modernFatefulEncounter ~= nil then
+    local has = math.floor(ribbonWord / 2147483648) % 2 == 1
+    if mon.modernFatefulEncounter and not has then ribbonWord = ribbonWord + 2147483648 end
+    if not mon.modernFatefulEncounter and has then ribbonWord = ribbonWord - 2147483648 end
+  end
+  local abilityNum = mon.abilityNum
+  if abilityNum == nil then abilityNum = pair[2] ~= 0 and ability == pair[2] and 1 or 0 end
+  local otFull = clampInt(mon.otId, 0, U32 - 1, 0)
+  local otSecret = mon.otSecretId
+  if otSecret == nil then otSecret = math.floor(otFull / 65536) end
   local friendship = mon.friendship
   if friendship == nil then friendship = mon.happiness end
   if friendship == nil then friendship = Pokemon.baseFriendship(species) end
@@ -598,12 +618,15 @@ function Protocol.packMon3(mon)
     hp = clampInt(mon.hp, 0, 65535, 0),
     status = statusOf3(mon),
     personality = personality,
-    otId = clampInt(mon.otId, 0, U32 - 1, 0) % 65536,
-    otSecretId = clampInt(mon.otSecretId, 0, 65535, 0),
+    otId = otFull % 65536,
+    otSecretId = clampInt(otSecret, 0, 65535, 0),
     otName = clipName(mon.otName or mon.ot, OT_NAME_LENGTH),
     otGender = clampInt(mon.otGender, 0, 1, 0),
     nature = personality % 25,
     ability = clampInt(ability, 0, 255, 0),
+    abilityNum = clampInt(abilityNum, 0, 1, 0),
+    language = clampInt(mon.language, 0, 255, egg and 1 or 2),
+    contest = contest,
     gender = Pokemon.gender(species, personality),
     ivs = ivs,
     evs = evs,
@@ -615,10 +638,11 @@ function Protocol.packMon3(mon)
     metLevel = clampInt(mon.metLevel, 0, 100, 0),
     metGame = clampInt(mon.metGame, 0, 15, 0),
     pokeball = clampInt(mon.pokeball, 1, BALL_LAST, 4),
-    ribbons = clampInt(mon.ribbons, 0, U32 - 1, 0),
+    ribbons = ribbonWord,
     markings = clampInt(mon.markings, 0, 15, 0),
     isEgg = egg,
     fatefulEncounter = mon.fatefulEncounter == true,
+    modernFatefulEncounter = math.floor(ribbonWord / 2147483648) % 2 == 1,
     eggCycles = egg and clampInt(mon.eggCycles, 0, 255, 0) or 0,
   }
 end
@@ -837,6 +861,9 @@ function Protocol.unpackMon3(data, packed, opts)
     evs = evs,
     ability = ability,
     abilityId = ability,
+    abilityNum = field(packed.abilityNum, 0, 1, pair[2] ~= 0 and ability == pair[2] and 1 or 0),
+    language = field(packed.language, 0, 255, isEgg and 1 or 2),
+    contest = {},
     gender = gender,
     happiness = friendship,
     friendship = friendship,
@@ -856,7 +883,12 @@ function Protocol.unpackMon3(data, packed, opts)
     isEgg = isEgg,
     eggCycles = isEgg and field(packed.eggCycles, 0, 255, 0) or 0,
     fatefulEncounter = packed.fatefulEncounter == true,
+    modernFatefulEncounter = packed.modernFatefulEncounter == true
+      or math.floor((tonumber(packed.ribbons) or 0) / 2147483648) % 2 == 1,
   }
+  for _, key in ipairs({ "cool", "beauty", "cute", "smart", "tough", "sheen" }) do
+    mon.contest[key] = field(type(packed.contest) == "table" and packed.contest[key], 0, 255, 0)
+  end
   Pokemon.applyStats(mon)
   require("src.core.game3.save_mon").normalize(mon)
   return mon

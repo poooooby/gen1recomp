@@ -3,6 +3,8 @@ local CachePaths = require("src.core.game3.cache_paths")
 local PokemonExtract = require("src.import.gba.pokemon_extract")
 local Versions = require("src.import.gba.versions")
 local ModRuntime = require("src.mods.Runtime")
+local CacheBlob = require("src.import.CacheBlob")
+local Strings = require("src.core.Strings")
 
 local Pokemon = {}
 
@@ -56,7 +58,7 @@ local function resolve_cache(cache)
       end
       local f = io.open(rel, "rb") or io.open("data/generated/gba/" .. rel, "rb")
       if f then
-        local data = f:read("*a")
+        local data = CacheBlob.decode(rel, f:read("*a"))
         f:close()
         return data
       end
@@ -330,7 +332,7 @@ function Pokemon.abilityName(abilityId)
   if not abilityId or abilityId < 1 then return "-------" end
   if not Pokemon._abilityNames then Pokemon.install(Pokemon._cache) end
   local n = Pokemon._abilityNames and Pokemon._abilityNames[abilityId]
-  if n and n ~= "" then return n end
+  if n and n ~= "" then return Strings(n) end
   error("no ROM ability name for ability " .. abilityId, 2)
 end
 
@@ -467,8 +469,9 @@ function Pokemon.calcStats(species, level, ivs, evs, personality)
 end
 
 --- Fill battle/display stats on an opaque mon (mutates and returns mon).
-function Pokemon.applyStats(mon)
+function Pokemon.applyStats(mon, session)
   if type(mon) ~= "table" then return mon end
+  local oldMaxHp = tonumber(mon.maxHp or mon.maxhp) or 0
   local species = tonumber(mon.species or mon.speciesId) or 1
   local level = tonumber(mon.level) or 5
   local ivs = mon.ivs or {}
@@ -476,6 +479,8 @@ function Pokemon.applyStats(mon)
   local personality = mon.personality or 0
   local st = Pokemon.calcStats(species, level, ivs, evs, personality)
   mon.maxHp = st.maxHp
+  local Enigma = require("src.core.game3.rs.enigma")
+  if Enigma.matches(session) then Enigma.recordStatCalculation(oldMaxHp, st.maxHp) end
   if mon.hp == nil or mon.hp < 0 or mon.hp > st.maxHp then
     mon.hp = st.maxHp
   end
@@ -649,10 +654,99 @@ function Pokemon.checkPartyHasHadPokerus(party, selection)
   return retVal
 end
 
--- pokefirered/src/pokemon.c:5612, :5676, :5682 (all stubbed in FRLG)
-function Pokemon.randomlyGivePartyPokerus(_) end
-function Pokemon.updatePartyPokerusTime(_) end
-function Pokemon.partySpreadPokerus(_) end
+local function pokerus_live(session)
+  local Profile = require("src.core.game3.profile")
+  return require(Profile.forSession(session).saveRules).POKERUS == true
+end
+
+local function has_species(mon)
+  return type(mon) == "table" and (tonumber(mon.species or mon.speciesId) or 0) ~= 0
+end
+
+-- pokeemerald/src/pokemon.c:6078
+function Pokemon.randomlyGivePartyPokerus(party, session)
+  if type(party) ~= "table" or not pokerus_live(session) then return end
+  local bit = require("bit")
+  local Rng = require("src.core.game3.rng")
+  local rnd = Rng.Random()
+  if rnd ~= 0x4000 and rnd ~= 0x8000 and rnd ~= 0xC000 then return end
+  local any = false
+  for i = 1, 6 do
+    if has_species(party[i]) and not Pokemon.isEgg(party[i]) then any = true end
+  end
+  if not any then return end
+  local idx
+  repeat
+    idx = Rng.Random() % 6
+  until has_species(party[idx + 1]) and not Pokemon.isEgg(party[idx + 1])
+  if Pokemon.checkPartyHasHadPokerus(party, bit.lshift(1, idx)) ~= 0 then return end
+  local r
+  repeat
+    r = Rng.Random() % 256
+  until bit.band(r, 7) ~= 0
+  if bit.band(r, 0xF0) ~= 0 then r = bit.band(r, 7) end
+  r = bit.band(bit.bor(r, bit.lshift(r, 4)), 0xFF)
+  r = bit.band(r, 0xF3)
+  party[idx + 1].pokerus = (r + 1) % 256
+end
+
+-- pokeemerald/src/pokemon.c:6170
+function Pokemon.updatePartyPokerusTime(days, session)
+  if not pokerus_live(session) then return end
+  local bit = require("bit")
+  days = tonumber(days) or 0
+  local party = type(session) == "table" and session.party or {}
+  for i = 1, 6 do
+    local mon = party[i]
+    if has_species(mon) then
+      local p = tonumber(mon.pokerus) or 0
+      if bit.band(p, 0xF) ~= 0 then
+        if bit.band(p, 0xF) < days or days > 4 then
+          p = bit.band(p, 0xF0)
+        else
+          p = p - days
+        end
+        if p == 0 then p = 0x10 end
+        mon.pokerus = p
+      end
+    end
+  end
+end
+
+-- pokeemerald/src/pokemon.c:6194
+function Pokemon.partySpreadPokerus(party, session)
+  if type(party) ~= "table" or not pokerus_live(session) then return end
+  local bit = require("bit")
+  local Rng = require("src.core.game3.rng")
+  if Rng.Random() % 3 ~= 0 then return end
+  local i = 0
+  while i < 6 do
+    local mon = party[i + 1]
+    if has_species(mon) then
+      local cur = tonumber(mon.pokerus) or 0
+      if cur ~= 0 and bit.band(cur, 0xF) ~= 0 then
+        local prev = party[i]
+        if i ~= 0 and type(prev) == "table" and bit.band(tonumber(prev.pokerus) or 0, 0xF0) == 0 then
+          prev.pokerus = cur
+        end
+        local nxt = party[i + 2]
+        if i ~= 5 and type(nxt) == "table" and bit.band(tonumber(nxt.pokerus) or 0, 0xF0) == 0 then
+          nxt.pokerus = cur
+          i = i + 1
+        end
+      end
+    end
+    i = i + 1
+  end
+end
+
+function Pokemon.regional(species, version)
+  return require("src.core.game3.dex").regionalNumber(species, version)
+end
+
+function Pokemon.regionalCount(version)
+  return require("src.core.game3.dex").regionalMax(version)
+end
 
 -- pokefirered/src/pokemon.c:5512 MonGainEVs
 function Pokemon.gainEVs(mon, defeatedSpecies)
@@ -894,7 +988,11 @@ function Pokemon.moveName(moveId)
   if not Pokemon._moveNames then Pokemon.install(Pokemon._cache) end
   local n = Pokemon._moveNames and Pokemon._moveNames[num]
   if n and n ~= "" then return n end
-  error("no ROM move name for move " .. num, 2)
+  local okB, BuiltinMoves = pcall(require, "src.core.game3.battle.builtin_moves")
+  if okB and BuiltinMoves and BuiltinMoves[num] and BuiltinMoves[num].name then
+    return BuiltinMoves[num].name
+  end
+  return "MOVE " .. tostring(num)
 end
 
 function Pokemon.learnset(species)
@@ -943,7 +1041,14 @@ function Pokemon.battleMove(moveId)
   moveId = tonumber(moveId)
   if not moveId then return nil end
   if not Pokemon._battleMoves then Pokemon.install(Pokemon._cache) end
-  return Pokemon._battleMoves and Pokemon._battleMoves[moveId]
+  if Pokemon._battleMoves and Pokemon._battleMoves[moveId] then
+    return Pokemon._battleMoves[moveId]
+  end
+  local okB, BuiltinMoves = pcall(require, "src.core.game3.battle.builtin_moves")
+  if okB and BuiltinMoves and BuiltinMoves[moveId] then
+    return BuiltinMoves[moveId]
+  end
+  return nil
 end
 
 function Pokemon.movePp(moveId)
@@ -1211,6 +1316,12 @@ function Pokemon.swapMoves(mon, slotA, slotB)
     mon.pp[slotB] = ppA
   end
 
+  if type(mon.maxPp) == "table" then
+    local maxA = mon.maxPp[slotA]
+    mon.maxPp[slotA] = mon.maxPp[slotB]
+    mon.maxPp[slotB] = maxA
+  end
+
   -- 4. If parallel array mon.ppBonuses / mon.ppBonus / mon.ppUp exists
   if type(mon.ppBonuses) == "table" then
     local bA = mon.ppBonuses[slotA]
@@ -1402,11 +1513,21 @@ local function pic(store, kind, species, form, shiny)
   if shiny and species ~= Pokemon.SPECIES_EGG then kind = kind .. "_shiny" end
   local key = form > 0 and (species .. "_" .. form) or species
   if kind:find("_shiny", 1, true) then key = "shiny:" .. key end
-  if store[key] then return store[key] end
-  return pic_entry(store, key, read_pic(pic_rel(kind, species, form)))
+  local hit = store[key]
+  if hit then return hit end
+  -- false marks a pic file known to be missing, so draw loops that probe
+  -- backPic then frontPic every frame do not re-read the filesystem.
+  if hit == false then return nil end
+  local rgba = read_pic(pic_rel(kind, species, form))
+  if not rgba then
+    store[key] = false
+    return nil
+  end
+  return pic_entry(store, key, rgba)
 end
 
-local SPECIES_SPINDA = 308
+Pokemon.SPECIES_SPINDA = 308
+local SPECIES_SPINDA = Pokemon.SPECIES_SPINDA
 local SPINDA_ROOT = "/pokemon/spinda/"
 
 local function spinda_file(name)

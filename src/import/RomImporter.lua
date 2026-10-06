@@ -6,6 +6,7 @@ local HostShell = require("src.core.HostShell")
 local HostPicker = require("src.core.HostPicker")
 local Platform = require("src.core.Platform")
 local SafeArea = require("src.core.SafeArea")
+local SecretGames = require("src.import.SecretGames")
 
 local RomImporter = {}
 RomImporter.__index = RomImporter
@@ -131,10 +132,27 @@ local PAL = {
 -- their real save-directory path and directories through the write
 -- directory only, so this never deletes the game folder (portable installs
 -- read the cache from there) or a developer's checked-out source tree.
+local chmodFn = nil
+
+local function makeWritable(real, mode)
+  if chmodFn == nil then
+    chmodFn = false
+    local okFfi, ffi = pcall(require, "ffi")
+    if okFfi and ffi.os ~= "Windows" then
+      pcall(ffi.cdef, "int chmod(const char *path, unsigned int mode);")
+      if pcall(function() return ffi.C.chmod end) then
+        chmodFn = function(p, m) pcall(ffi.C.chmod, p, m) end
+      end
+    end
+  end
+  if chmodFn then chmodFn(real, mode) end
+end
+
 local function removeTree(path)
   local info = love.filesystem.getInfo(path)
   if not info then return end
   if info.type == "directory" then
+    makeWritable(love.filesystem.getSaveDirectory() .. "/" .. path, 493)
     for _, child in ipairs(love.filesystem.getDirectoryItems(path)) do
       removeTree(path .. "/" .. child)
     end
@@ -146,6 +164,10 @@ local function removeTree(path)
   if not f then return end
   f:close()
   local ok, err = os.remove(real)
+  if not ok then
+    makeWritable(real, 420)
+    ok, err = os.remove(real)
+  end
   if not ok then
     error("could not remove stale cache: " .. tostring(err))
   end
@@ -204,11 +226,12 @@ function RomImporter.syncAndroidShortcuts(activeVersion)
     return false
   end
 
-  local allVersions = GameVersion.ORDER
+  local allVersions = SecretGames.order()
   local ready = {}
   local seen = {}
 
-  if activeVersion and RomImporter.isReady(activeVersion) then
+  if activeVersion and SecretGames.visible(activeVersion)
+      and RomImporter.isReady(activeVersion) then
     table.insert(ready, activeVersion)
     seen[activeVersion] = true
   end
@@ -446,6 +469,10 @@ local function commandOutput(command)
   return result ~= "" and result or nil
 end
 
+local function pfs()
+  return require("src.core.SaveData").persistenceFs(love.filesystem)
+end
+
 local IMPORTS_DIR = "imports"
 local BASE_ROMS_DIR = "baseroms"
 local MODS_INBOX_DIR = "imports/mods"
@@ -467,9 +494,9 @@ local function isRomFilename(name)
   return type(name) == "string" and name:lower():match("%.gb[ac]?$") ~= nil
 end
 
-local function cartLabels(generation)
+local function cartLabels(generation, imp)
   local out = {}
-  for _, id in ipairs(GameVersion.ORDER) do
+  for _, id in ipairs(SecretGames.order(imp or {})) do
     if generation == nil or GameVersion.generation(id) == generation then
       out[#out + 1] = GameVersion.info(id).label
     end
@@ -477,12 +504,12 @@ local function cartLabels(generation)
   return out
 end
 
-local function cartsSlashed(generation)
-  return table.concat(cartLabels(generation), "/")
+local function cartsSlashed(generation, imp)
+  return table.concat(cartLabels(generation, imp), "/")
 end
 
-local function cartsProse()
-  local names = cartLabels(nil)
+local function cartsProse(imp)
+  local names = cartLabels(nil, imp)
   local last = table.remove(names)
   if #names == 0 then return last end
   return table.concat(names, ", ") .. ", or " .. last
@@ -508,11 +535,12 @@ function RomImporter.mtpHintPath(saveDir)
 end
 
 function RomImporter:ensureImportsDir()
-  local info = love.filesystem.getInfo(IMPORTS_DIR)
+  local fs = pfs()
+  local info = fs.getInfo(IMPORTS_DIR)
   if info and info.type == "directory" then return true end
   if info then return false end
-  if love.filesystem.createDirectory then
-    return love.filesystem.createDirectory(IMPORTS_DIR)
+  if fs.createDirectory then
+    return fs.createDirectory(IMPORTS_DIR)
   end
   return false
 end
@@ -521,22 +549,24 @@ end
 -- love.filesystem.createDirectory does not create nested parents.
 function RomImporter:ensureCartsInboxDir()
   self:ensureImportsDir()
-  local info = love.filesystem.getInfo(CARTS_INBOX_DIR)
+  local fs = pfs()
+  local info = fs.getInfo(CARTS_INBOX_DIR)
   if info and info.type == "directory" then return true end
   if info then return false end
-  if love.filesystem.createDirectory then
-    return love.filesystem.createDirectory(CARTS_INBOX_DIR)
+  if fs.createDirectory then
+    return fs.createDirectory(CARTS_INBOX_DIR)
   end
   return false
 end
 
 function RomImporter:ensureModsInboxDir()
   self:ensureImportsDir()
-  local info = love.filesystem.getInfo(MODS_INBOX_DIR)
+  local fs = pfs()
+  local info = fs.getInfo(MODS_INBOX_DIR)
   if info and info.type == "directory" then return true end
   if info then return false end
-  if love.filesystem.createDirectory then
-    return love.filesystem.createDirectory(MODS_INBOX_DIR)
+  if fs.createDirectory then
+    return fs.createDirectory(MODS_INBOX_DIR)
   end
   return false
 end
@@ -546,21 +576,22 @@ end
 -- Creates all three version folders so MTP browsing shows where each game goes.
 function RomImporter:ensureSavesInboxDir(version)
   self:ensureImportsDir()
-  local info = love.filesystem.getInfo(SAVES_INBOX_DIR)
+  local fs = pfs()
+  local info = fs.getInfo(SAVES_INBOX_DIR)
   if info and info.type ~= "directory" then return false end
   if not info then
-    if not (love.filesystem.createDirectory
-        and love.filesystem.createDirectory(SAVES_INBOX_DIR)) then
+    if not (fs.createDirectory
+        and fs.createDirectory(SAVES_INBOX_DIR)) then
       return false
     end
   end
-  for v in pairs(GameVersion.VERSIONS) do
+  for _, v in ipairs(SecretGames.order(self)) do
     local dir = savesInboxDir(v)
-    local vInfo = love.filesystem.getInfo(dir)
+    local vInfo = fs.getInfo(dir)
     if vInfo and vInfo.type ~= "directory" then return false end
     if not vInfo then
-      if not (love.filesystem.createDirectory
-          and love.filesystem.createDirectory(dir)) then
+      if not (fs.createDirectory
+          and fs.createDirectory(dir)) then
         return false
       end
     end
@@ -621,15 +652,27 @@ function RomImporter:_setNxSavesInboxNotice(version)
   }
 end
 
+local function listFs(dir)
+  if dir == "" or dir == "/" then return love.filesystem end
+  return pfs()
+end
+
+local function readListed(path)
+  local dir = path:match("^(.*)/[^/]+$") or ""
+  local data = listFs(dir).read(path)
+  return type(data) == "string" and data or nil
+end
+
 local function listRomPaths(dir)
   local paths = {}
-  for _, name in ipairs(love.filesystem.getDirectoryItems(dir) or {}) do
+  local fs = listFs(dir)
+  for _, name in ipairs(fs.getDirectoryItems(dir) or {}) do
     -- Skip AppleDouble / hidden junk from Mac MTP (._cart.gb ends in .gb
     -- but is not a ROM -- rescan would try it first and block the real dump).
     if name:sub(1, 1) ~= "." then
       local path = (dir == "" or dir == "/") and name or (dir .. "/" .. name)
       if isRomFilename(name)
-          and love.filesystem.getInfo(path, "file") then
+          and fs.getInfo(path, "file") then
         paths[#paths + 1] = path
       end
     end
@@ -638,7 +681,7 @@ local function listRomPaths(dir)
 end
 
 local function baseRomScanSatisfied(self)
-  for _, version in ipairs(GameVersion.ORDER) do
+  for _, version in ipairs(SecretGames.order(self)) do
     if not self.ready[version] and not self.baseRoms[version] then
       return false
     end
@@ -661,9 +704,9 @@ function RomImporter:_stepBaseRomScan()
     return
   end
   if scan.state == "queued" then
-    local info = love.filesystem.getInfo(BASE_ROMS_DIR)
-    if not info and love.filesystem.createDirectory then
-      love.filesystem.createDirectory(BASE_ROMS_DIR)
+    local info = pfs().getInfo(BASE_ROMS_DIR)
+    if not info and pfs().createDirectory then
+      pfs().createDirectory(BASE_ROMS_DIR)
     end
     scan.paths = listRomPaths(BASE_ROMS_DIR)
     table.sort(scan.paths)
@@ -677,11 +720,11 @@ function RomImporter:_stepBaseRomScan()
   end
   scan.index = scan.index + 1
 
-  local info = love.filesystem.getInfo(path, "file")
+  local info = pfs().getInfo(path, "file")
   if info and isAcceptedRomSize(info.size) then
-    local data = love.filesystem.read(path)
+    local data = pfs().read(path)
     if type(data) == "string" and isAcceptedRomSize(#data) then
-      local version = GameVersion.forSha1(sha1(data))
+      local version = self:_versionForSha1(sha1(data))
       if version and not self.ready[version] and not self.baseRoms[version] then
         self.baseRoms[version] = {
           path = path,
@@ -698,13 +741,14 @@ end
 
 local function listZipPaths(dir)
   local paths = {}
-  for _, name in ipairs(love.filesystem.getDirectoryItems(dir) or {}) do
+  local fs = listFs(dir)
+  for _, name in ipairs(fs.getDirectoryItems(dir) or {}) do
     -- Skip AppleDouble / hidden junk from Mac MTP (._foo.zip ends in .zip
     -- but is not a PhysFS archive -- mount fails with "could not be opened").
     if name:sub(1, 1) ~= "." then
       local path = (dir == "" or dir == "/") and name or (dir .. "/" .. name)
       if name:lower():match("%.zip$")
-          and love.filesystem.getInfo(path, "file") then
+          and fs.getInfo(path, "file") then
         paths[#paths + 1] = path
       end
     end
@@ -714,13 +758,14 @@ end
 
 local function listSavPaths(dir)
   local paths = {}
-  for _, name in ipairs(love.filesystem.getDirectoryItems(dir) or {}) do
+  local fs = listFs(dir)
+  for _, name in ipairs(fs.getDirectoryItems(dir) or {}) do
     -- Skip AppleDouble / hidden junk from Mac MTP (._foo.sav ends in .sav
     -- but is not a real battery save -- import would fail and invent noise).
     if name:sub(1, 1) ~= "." then
       local path = (dir == "" or dir == "/") and name or (dir .. "/" .. name)
       if name:lower():match("%.sav$")
-          and love.filesystem.getInfo(path, "file") then
+          and fs.getInfo(path, "file") then
         paths[#paths + 1] = path
       end
     end
@@ -748,11 +793,12 @@ end
 
 local function listCartPaths(dir)
   local paths = {}
-  for _, name in ipairs(love.filesystem.getDirectoryItems(dir) or {}) do
+  local fs = listFs(dir)
+  for _, name in ipairs(fs.getDirectoryItems(dir) or {}) do
     if name:sub(1, 1) ~= "." then
       local path = (dir == "" or dir == "/") and name or (dir .. "/" .. name)
       if name:lower():match("%.g1rcart$")
-          and love.filesystem.getInfo(path, "file") then
+          and fs.getInfo(path, "file") then
         paths[#paths + 1] = path
       end
     end
@@ -775,7 +821,7 @@ end
 
 local function loadImportedSavHashes(version)
   local set = {}
-  local raw = love.filesystem.read(savesImportedHashesPath(version))
+  local raw = pfs().read(savesImportedHashesPath(version))
   if type(raw) ~= "string" then return set end
   for line in raw:gmatch("[^\r\n]+") do
     local h = line:match("^(%x+)$")
@@ -787,22 +833,23 @@ end
 local function appendImportedSavHash(version, hash)
   if type(hash) ~= "string" or hash == "" then return end
   local path = savesImportedHashesPath(version)
-  local prev = love.filesystem.read(path) or ""
+  local prev = pfs().read(path) or ""
   if prev:find(hash, 1, true) then return end
-  love.filesystem.write(path, prev .. hash .. string.char(10))
+  pfs().write(path, prev .. hash .. string.char(10))
 end
 
 -- Keep bytes for the player (MTP recovery) but stop matching %.sav$ on rescan.
 local function retireImportedSav(path)
   if type(path) ~= "string" or path == "" then return false end
-  local data = love.filesystem.read(path)
+  local fs = pfs()
+  local data = fs.read(path)
   if type(data) ~= "string" then return false end
   local dest = path .. ".imported"
-  if love.filesystem.getInfo(dest) then
+  if fs.getInfo(dest) then
     dest = path .. ".imported." .. tostring(os.time())
   end
-  if not love.filesystem.write(dest, data) then return false end
-  love.filesystem.remove(path)
+  if not fs.write(dest, data) then return false end
+  fs.remove(path)
   return true
 end
 
@@ -868,7 +915,7 @@ function RomImporter:rescanSavesAction(version)
   local lastOk, lastFail = nil, nil
   local gameLabel = GameVersion.info(version).displayName
   for _, path in ipairs(candidates) do
-    local data = love.filesystem.read(path)
+    local data = readListed(path)
     local hash = (type(data) == "string" and data ~= "") and sha1(data) or nil
     if hash and seenHashes[hash] then
       skipCount = skipCount + 1
@@ -936,7 +983,7 @@ function RomImporter:rescanAction(version)
   local sawOtherVersion = false
   local junkData, junkName = nil, nil
   for _, path in ipairs(candidates) do
-    local data = love.filesystem.read(path)
+    local data = readListed(path)
     local displayName = path:match("[^/\\]+$") or path
     if type(data) ~= "string" then
       self:setError("The file could not be read: " .. displayName, version)
@@ -945,7 +992,7 @@ function RomImporter:rescanAction(version)
     if not isAcceptedRomSize(#data) then
       if not junkData then junkData, junkName = data, displayName end
     else
-      local romVersion = GameVersion.forSha1(sha1(data))
+      local romVersion = self:_versionForSha1(sha1(data))
       if not romVersion then
         if not junkData then junkData, junkName = data, displayName end
       elseif romVersion ~= version then
@@ -1020,12 +1067,13 @@ end
 -- listing order and the selection was dropped: picking Red imported Blue
 -- (#1274).  The callers that are not a Choose, the Android USB-drop scans,
 -- pass nothing and still take the first pending cart of any version.
-local function findPendingRom(ready, wanted)
+local function findPendingRom(self, wanted)
+  local ready = self.ready
   for _, name in ipairs(love.filesystem.getDirectoryItems("")) do
     if isRomFilename(name) and love.filesystem.getInfo(name, "file") then
       local data = love.filesystem.read(name)
       if type(data) == "string" and isAcceptedRomSize(#data) then
-        local version = GameVersion.forSha1(sha1(data))
+        local version = self:_versionForSha1(sha1(data))
         if version and not ready[version]
             and (wanted == nil or version == wanted) then
           return name, data
@@ -1037,7 +1085,7 @@ local function findPendingRom(ready, wanted)
 end
 
 local function importPendingRom(self)
-  local name, data = findPendingRom(self.ready, self.chooseVersion)
+  local name, data = findPendingRom(self, self.chooseVersion)
   if not name then return false end
   self:startData(data, name)
   return true
@@ -1057,7 +1105,7 @@ local function consumePickedRomError(self)
   if not love.filesystem.getInfo(preferred, "file") then return false end
   local data = love.filesystem.read(preferred)
   if type(data) == "string" and isAcceptedRomSize(#data) then
-    local version = GameVersion.forSha1(sha1(data))
+    local version = self:_versionForSha1(sha1(data))
     if version and self.ready[version] then return false end
   end
   love.filesystem.remove(preferred)
@@ -1449,7 +1497,8 @@ function RomImporter:_applyLastVersionTab()
   if okLO and LO.pendingTab then return end
   if os.getenv("POKEPORT_LAUNCHER_TAB") then return end
   local last = okOpt and opts and opts.lastVersion
-  if last and GameVersion.VERSIONS[last] and self.ready[last] then
+  if last and GameVersion.VERSIONS[last] and self.ready[last]
+      and SecretGames.shown(self, last) then
     self.tab = last
   end
 end
@@ -1612,6 +1661,17 @@ function RomImporter.new(onComplete, opts)
     end
     self.romName[version] = "pokemon_" .. info.id .. ext
   end
+  if GameVersion.VERSIONS[self.tab] and not SecretGames.shown(self, self.tab) then
+    self.tab = "red"
+  end
+  local portableErr = CacheFs.portableError()
+  if portableErr then
+    self.notice = {
+      version = self.tab or "red",
+      status = Strings("Portable folder unavailable"),
+      detail = portableErr,
+    }
+  end
   RomImporter.syncAndroidShortcuts()
   Transition.reset()
   Transition.armed = false
@@ -1644,7 +1704,7 @@ function RomImporter.new(onComplete, opts)
     if not self.ready[version] then needRom = true; break end
   end
   if mobileFileBridge and needRom then
-    local name, data = findPendingRom(self.ready)
+    local name, data = findPendingRom(self)
     if name then
       self:startData(data, name)
     else
@@ -1904,7 +1964,7 @@ function RomImporter:focus(f)
   end
   for _, v in ipairs(GameVersion.ORDER) do
     if not self.ready[v] then
-      local name, data = findPendingRom(self.ready)
+      local name, data = findPendingRom(self)
       if name then
         self:startData(data, name)
       else
@@ -1913,6 +1973,34 @@ function RomImporter:focus(f)
       return
     end
   end
+end
+
+function RomImporter:_versionForSha1(hash)
+  local version = GameVersion.forSha1(hash)
+  if version and not SecretGames.shown(self, version) then return nil end
+  return version
+end
+
+function RomImporter:_logoTap()
+  if SecretGames.update() then
+    self._secretPopup = nil
+    self._logoTaps = nil
+    return
+  end
+  if self._secretPopup or not SecretGames.anyLocked() then return end
+  self._logoTaps = (self._logoTaps or 0) + 1
+  if self._logoTaps >= SecretGames.TAPS then
+    self._secretPopup = true
+    local okKit, Kit = pcall(require, "src.ui.kit.Kit")
+    if okKit then Kit.setFocus("secret-ok") end
+  end
+end
+
+function RomImporter:_confirmSecret()
+  if not self._secretPopup then return end
+  self._secretPopup = nil
+  SecretGames.unlock()
+  self._headerChrome = nil
 end
 
 function RomImporter:setError(message, version)
@@ -1970,17 +2058,17 @@ function RomImporter:startData(data, displayName, sourcePath)
     self:setError(("Expected a 1 MiB Game Boy ROM (%s), a "
       .. "2 MiB Game Boy Color ROM (%s), or a 16 MiB Game Boy Advance ROM (%s); "
       .. "this file is %.2f MiB.")
-      :format(cartsSlashed(1), cartsSlashed(2), cartsSlashed(3),
+      :format(cartsSlashed(1, self), cartsSlashed(2, self), cartsSlashed(3, self),
         #data / 1024 / 1024))
     return
   end
   local actualHash = sha1(data)
-  local version = GameVersion.forSha1(actualHash)
+  local version = self:_versionForSha1(actualHash)
   if not version then
     self:setError(("Unsupported ROM (SHA-1 %s). This needs a clean US Pokemon "
       .. "%s dump; patched, trimmed or "
       .. "\"fixed\" dumps "
-      .. "(tagged [b] or [BF]) never verify."):format(actualHash, cartsProse()))
+      .. "(tagged [b] or [BF]) never verify."):format(actualHash, cartsProse(self)))
     return
   end
   self.romSha1 = actualHash
@@ -2037,9 +2125,9 @@ function RomImporter:_startExtractThread(version, prefix, data, displayName)
   local resultName = "rom_import_result"
   love.thread.getChannel(progressName):clear()
   love.thread.getChannel(resultName):clear()
-  local started = pcall(thread.start, thread, version, prefix, data,
+  local started, startResult = pcall(thread.start, thread, version, prefix, data,
     progressName, resultName, self.romSha1)
-  if not started then return false end
+  if not started or startResult == false then return false end
   self._extract = {
     thread = thread, version = version, prefix = prefix,
     displayName = displayName,
@@ -2092,6 +2180,10 @@ function RomImporter:_completeImport(version, prefix, displayName)
   CacheFs.prefix = savedPrefix
   if not ok then
     error("could not finish the private cache: " .. tostring(writeError))
+  end
+  local SaveConvert = package.loaded["src.save_convert.SaveConvert"]
+  if GameVersion.generation(version) == 2 and SaveConvert then
+    SaveConvert.invalidateGen2Data(version)
   end
   self.ready[version] = true
   self.returning[version] = false
@@ -2225,7 +2317,10 @@ function RomImporter:_reimportCandidate(version)
 end
 
 function RomImporter:_queueReimport(version)
-  if not GameVersion.VERSIONS[version] or self.ready[version] then return end
+  if not GameVersion.VERSIONS[version] or self.ready[version]
+      or not SecretGames.shown(self, version) then
+    return
+  end
   self._reimportQueue = self._reimportQueue or {}
   for _, v in ipairs(self._reimportQueue) do
     if v == version then return end
@@ -2900,12 +2995,13 @@ function RomImporter:chooseRequiredImport(modId, importId)
 
   if self.isNX then
     local inbox = "imports/baseroms"
-    love.filesystem.createDirectory(inbox)
+    local fs = pfs()
+    fs.createDirectory(inbox)
     local lastError
-    for _, name in ipairs(love.filesystem.getDirectoryItems(inbox) or {}) do
+    for _, name in ipairs(fs.getDirectoryItems(inbox) or {}) do
       if name:sub(1, 1) ~= "." then
         local path = inbox .. "/" .. name
-        local info = love.filesystem.getInfo(path, "file")
+        local info = fs.getInfo(path, "file")
         local RequiredImports = require("src.mods.RequiredImports")
         local sizeErr = info
           and RequiredImports.sizeError(spec, info.size, false)
@@ -2913,7 +3009,7 @@ function RomImporter:chooseRequiredImport(modId, importId)
             and info.size > RequiredImports.LARGE_WARN_BYTES then
           return self:_importRequiredSource(modId, importId, path)
         end
-        local data = not sizeErr and love.filesystem.read(path) or nil
+        local data = not sizeErr and fs.read(path) or nil
         if data and self:_importRequiredData(modId, importId, data) then return end
         if sizeErr then lastError = sizeErr
         elseif self.requiredImportNotice
@@ -3122,11 +3218,11 @@ function RomImporter:exportSave(version, format, scope, slotId)
   version = self:_resolveSaveVersion(version)
   local noticeScope = scope or version
   local IO = require("src.import.SaveFileIO")
-  local ok, res
+  local ok, res, exportNote
   if format == "lua" then
     ok, res = IO.exportLuaSlot(version, slotId, cartOfScope(scope))
   else
-    ok, res = IO.exportActiveSlot(version)
+    ok, res, exportNote = IO.exportActiveSlot(version)
   end
   if not ok then
     self.saveNotice[noticeScope] = { ok = false, text = tostring(res) }
@@ -3173,7 +3269,9 @@ function RomImporter:exportSave(version, format, scope, slotId)
     return
   end
   local dir = res:match("^(.*)[/\\][^/\\]+$")
-  self.saveNotice[noticeScope] = { ok = true, text = "Exported to " .. res, dir = dir }
+  local text = "Exported to " .. res
+  if exportNote then text = text .. "\n" .. exportNote end
+  self.saveNotice[noticeScope] = { ok = true, text = text, dir = dir }
 end
 
 -- Delete a save slot from the registry and disk, then refresh the panel.  If the
@@ -3243,7 +3341,7 @@ function RomImporter:choose(version)
     -- a fresh SAF pick).  Never reuse an already-imported cart's file -- that
     -- was the #167 failure mode (second Choose just re-extracted Red).  This
     -- is a Choose, so it takes the cart that was asked for and nothing else.
-    local name, data = findPendingRom(self.ready, self.chooseVersion)
+    local name, data = findPendingRom(self, self.chooseVersion)
     if name then
       self:startData(data, name)
     elseif consumePickedRomError(self) then
@@ -3386,6 +3484,12 @@ function RomImporter:_pollPickedFiles(dt)
 end
 
 function RomImporter:update(dt)
+  local released, changed = SecretGames.update()
+  if released then
+    self._secretPopup = nil
+    self._logoTaps = nil
+    if changed then self._headerChrome = nil end
+  end
   self.pulse = self.pulse + dt
   if self._importerJob then self:_stepImporter() end
   if not Transition.armed then
@@ -3401,12 +3505,12 @@ function RomImporter:update(dt)
       return
     end
   end
-  self:_updatePadCursor(dt)
+  if not self._inputBlocked then self:_updatePadCursor(dt) end
   self:_stepBaseRomScan()
   -- Pump the FlexLove view (input polling + the queued click actions).  The
   -- flag is only set once draw() has built a tree, so headless runs and the
   -- test tier never touch the toolkit.
-  if self._flex then
+  if self._flex and not self._inputBlocked then
     require("src.import.LauncherView").update(self, dt)
   end
   -- Drive every in-flight async fetch.  These are the operations that used to
@@ -3472,6 +3576,12 @@ function RomImporter:update(dt)
       end
       if os.getenv("POKEPORT_LAUNCHER_BUG") == "1" then
         self:_openBugPanel()
+      end
+      if os.getenv("POKEPORT_LAUNCHER_GAME_POPUP") == "1" then
+        self._gamePopup = true
+      end
+      for _ = 1, tonumber(os.getenv("POKEPORT_LAUNCHER_LOGO_TAPS") or "") or 0 do
+        self:_logoTap()
       end
       -- POKEPORT_LAUNCHER_FIND_KIND=mods|carts picks which half of the feed
       -- the FIND tab is browsing; the switch is otherwise only a click.
@@ -3776,8 +3886,9 @@ end
 
 function RomImporter:_cycleTab(delta)
   local order = { "mods", "find", "skins", "importers" }
-  for i = #GameVersion.ORDER, 1, -1 do
-    table.insert(order, 1, GameVersion.ORDER[i])
+  local games = SecretGames.order(self)
+  for i = #games, 1, -1 do
+    table.insert(order, 1, games[i])
   end
   local idx = 1
   for i, id in ipairs(order) do
@@ -3922,6 +4033,10 @@ function RomImporter:gamepadpressed(_, button)
     if Kit.FileBrowser and Kit.FileBrowser.active then
       if Kit.FileBrowser.gamepadpressed(action) then return end
     end
+  end
+  if self._secretPopup then
+    if action == "a" or action == "start" then self:_confirmSecret() end
+    return
   end
 
   -- Y button toggle between Native Controller Navigation and Virtual Pointer Cursor:
@@ -4540,6 +4655,7 @@ end
 
 function RomImporter:_switchTab(id)
   if id == "bug" then return self:_openBugPanel() end
+  if GameVersion.VERSIONS[id] and not SecretGames.shown(self, id) then return end
   if self.tab and self.tab ~= id then
     local at = tabOrder()
     Transition.start("tabs", "tab", {
@@ -5486,6 +5602,12 @@ function RomImporter:keypressed(key)
       if Kit.VirtualKeyboard.keypressed(key) then return end
     end
   end
+  if self._secretPopup then
+    if key == "return" or key == "kpenter" or key == "space" then
+      self:_confirmSecret()
+    end
+    return
+  end
   if self._profileSavePrompt then
     if key == "backspace" then
       self._profileSavePrompt.text = utf8Back(self._profileSavePrompt.text or "")
@@ -6035,7 +6157,9 @@ function RomImporter:_restoreActiveCarts(opts)
 end
 
 local CART_RAIL = { red = "railRed", blue = "railBlue", yellow = "railGold",
-                    gold = "railAmber", silver = "railSilver" }
+                    gold = "railAmber", silver = "railSilver", crystal = "railCrystal",
+                    firered = "railFireRed", leafgreen = "railLeafGreen",
+                    emerald = "railEmerald", ruby = "railRuby", sapphire = "railSapphire" }
 local CART_START_VERSION = "1.0.0"
 
 local function cartShellHex(version)
@@ -7909,10 +8033,8 @@ end
 --
 -- The index is metadata only (src/mods/ModIndex.lua): it says where a mod's
 -- zip lives, and the install runs through exactly the same path "Import mod
--- .zip" does.  Nothing here is automatic -- no index ships with the launcher,
--- and the tab stays an empty "Add an index" prompt until the player names one,
--- because subscribing to somebody's list of mods is a trust decision and not a
--- default.
+-- .zip" does.  The main index is included by default; players can add other
+-- indexes alongside it.  Installing a listed mod remains an explicit action.
 --
 -- Fetching is the same synchronous curl the update checks already use, cached
 -- in options for a day, so the first open of the tab costs one round trip and
@@ -8380,8 +8502,12 @@ function RomImporter:_queueFindEnrichment()
   if not visible then return end
   local thumbnails, stats = 0, 0
   for _, entry in ipairs(visible) do
+    -- A row already resolved to "failed" (or with no thumbnail at all) must not
+    -- spend this frame's allowance: _startFindThumb ignores it, so counting it
+    -- let two dead rows above a card starve it of a download forever.
     if thumbnails < FIND_ENRICH_PER_FRAME
         and self:_findThumb(entry) == nil
+        and not (self._findThumbs and self._findThumbs[entry.id] ~= nil)
         and not self:_findThumbPending(entry.id) then
       self:_startFindThumb(entry)
       thumbnails = thumbnails + 1
@@ -8433,9 +8559,7 @@ function RomImporter:_pumpFindStats()
   if next(pending) == nil then self._findStatsPending = nil end
 end
 
--- Open the "add an index" text prompt.  Deliberately a typed URL rather than a
--- picked-from-a-list affair: there is no blessed index, and presenting one
--- would make the launcher's choice look like an endorsement.
+-- Open the text prompt for an additional index URL.
 function RomImporter:_promptAddIndex()
   self._indexPrompt = { text = "" }
   self:_armTextInput()

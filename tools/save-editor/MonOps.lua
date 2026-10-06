@@ -37,7 +37,6 @@ function MonOps.create(data, species, level, gen)
     for slot = 1, 4 do
       local mvId = moves[slot]
       if mvId and mvId > 0 then
-        local mvName = PokemonG3.moveName(mvId)
         monMoves[slot] = {
           id = mvId,
           moveId = mvId,
@@ -106,9 +105,14 @@ function MonOps.recalc(data, mon, gen)
       if mon.personality then
         mon.nature = PokemonG3.natureId and PokemonG3.natureId(mon.personality) or mon.nature
         mon.gender = PokemonG3.gender and PokemonG3.gender(mon.speciesId or mon.species, mon.personality) or mon.gender
-        mon.ability = PokemonG3.abilityId and PokemonG3.abilityId(mon.speciesId or mon.species, mon.personality) or mon.ability
+        local pair = PokemonG3.abilities(mon.speciesId or mon.species)
+        mon.abilityNum = mon.abilityNum or (pair[2] and pair[2] ~= 0 and mon.personality % 2 or 0)
+        mon.ability = pair[mon.abilityNum + 1] or pair[1]
+        mon.abilityId = mon.ability
       end
-      mon.hp = math.max(0, math.min(mon.hp or mon.maxHp, mon.maxHp))
+      if mon.maxHp then
+        mon.hp = math.max(0, math.min(mon.hp or mon.maxHp, mon.maxHp))
+      end
     end
     return
   end
@@ -213,7 +217,7 @@ function MonOps.setNature(data, mon, natureId, gen)
   mon.nature = natureId
   local isG3 = (gen == 3) or (mon.speciesId ~= nil) or (mon.personality ~= nil)
   if isG3 then
-    local currentAbility = (mon.personality and (mon.personality % 2)) or 0
+    local currentAbility = mon.abilityNum or (mon.personality and (mon.personality % 2)) or 0
     local isShiny = require("src.core.game3.summary_data").isShiny(mon)
     mon.personality = MonOps.generatePid(mon.speciesId or mon.species, mon.otId or 0, mon.otSecretId or 0, {
       nature = natureId,
@@ -238,6 +242,7 @@ function MonOps.setAbility(data, mon, abilitySlot, gen)
       gender = mon.gender,
       shiny = isShiny,
     })
+    mon.abilityNum = abilitySlot
     local PokemonG3 = require("src.core.game3.pokemon")
     mon.ability = PokemonG3.abilityId(mon.speciesId or mon.species, mon.personality)
     MonOps.recalc(data, mon, gen)
@@ -249,7 +254,7 @@ function MonOps.setGender(data, mon, gender, gen)
   local isG3 = (gen == 3) or (mon.speciesId ~= nil) or (mon.personality ~= nil)
   if isG3 then
     local currentNature = (mon.personality and (mon.personality % 25)) or mon.nature or 0
-    local currentAbility = (mon.personality and (mon.personality % 2)) or 0
+    local currentAbility = mon.abilityNum or (mon.personality and (mon.personality % 2)) or 0
     local isShiny = require("src.core.game3.summary_data").isShiny(mon)
     mon.personality = MonOps.generatePid(mon.speciesId or mon.species, mon.otId or 0, mon.otSecretId or 0, {
       nature = currentNature,
@@ -270,7 +275,7 @@ function MonOps.setShiny(data, mon, shiny, gen)
   local isG3 = (gen == 3) or (mon.speciesId ~= nil) or (mon.personality ~= nil)
   if isG3 then
     local currentNature = (mon.personality and (mon.personality % 25)) or mon.nature or 0
-    local currentAbility = (mon.personality and (mon.personality % 2)) or 0
+    local currentAbility = mon.abilityNum or (mon.personality and (mon.personality % 2)) or 0
     mon.personality = MonOps.generatePid(mon.speciesId or mon.species, mon.otId or 0, mon.otSecretId or 0, {
       nature = currentNature,
       ability = currentAbility,
@@ -356,8 +361,169 @@ function MonOps.setMove(data, mon, slot, moveId)
     moveId = mdef.moveId or numMove,
     pp = basePp + currentUps * math.floor(basePp / 5),
     ppUps = currentUps > 0 and currentUps or nil,
-    maxPp = basePp,
+    maxPp = basePp + currentUps * math.floor(basePp / 5),
   }
+end
+
+function MonOps.getPpUps(mon, slot)
+  if type(mon) ~= "table" or not slot then return 0 end
+  if type(mon.ppBonusesPacked) == "number" then
+    local bit = require("bit")
+    return bit.band(bit.rshift(mon.ppBonusesPacked, (slot - 1) * 2), 3)
+  end
+  local mv = mon.moves and mon.moves[slot]
+  if type(mv) == "table" and mv.ppUps ~= nil then
+    return tonumber(mv.ppUps) or 0
+  end
+  if type(mon.ppBonuses) == "table" and mon.ppBonuses[slot] ~= nil then
+    return tonumber(mon.ppBonuses[slot]) or 0
+  end
+  return 0
+end
+
+function MonOps.getBasePp(data, mon, slot)
+  if type(mon) ~= "table" or not slot then return 10 end
+  local mv = mon.moves and mon.moves[slot]
+  local moveId = nil
+  if type(mv) == "table" then
+    moveId = mv.moveId or mv.id or mv.move
+    if mv.basePp then return tonumber(mv.basePp) end
+  elseif type(mv) == "number" then
+    moveId = mv
+  elseif type(mv) == "string" then
+    moveId = mv
+  end
+  if not moveId then return 10 end
+
+  local num = tonumber(moveId)
+  local mdef = data and data.moves and (data.moves[moveId] or (num and data.moves[num]))
+  if mdef and mdef.pp then return tonumber(mdef.pp) end
+
+  local okP, PokemonG3 = pcall(require, "src.core.game3.pokemon")
+  if okP and PokemonG3 then
+    if num and PokemonG3.battleMove then
+      local row = PokemonG3.battleMove(num)
+      if row and row.pp then return tonumber(row.pp) end
+    end
+    if num and PokemonG3.movePp then
+      local pp = PokemonG3.movePp(num)
+      if pp and pp > 0 then return pp end
+    end
+  end
+
+  local okB, BuiltinMoves = pcall(require, "src.core.game3.battle.builtin_moves")
+  if okB and BuiltinMoves then
+    if num and BuiltinMoves[num] and BuiltinMoves[num].pp then
+      return tonumber(BuiltinMoves[num].pp)
+    end
+    if type(moveId) == "string" then
+      local norm = moveId:upper():gsub("[^A-Z0-9]", " ")
+      for _, row in pairs(BuiltinMoves) do
+        if row.name and row.name:upper() == norm and row.pp then
+          return tonumber(row.pp)
+        end
+      end
+    end
+  end
+
+  return 10
+end
+
+function MonOps.calcMaxPp(basePp, ppUps, gen)
+  basePp = math.max(1, tonumber(basePp) or 10)
+  ppUps = math.max(0, math.min(3, tonumber(ppUps) or 0))
+  if gen == 1 or gen == 2 then
+    -- GBPKM.GetMovePP and Gen 2 engine/items/item_effects.asm cap the
+    -- per-PP-Up bonus at seven: a 40 PP move reaches 61, not 64.
+    return basePp + ppUps * math.min(7, math.floor(basePp / 5))
+  end
+  return basePp + math.floor(basePp * 20 * ppUps / 100)
+end
+
+function MonOps.setPpUps(data, mon, slot, ppUps, gen)
+  if type(mon) ~= "table" or not slot then return end
+  ppUps = math.max(0, math.min(3, math.floor(tonumber(ppUps) or 0)))
+  local basePp = MonOps.getBasePp(data, mon, slot)
+  if basePp == 1 then ppUps = 0 end -- Sketch cannot receive PP Ups.
+
+  local isG3 = (gen == 3) or (mon.speciesId ~= nil) or (mon.personality ~= nil) or (type(mon.ppBonusesPacked) == "number")
+  local newMaxPp = MonOps.calcMaxPp(basePp, ppUps, isG3 and 3 or (gen or 1))
+  if isG3 then
+    local bit = require("bit")
+    local shift = (slot - 1) * 2
+    local packed = tonumber(mon.ppBonusesPacked) or 0
+    mon.ppBonusesPacked = bit.bor(bit.band(packed, bit.bnot(bit.lshift(3, shift))), bit.lshift(ppUps, shift))
+    mon.maxPp = mon.maxPp or {}
+    mon.maxPp[slot] = newMaxPp
+    mon.pp = mon.pp or {}
+    if mon.pp[slot] == nil or mon.pp[slot] > newMaxPp then
+      mon.pp[slot] = newMaxPp
+    end
+    local mv = mon.moves and mon.moves[slot]
+    if type(mv) == "table" then
+      mv.pp, mv.maxPp = mon.pp[slot], newMaxPp
+      mv.ppUps = ppUps > 0 and ppUps or nil
+    end
+  else
+    local mv = mon.moves and mon.moves[slot]
+    if type(mv) == "table" then
+      mv.ppUps = ppUps > 0 and ppUps or nil
+      mv.maxPp = newMaxPp
+      if mv.pp == nil or mv.pp > newMaxPp then
+        mv.pp = newMaxPp
+      end
+    end
+    if type(mon.pp) == "table" and (mon.pp[slot] == nil or mon.pp[slot] > newMaxPp) then
+      mon.pp[slot] = newMaxPp
+    end
+    if type(mon.maxPp) == "table" then
+      mon.maxPp[slot] = newMaxPp
+    end
+  end
+  return ppUps, newMaxPp
+end
+
+function MonOps.setPp(data, mon, slot, value, gen)
+  if type(mon) ~= "table" or not slot then return end
+  local basePp = MonOps.getBasePp(data, mon, slot)
+  local ppUps = MonOps.getPpUps(mon, slot)
+  local isG3 = (gen == 3) or (mon.speciesId ~= nil) or (mon.personality ~= nil) or (type(mon.ppBonusesPacked) == "number")
+  local maxPp = MonOps.calcMaxPp(basePp, ppUps, isG3 and 3 or (gen or 1))
+  local target = math.max(0, math.min(maxPp, math.floor(tonumber(value) or 0)))
+  if isG3 then
+    mon.pp = mon.pp or {}
+    mon.pp[slot] = target
+    mon.maxPp = mon.maxPp or {}
+    mon.maxPp[slot] = maxPp
+    local mv = mon.moves and mon.moves[slot]
+    if type(mv) == "table" then mv.pp, mv.maxPp = target, maxPp end
+  else
+    local mv = mon.moves and mon.moves[slot]
+    if type(mv) == "table" then
+      mv.pp = target
+      mv.maxPp = maxPp
+    end
+    if type(mon.pp) == "table" then
+      mon.pp[slot] = target
+    end
+  end
+  return target, maxPp
+end
+
+function MonOps.maxAllPpUps(data, mon, gen)
+  if type(mon) ~= "table" or not mon.moves then return end
+  local ups = (mon.isEgg or mon.egg) and 0 or 3
+  for slot = 1, 4 do
+    local move = mon.moves[slot]
+    local id = type(move) == "table" and (move.moveId or move.id) or move
+    if id and id ~= 0 then
+      MonOps.setPpUps(data, mon, slot, ups, gen)
+      local basePp = MonOps.getBasePp(data, mon, slot)
+      local isG3 = gen == 3 or mon.speciesId ~= nil or mon.personality ~= nil
+      local maxPp = MonOps.calcMaxPp(basePp, MonOps.getPpUps(mon, slot), isG3 and 3 or (gen or 1))
+      MonOps.setPp(data, mon, slot, maxPp, gen)
+    end
+  end
 end
 
 -- HP DV is derived from the low bits of the other four (Stats.randomDVs).
@@ -398,6 +564,54 @@ function MonOps.setDv(data, mon, key, value, gen)
       end
     end
   end
+  MonOps.recalc(data, mon, gen)
+end
+
+local EV_KEYS = { "hp", "atk", "def", "spe", "spa", "spd" }
+
+function MonOps.setEv(data, mon, key, value, gen)
+  if type(mon) ~= "table" or not key then return end
+  mon.evs = mon.evs or { hp = 0, atk = 0, def = 0, spe = 0, spa = 0, spd = 0 }
+  local target = math.max(0, math.min(255, math.floor(tonumber(value) or 0)))
+  local otherTotal = 0
+  for _, k in ipairs(EV_KEYS) do
+    if k ~= key then
+      otherTotal = otherTotal + (tonumber(mon.evs[k]) or 0)
+    end
+  end
+  if otherTotal + target > 510 then
+    target = math.max(0, 510 - otherTotal)
+  end
+  mon.evs[key] = target
+  MonOps.recalc(data, mon, gen)
+  return target
+end
+
+function MonOps.clearEvs(data, mon, gen)
+  if type(mon) ~= "table" then return end
+  mon.evs = { hp = 0, atk = 0, def = 0, spe = 0, spa = 0, spd = 0 }
+  MonOps.recalc(data, mon, gen)
+end
+
+function MonOps.setIv(data, mon, key, value, gen)
+  if type(mon) ~= "table" or not key then return end
+  mon.ivs = mon.ivs or { hp = 31, atk = 31, def = 31, spe = 31, spa = 31, spd = 31 }
+  local target = math.max(0, math.min(31, math.floor(tonumber(value) or 0)))
+  mon.ivs[key] = target
+  mon.dvs = mon.dvs or {}
+  mon.dvs.attack = math.floor((mon.ivs.atk or 0) / 2)
+  mon.dvs.defense = math.floor((mon.ivs.def or 0) / 2)
+  mon.dvs.speed = math.floor((mon.ivs.spe or 0) / 2)
+  mon.dvs.special = math.floor(((mon.ivs.spa or 0) + (mon.ivs.spd or 0)) / 4)
+  mon.dvs.hp = math.floor((mon.ivs.hp or 0) / 2)
+  MonOps.recalc(data, mon, gen)
+  return target
+end
+
+function MonOps.maxIvs(data, mon, gen)
+  if type(mon) ~= "table" then return end
+  mon.ivs = { hp = 31, atk = 31, def = 31, spe = 31, spa = 31, spd = 31 }
+  mon.dvs = { attack = 15, defense = 15, speed = 15, special = 15, hp = 15 }
   MonOps.recalc(data, mon, gen)
 end
 

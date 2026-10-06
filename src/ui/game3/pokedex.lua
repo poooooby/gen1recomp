@@ -17,7 +17,7 @@ local PokedexChrome = require("src.ui.game3.pokedex_chrome")
 local Strings = require("src.core.Strings")
 local RomText = require("src.core.game3.rom_text")
 
-local Pokedex = {}
+local Pokedex = { isMenu = true }
 
 Pokedex.open = false
 Pokedex.screen = "mode_select"
@@ -155,7 +155,7 @@ function Pokedex.maxSpecies()
   if Pokedex.mode == "national" or Pokedex.currentOrder == "numerical_national" then
     return Dex.NATIONAL_MAX or 386
   end
-  return Dex.KANTO_MAX or 151
+  return Dex.regionalMax()
 end
 
 -- pokefirered/src/pokedex_screen.c:3113

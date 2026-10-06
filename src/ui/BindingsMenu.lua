@@ -28,6 +28,16 @@ local BUTTONS = {
   { id = "speedDown", label = "SPEED -", pad = "leftshoulder", action = true },
   { id = "speedUp", label = "SPEED +", pad = "rightshoulder", action = true },
 }
+BindingsMenu.BUTTONS = BUTTONS
+
+BindingsMenu.GEN3_BUTTONS = {
+  BUTTONS[1], BUTTONS[2], BUTTONS[3], BUTTONS[4],
+  BUTTONS[5], BUTTONS[6], BUTTONS[7], BUTTONS[8],
+  { id = "l", label = "L", key = "q", pad = "leftshoulder" },
+  { id = "r", label = "R", key = "e", pad = "rightshoulder" },
+  { id = "speedDown", label = "SPEED -", pad = "triggerleft", action = true },
+  { id = "speedUp", label = "SPEED +", pad = "triggerright", action = true },
+}
 
 -- a binding is a plain key string or { key, pad }; absent = the fixed
 -- map, so a vanilla save renders today's keys byte-identically
@@ -81,11 +91,11 @@ local function boundRight(overlay, def)
   return key
 end
 
-function BindingsMenu.new(game)
+function BindingsMenu.new(game, opts)
   local overlay = game.save and game.save.options
                   and game.save.options.bindings
   local items = {}
-  for i, def in ipairs(BUTTONS) do
+  for i, def in ipairs(opts and opts.buttons or BUTTONS) do
     -- translated here, not in ROWS: that table is built at require
     -- time, before Strings.load has a catalog to look in
     items[i] = { label = Strings(def.label),
@@ -313,6 +323,7 @@ function BindingsMenu:drainCapture()
       if ev.kind == "key" then self:captureKey(ev.value)
       elseif ev.kind == "pad" then self:capturePad(ev.value)
       elseif ev.kind == "joy" then self:captureJoy(ev.value)
+      elseif ev.kind == "touch" and ev.value == "b" then self:endCapture()
       end
     else
       if ev.kind == "key" then self:captureKeyRelease(ev.value)
@@ -338,11 +349,12 @@ end
 function BindingsMenu:draw()
   ListMenu.draw(self)
   if self.capture then
-    Font.drawBox(1, 6, 18, 6)
+    Font.drawBox(1, 6, 18, 8)
     love.graphics.setColor(0, 0, 0, 1)
     Font.draw(Strings("PRESS A BUTTON"), 24, 60)
     Font.draw(Strings("RELEASE TO SET"), 24, 72)
     Font.draw(Strings("ESC/2ND CANCELS"), 24, 84)
+    Font.draw(Strings("TOUCH B CANCELS"), 24, 96)
     love.graphics.setColor(1, 1, 1, 1)
   end
 end

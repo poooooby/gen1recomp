@@ -3,6 +3,7 @@
 
 local Logger = require("src.core.Logger")
 local Runtime = require("src.mods.Runtime")
+local GameVersion = require("src.core.GameVersion")
 
 local Gen3Compat = {}
 
@@ -89,6 +90,14 @@ end
 -- ------- ids
 
 local MAP_PREFIX = "FR_"
+
+Gen3Compat.FAMILIES = { frlg = true }
+
+function Gen3Compat.appliesTo(version)
+  if type(version) ~= "string" then return true end
+  if not GameVersion.VERSIONS[version] then return true end
+  return Gen3Compat.FAMILIES[GameVersion.layout(version)] == true
+end
 
 function Gen3Compat.gen1MapId(id)
   if type(id) ~= "string" then return id end
@@ -299,7 +308,10 @@ local function flagId(name)
   local n = tonumber(name)
   if n then return n end
   local Flags = g3("scripting.flags")
-  return Flags and Flags.IDS and Flags.IDS[name] or nil
+  if not Flags then return nil end
+  local ok, t = pcall(Flags.active, session())
+  local ids = ok and t and t.IDS or Flags.IDS
+  return ids and ids[name] or nil
 end
 
 local function varId(name)
@@ -308,7 +320,10 @@ local function varId(name)
   local n = tonumber(name)
   if n then return n end
   local Flags = g3("scripting.flags")
-  return Flags and Flags.VAR_IDS and Flags.VAR_IDS[name] or nil
+  if not Flags then return nil end
+  local ok, t = pcall(Flags.active, session())
+  local ids = ok and t and t.VAR_IDS or Flags.VAR_IDS
+  return ids and ids[name] or nil
 end
 
 function Gen3Compat.getFlag(name)
@@ -768,7 +783,11 @@ local function buildGame()
     return function()
       local g = live()
       if not (g and g.saveGame) then return end
-      if g.saveOffered and not g:saveOffered() then return false end
+      if g.quickSaveAllowed then
+        if not g:quickSaveAllowed() then return false end
+      elseif g.saveOffered and not g:saveOffered() then
+        return false
+      end
       return g:saveGame()
     end
   end

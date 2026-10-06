@@ -50,6 +50,12 @@ local function stampNewMon(S, mon)
   if Gen.ofState(S) == 3 then
     mon.ot = (S.save.player and S.save.player.name) or S.save.name or "RED"
     mon.otId = (S.save.player and S.save.player.id) or S.save.trainerId or 0
+    mon.otName = mon.ot
+    mon.otSecretId = S.save.secretId or 0
+    mon.otGender = S.save.gender or 0
+    mon.language = 2
+    mon.metGame = require("src.core.GameVersion").gameCode(Gen.versionOf(S.save, S.version))
+    mon.metLevel = mon.level
   elseif Gen.ofState(S) == 2 then
     require("src.battle.gen2.Mon").stampOT(S.save, mon)
   else
@@ -116,6 +122,8 @@ end
 -- Mark the save dirty and say what changed.  Also disarms any pending
 -- destructive confirmation: doing something else is an implicit "no".
 function Ops.mark(S, msg)
+  S.revision = (S.revision or 0) + 1
+  S.historyToken = S.revision
   S.dirty = true
   S.status = msg or S.status
   S.armed = nil
@@ -398,15 +406,37 @@ end
 -- The item catalog minus the badges, which are toggles on their own row and
 -- would otherwise be "addable" into the bag as ordinary items.
 function Ops.itemSearch(S, query)
-  query = tostring(query or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
-  local out = {}
-  for _, id in ipairs(S.cat.items) do
-    if not Ops.isBadgeId(id)
-        and (query == "" or id:lower():find(query, 1, true)) then
-      out[#out + 1] = id
+  query=tostring(query or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+  local out={}
+  for _,id in ipairs(S.cat.items) do
+    local def=S.data.items[id]
+    local name=def and tostring(def.name or ""):lower() or ""
+    local number=def and tonumber(def.itemId)
+    if not Ops.isBadgeId(id) and (query=="" or id:lower():find(query,1,true)
+      or name:find(query,1,true) or (number and query==tostring(number))) then out[#out+1]=id end
+  end
+  if query~="" then
+    local function rank(id)
+      local def=S.data.items[id]
+      local name=tostring(def and def.name or ""):lower()
+      local key=id:lower()
+      if key==query or name==query or (def and tostring(def.itemId)==query) then return 0 end
+      if key:sub(1,#query)==query or name:sub(1,#query)==query then return 1 end
+      return 2
     end
+    table.sort(out,function(a,b)
+      local ra,rb=rank(a),rank(b)
+      return ra~=rb and ra<rb or (ra==rb and a<b)
+    end)
   end
   return out
+end
+
+function Ops.monName(S, mon)
+  if not mon then return "Empty slot" end
+  if type(mon.nickname)=="string" and mon.nickname~="" then return mon.nickname end
+  local def=S.data.pokemon[mon.species or mon.speciesId]
+  return tostring((def and def.name) or mon.name or mon.species or "Pokemon")
 end
 
 -- `dest` is "bag" or "pc"; the picker can flip it while open.  `opened`
@@ -474,6 +504,68 @@ function Ops.setDv(S, mon, key, value)
   end
   MonOps.setDv(S.data, mon, key, want, Gen.ofState(S))
   return Ops.mark(S, ("%s DV %d  (HP DV now %d)"):format(key, mon.dvs[key], mon.dvs.hp))
+end
+
+function Ops.setEv(S, mon, key, value)
+  if not mon then return false end
+  mon.evs = mon.evs or { hp = 0, atk = 0, def = 0, spe = 0, spa = 0, spd = 0 }
+  local cur = tonumber(mon.evs[key]) or 0
+  local applied = MonOps.setEv(S.data, mon, key, value, Gen.ofState(S))
+  if applied == cur then
+    return Ops.say(S, ("%s EV is already %d"):format(key:upper(), cur))
+  end
+  return Ops.mark(S, ("%s EV set to %d"):format(key:upper(), applied or 0))
+end
+
+function Ops.clearEvs(S, mon)
+  if not mon then return false end
+  MonOps.clearEvs(S.data, mon, Gen.ofState(S))
+  return Ops.mark(S, ("Cleared EVs for %s"):format(mon.species or "Pokémon"))
+end
+
+function Ops.setIv(S, mon, key, value)
+  if not mon then return false end
+  mon.ivs = mon.ivs or { hp = 31, atk = 31, def = 31, spe = 31, spa = 31, spd = 31 }
+  local cur = tonumber(mon.ivs[key]) or 0
+  local applied = MonOps.setIv(S.data, mon, key, value, Gen.ofState(S))
+  if applied == cur then
+    return Ops.say(S, ("%s IV is already %d"):format(key:upper(), cur))
+  end
+  return Ops.mark(S, ("%s IV set to %d"):format(key:upper(), applied or 0))
+end
+
+function Ops.maxIvs(S, mon)
+  if not mon then return false end
+  MonOps.maxIvs(S.data, mon, Gen.ofState(S))
+  return Ops.mark(S, ("Maxed IVs (31) for %s"):format(mon.species or "Pokémon"))
+end
+
+function Ops.setPpUps(S, mon, slot, value)
+  if not mon or not slot or not (mon.moves and mon.moves[slot]) then return false end
+  if not moveId(mon, slot) or moveId(mon, slot) == 0 then return Ops.say(S, "Choose a move first") end
+  local cur = MonOps.getPpUps(mon, slot)
+  local want = math.max(0, math.min(3, math.floor(tonumber(value) or 0)))
+  if want > 0 and (mon.egg or mon.isEgg or MonOps.getBasePp(S.data, mon, slot) == 1) then
+    return Ops.say(S, "Eggs and this move cannot use PP Ups")
+  end
+  if want == cur then
+    return Ops.say(S, ("Slot %d PP Up is already %d"):format(slot, want))
+  end
+  local applied, maxPp = MonOps.setPpUps(S.data, mon, slot, want, Gen.ofState(S))
+  return Ops.mark(S, ("Slot %d PP Up set to %d (Max PP %d)"):format(slot, applied, maxPp))
+end
+
+function Ops.setPp(S, mon, slot, value)
+  if not mon or not slot or not (mon.moves and mon.moves[slot]) then return false end
+  if not moveId(mon, slot) or moveId(mon, slot) == 0 then return Ops.say(S, "Choose a move first") end
+  local applied, maxPp = MonOps.setPp(S.data, mon, slot, value, Gen.ofState(S))
+  return Ops.mark(S, ("Slot %d PP set to %d/%d"):format(slot, applied or 0, maxPp or 0))
+end
+
+function Ops.maxAllPpUps(S, mon)
+  if not mon then return false end
+  MonOps.maxAllPpUps(S.data, mon, Gen.ofState(S))
+  return Ops.mark(S, ("Restored PP and maximized supported PP Ups for %s"):format(mon.species or "Pokémon"))
 end
 
 -- Kept for tests and any keyboard path; the inspector opens the searchable
@@ -624,6 +716,130 @@ function Ops.clearMove(S, mon, slot)
   local id = moveId(mon, slot)
   if Gen.ofState(S) == 3 then MonOps.clearMove(mon, slot) else mon.moves[slot] = nil end
   return Ops.mark(S, ("Cleared move slot %d (%s)"):format(slot, id))
+end
+
+function Ops.setExperience(S, mon, value)
+  local exp = tonumber(value)
+  if not mon or not require("Legality").integer(exp, 0, 16777215) then
+    return Ops.say(S, "Experience must be a nonnegative whole number")
+  end
+  local g = Gen.ofState(S)
+  local def = S.data.pokemon[mon.species or mon.speciesId]
+  local function threshold(level)
+    if g == 3 then
+      local Pokemon = require("src.core.game3.pokemon")
+      return require("src.core.game3.summary_data").expForLevel(Pokemon.growthRate(mon.species or mon.speciesId), level)
+    elseif g == 2 then
+      local Mon = require("src.battle.gen2.Mon")
+      return Mon.experienceForLevel(Mon.growthFor(S.data, def and def.growthRate), level)
+    end
+    return require("src.pokemon.Growth").expForLevel(def and def.growthRate or 0, level, S.data.growth_rates)
+  end
+  if exp > threshold(100) then return Ops.say(S, "Experience exceeds this species' level 100 maximum") end
+  if exp == Gen.exp(mon) then return Ops.say(S, "Experience is unchanged") end
+  local level = 1
+  while level < 100 and exp >= threshold(level + 1) do level = level + 1 end
+  MonOps.setLevel(S.data, mon, level, g)
+  if g == 2 then mon.experience = exp
+  else mon.exp = exp end
+  if mon.experience ~= nil then mon.experience = exp end
+  if mon.exp ~= nil then mon.exp = exp end
+  return Ops.mark(S, "Experience updated; level " .. level)
+end
+
+function Ops.setCurrentHp(S, mon, value)
+  local hp = tonumber(value)
+  local max = mon and (mon.maxHp or (mon.stats and mon.stats.hp)) or 0
+  if not mon or not require("Legality").integer(hp, 0, max) then
+    return Ops.say(S, "HP must be a whole number from 0 to " .. max)
+  end
+  if hp == mon.hp then return Ops.say(S, "HP is unchanged") end
+  mon.hp = hp
+  return Ops.mark(S, "Current HP updated")
+end
+
+function Ops.setMonStatus(S, mon, status)
+  if not mon then return false end
+  local allowed = {SLP=true, PSN=true, BRN=true, FRZ=true, PAR=true, TOX=true}
+  if status ~= nil and (not allowed[status] or (Gen.ofState(S) == 1 and status == "TOX")) then
+    return Ops.say(S, "Choose a status supported by this generation")
+  end
+  if mon.status == status then return Ops.say(S, "Status is unchanged") end
+  mon.status = status
+  mon.sleep = status == "SLP" and 1 or nil
+  mon.toxicCounter = nil
+  return Ops.mark(S, "Status: " .. (status or "healthy"))
+end
+
+function Ops.setTrainerProperty(S, key, value)
+  if key == "name" then
+    value = tostring(value or "")
+    if value == "" or Ops.nicknameLength(value) > 7 or not Ops.nicknameUsable(S,value) then
+      return Ops.say(S,"Trainer name must contain 1-7 game characters")
+    end
+    S.save.player = S.save.player or {}
+    S.save.player.name = value
+    if Gen.ofState(S)==3 then S.save.name, S.save.playerName = value,value end
+  elseif key == "buenaPoints" then
+    if not Gen.hasBuenaPoints(S.save, S.version) then return Ops.say(S, "Buena points are only available in Crystal") end
+    local n = tonumber(value)
+    if not n or n ~= n or n < 0 or n > 30 or n ~= math.floor(n) then
+      return Ops.say(S, "Buena points must be a whole number from 0 to 30")
+    end
+    if Gen.buenaPoints(S.save, S.version) == n then return true end
+    if not Gen.setBuenaPoints(S.save, n, S.version) then return Ops.say(S, "Invalid Crystal Buena state") end
+    return Ops.mark(S, "Buena points updated")
+  else
+    local max = ({id=65535,secretId=65535,money=999999,coins=9999})[key]
+    local n=tonumber(value)
+    if not max or not n or n ~= math.floor(n) or n<0 or n>max then return Ops.say(S,"Invalid trainer value") end
+    if key=="secretId" then
+      if Gen.ofState(S)~=3 then return Ops.say(S,"This generation has no secret ID") end
+      S.save.secretId=n
+    elseif key=="id" then
+      S.save.player=S.save.player or {};S.save.player.id=n
+      if Gen.ofState(S)==3 then S.save.trainerId,S.save.id,S.save.playerId=n,n,n end
+    elseif key=="money" then Gen.setMoney(S.save,n)
+    elseif key=="coins" then Gen.setCoins(S.save,n) end
+  end
+  return Ops.mark(S,"Trainer "..key.." updated")
+end
+
+function Ops.setMonProperty(S, mon, key, value)
+  if not mon then return Ops.say(S, "Select a Pokemon first") end
+  local P = require("Properties")
+  local d = P.find(S, key)
+  if not d then return Ops.say(S, "That property is unavailable in this generation") end
+  local parsed, err = P.parse(d, value)
+  if parsed == nil then return Ops.say(S, err) end
+  if d.text and (Ops.nicknameLength(parsed) > d.max or not Ops.nicknameUsable(S, parsed)) then
+    return Ops.say(S, "Trainer name must use game characters and fit in " .. d.max .. " characters")
+  end
+  if P.get(mon, d) == parsed then return Ops.say(S, d.label .. " is unchanged") end
+  P.write(mon, d, parsed)
+  if key == "personality" then
+    mon.isShiny = nil
+    local PokemonG3 = require("src.core.game3.pokemon")
+    local pair = PokemonG3.abilities(mon.speciesId or mon.species)
+    mon.abilityNum = pair[2] and pair[2] ~= 0 and parsed % 2 or 0
+    MonOps.recalc(S.data, mon, 3)
+  elseif key == "otId" or key == "otSecretId" then
+    mon.isShiny = nil
+  end
+  return Ops.mark(S, d.label .. " updated")
+end
+
+function Ops.setStatExp(S, mon, key, value)
+  local n = tonumber(value)
+  if Gen.ofState(S) == 3 or not mon or not n or n ~= math.floor(n) or n < 0 or n > 65535 then
+    return Ops.say(S, "Stat experience must be a whole number from 0 to 65535")
+  end
+  local allowed = { hp=true, attack=true, defense=true, speed=true, special=true }
+  if not allowed[key] then return Ops.say(S, "Unknown stat") end
+  mon.statExp = mon.statExp or {}
+  mon.statExp[key] = n
+  MonOps.recalc(S.data, mon, Gen.ofState(S))
+  return Ops.mark(S, key .. " stat experience updated")
 end
 
 function Ops.resetMoves(S, mon)
@@ -1023,6 +1239,24 @@ local function itemQty(inv, id)
 end
 Ops.itemQty = itemQty
 
+-- engine/items/inventory.asm:64
+local function splits(S, id)
+  return Gen.ofState(S) == 1 and Bag.slotsFor(id, Ops.STACK_MAX + 1, S.data) > 1
+end
+
+local function stackTarget(S, id, have)
+  if splits(S, id) then
+    return math.max(1, Bag.slotsFor(id, have, S.data)) * Ops.STACK_MAX
+  end
+  return Ops.stackMax(S)
+end
+
+local function rowCount(S, pc, id, slot)
+  for _, row in ipairs(Ops.stackRows(S, pc)) do
+    if row.id == id and row.slot == slot then return row.count, row end
+  end
+end
+
 local function changeG3(S, pc, id, quantity)
   if not id then return Ops.say(S, "Pick an item first") end
   if not G3.change(S.data, S.save, pc, { { id = id, qty = quantity } }) then
@@ -1031,16 +1265,23 @@ local function changeG3(S, pc, id, quantity)
   return Ops.mark(S, ("%s x%d%s"):format(tostring(id), quantity, pc and " in PC storage" or ""))
 end
 
+local function g3Max(S, id, pc)
+  return G3.slotMax(require("src.core.game3.items_data").pocketOf(G3.itemId(S.data, id)), pc)
+end
+
 local function maxG3(S, pc)
   local changes = {}
+  local top = 0
   for id, qty in pairs(pc and S.save.pcItems or S.save.inventory) do
-    if type(qty) == "number" and qty > 0 and qty < 999 and Ops.itemStacks(S, id) then
-      changes[#changes + 1] = { id = id, qty = 999 }
+    local cap = g3Max(S, id, pc)
+    if type(qty) == "number" and qty > 0 and qty < cap and Ops.itemStacks(S, id) then
+      changes[#changes + 1] = { id = id, qty = cap }
+      top = math.max(top, cap)
     end
   end
   if #changes == 0 then return Ops.say(S, "Every stack is already maxed") end
   if not G3.change(S.data, S.save, pc, changes) then return Ops.say(S, "Item changes refused") end
-  return Ops.mark(S, ("Maxed %d stacks to x999"):format(#changes))
+  return Ops.mark(S, ("Maxed %d stacks to x%d"):format(#changes, top))
 end
 
 function Ops.addToBag(S, id)
@@ -1057,18 +1298,22 @@ function Ops.addToBag(S, id)
     :format(Bag.slots(S.save, S.data, pocket), capacity, pocket))
 end
 
-function Ops.bagAdjust(S, id, delta)
+function Ops.bagAdjust(S, id, delta, slot)
   if not id then return Ops.say(S, "No bag row selected") end
   S.save.inventory = S.save.inventory or {}
   local have = itemQty(S.save.inventory, id)
   if Gen.ofState(S) == 3 then return changeG3(S, false, id, math.max(0, G3.quantity(S.data, S.save, false, id) + delta)) end
   if delta > 0 then
-    if have >= Ops.stackMax(S) then
+    if have >= Ops.stackMax(S) and not splits(S, id) then
       return Ops.say(S, ("%s is already at x%d"):format(tostring(id), Ops.stackMax(S)))
     end
-    Bag.add(S.save, id, delta, S.data)
+    if not Bag.add(S.save, id, delta, S.data) then
+      local pocket = Bag.pocketOf(id, S.data)
+      return Ops.say(S, ("No room for %d more %s (%d/%d %s slots)"):format(delta, tostring(id),
+        Bag.slots(S.save, S.data, pocket), Bag.capacity(S.data, pocket), pocket))
+    end
   else
-    Bag.remove(S.save, id, -delta)
+    Bag.remove(S.save, id, -delta, S.data, slot)
     if not S.save.inventory[id] then
       return Ops.mark(S, ("Removed the last %s from the bag"):format(tostring(id)))
     end
@@ -1076,12 +1321,17 @@ function Ops.bagAdjust(S, id, delta)
   return Ops.mark(S, ("%s x%d"):format(tostring(id), itemQty(S.save.inventory, id)))
 end
 
-function Ops.bagDrop(S, id)
+function Ops.bagDrop(S, id, slot)
   if not id then return Ops.say(S, "No bag row selected") end
   S.save.inventory = S.save.inventory or {}
   local qty = itemQty(S.save.inventory, id)
   if Gen.ofState(S) == 3 then return changeG3(S, false, id, 0) end
-  Bag.remove(S.save, id, qty)
+  local row = slot and rowCount(S, false, id, slot)
+  if row and row < qty then
+    Bag.remove(S.save, id, row, S.data, slot)
+    return Ops.mark(S, ("Dropped %d %s (%d left in the bag)"):format(row, tostring(id), qty - row))
+  end
+  Bag.remove(S.save, id, qty, S.data)
   return Ops.mark(S, ("Dropped all %d %s"):format(qty, tostring(id)))
 end
 
@@ -1107,7 +1357,7 @@ end
 function Ops.bagMax(S, id)
   if Gen.ofState(S) == 3 then
     if not id or not Ops.itemStacks(S, id) or G3.quantity(S.data, S.save, false, id) <= 0 then return Ops.say(S, "No stack to max") end
-    return changeG3(S, false, id, 999)
+    return changeG3(S, false, id, g3Max(S, id, false))
   end
   if not id then return Ops.say(S, "No bag row selected") end
   S.save.inventory = S.save.inventory or {}
@@ -1116,17 +1366,18 @@ function Ops.bagMax(S, id)
   if not Ops.itemStacks(S, id) then
     return Ops.say(S, ("%s has no quantity to max"):format(tostring(id)))
   end
-  if have >= Ops.stackMax(S) then
+  local target = stackTarget(S, id, have)
+  if have >= target then
     return Ops.say(S, ("%s is already at x%d"):format(tostring(id), Ops.stackMax(S)))
   end
-  Bag.add(S.save, id, Ops.stackMax(S) - have, S.data)
-  return Ops.mark(S, ("%s x%d"):format(tostring(id), Ops.stackMax(S)))
+  Bag.add(S.save, id, target - have, S.data)
+  return Ops.mark(S, ("%s x%d"):format(tostring(id), target))
 end
 
 function Ops.bagCanMax(S, id)
   if id ~= nil then
     local have = Gen.ofState(S) == 3 and G3.quantity(S.data, S.save, false, id) or itemQty(S.save.inventory, id)
-    return have > 0 and have < Ops.stackMax(S) and Ops.itemStacks(S, id)
+    return have > 0 and have < stackTarget(S, id, have) and Ops.itemStacks(S, id)
   end
   for _, rowId in ipairs(Bag.order(S.save, S.data)) do
     if Ops.bagCanMax(S, rowId) then return true end
@@ -1142,8 +1393,9 @@ function Ops.bagMaxAll(S)
   local n = 0
   for _, id in ipairs(ids) do
     local have = itemQty(S.save.inventory, id)
-    if have > 0 and have < Ops.stackMax(S) and Ops.itemStacks(S, id) then
-      Bag.add(S.save, id, Ops.stackMax(S) - have, S.data)
+    local target = stackTarget(S, id, have)
+    if have > 0 and have < target and Ops.itemStacks(S, id) then
+      Bag.add(S.save, id, target - have, S.data)
       n = n + 1
     end
   end
@@ -1207,8 +1459,24 @@ end
 
 function Ops.pcOrder(S)
   local ids = {}
-  for id in pairs(Ops.pcItems(S)) do ids[#ids + 1] = id end
+  local gen1 = Gen.ofState(S) == 1
+  for id, n in pairs(Ops.pcItems(S)) do
+    for _ = 1, gen1 and math.max(1, Bag.slotsFor(id, n, S.data)) or 1 do ids[#ids + 1] = id end
+  end
   return itemRows(S, ids, S.pcSort)
+end
+
+function Ops.stackRows(S, pc)
+  local order = pc and Ops.pcOrder(S) or Bag.order(S.save, S.data)
+  local store = pc and Ops.pcItems(S) or S.save.inventory
+  if Gen.ofState(S) == 1 then
+    return Bag.stackRows(store, order, S.data, pc and S.save.pcStacks or S.save.bagStacks)
+  end
+  local rows = {}
+  for i, id in ipairs(order) do
+    rows[i] = { id = id, slot = 1, index = i, count = store[id] }
+  end
+  return rows
 end
 
 function Ops.pcSort(S, mode)
@@ -1267,16 +1535,27 @@ function Ops.addToPc(S, id)
   return Ops.mark(S, ("%s x%d in PC storage"):format(tostring(id), pc[id]))
 end
 
-function Ops.pcAdjust(S, id, delta)
+function Ops.pcAdjust(S, id, delta, slot)
   if Gen.ofState(S) == 3 then return changeG3(S, true, id, math.max(0, G3.quantity(S.data, S.save, true, id) + delta)) end
   if not id then return Ops.say(S, "No PC row selected") end
   local pc = Ops.pcItems(S)
   local cur = itemQty(pc, id)
   if not pc[id] and cur <= 0 then return Ops.say(S, ("%s is not in PC storage"):format(tostring(id))) end
-  if delta > 0 and cur >= slotMax(S, id) then
+  if delta < 0 and splits(S, id) then
+    Bag.pcRemove(S.save, id, -delta, S.data, slot)
+    if not pc[id] then
+      return Ops.mark(S, ("Removed %s from PC storage"):format(tostring(id)))
+    end
+    return Ops.mark(S, ("%s x%d in PC storage"):format(tostring(id), pc[id]))
+  end
+  local split = delta > 0 and splits(S, id)
+  if delta > 0 and cur >= slotMax(S, id) and not split then
     return Ops.say(S, ("%s is already at x%d"):format(tostring(id), slotMax(S, id)))
   end
-  local nextQty = clamp(cur + delta, 0, math.max(cur, slotMax(S, id)))
+  if split and not pcStacksFree(S, id, delta) then
+    return Ops.say(S, ("PC item storage is full (%d stacks)"):format(pcCapacity(S)))
+  end
+  local nextQty = split and cur + delta or clamp(cur + delta, 0, math.max(cur, slotMax(S, id)))
   if nextQty <= 0 then
     pc[id] = nil
     return Ops.mark(S, ("Removed %s from PC storage"):format(tostring(id)))
@@ -1285,19 +1564,24 @@ function Ops.pcAdjust(S, id, delta)
   return Ops.mark(S, ("%s x%d in PC storage"):format(tostring(id), pc[id]))
 end
 
-function Ops.pcDrop(S, id)
+function Ops.pcDrop(S, id, slot)
   if Gen.ofState(S) == 3 then return changeG3(S, true, id, 0) end
   if not id then return Ops.say(S, "No PC row selected") end
   local pc = Ops.pcItems(S)
   local qty = itemQty(pc, id)
-  pc[id] = nil
+  local row = slot and rowCount(S, true, id, slot)
+  if row and row < qty then
+    Bag.pcRemove(S.save, id, row, S.data, slot)
+    return Ops.mark(S, ("Dropped %d %s (%d left in PC storage)"):format(row, tostring(id), qty - row))
+  end
+  Bag.pcRemove(S.save, id, qty, S.data)
   return Ops.mark(S, ("Dropped all %d %s from PC storage"):format(qty, tostring(id)))
 end
 
 function Ops.pcMax(S, id)
   if Gen.ofState(S) == 3 then
     if not id or not Ops.itemStacks(S, id) or G3.quantity(S.data, S.save, true, id) <= 0 then return Ops.say(S, "No stack to max") end
-    return changeG3(S, true, id, 999)
+    return changeG3(S, true, id, g3Max(S, id, true))
   end
   if not id then return Ops.say(S, "No PC row selected") end
   local pc = Ops.pcItems(S)
@@ -1306,22 +1590,23 @@ function Ops.pcMax(S, id)
   if not Ops.itemStacks(S, id) then
     return Ops.say(S, ("%s has no quantity to max"):format(tostring(id)))
   end
-  if cur >= Ops.stackMax(S) then
+  local target = stackTarget(S, id, cur)
+  if cur >= target then
     return Ops.say(S, ("%s is already at x%d"):format(tostring(id), Ops.stackMax(S)))
   end
-  pc[id] = Ops.stackMax(S)
-  return Ops.mark(S, ("%s x%d in PC storage"):format(tostring(id), Ops.stackMax(S)))
+  pc[id] = target
+  return Ops.mark(S, ("%s x%d in PC storage"):format(tostring(id), target))
 end
 
 function Ops.pcCanMax(S, id)
   local pc = Ops.pcItems(S)
   if id ~= nil then
     local have = Gen.ofState(S) == 3 and G3.quantity(S.data, S.save, true, id) or itemQty(pc, id)
-    return have > 0 and have < Ops.stackMax(S) and Ops.itemStacks(S, id)
+    return have > 0 and have < stackTarget(S, id, have) and Ops.itemStacks(S, id)
   end
   for rowId, val in pairs(pc) do
     local qty = itemQty(pc, rowId)
-    if qty > 0 and qty < Ops.stackMax(S) and Ops.itemStacks(S, rowId) then
+    if qty > 0 and qty < stackTarget(S, rowId, qty) and Ops.itemStacks(S, rowId) then
       return true
     end
   end
@@ -1334,8 +1619,9 @@ function Ops.pcMaxAll(S)
   local n = 0
   for id, val in pairs(pc) do
     local qty = itemQty(pc, id)
-    if qty > 0 and qty < Ops.stackMax(S) and Ops.itemStacks(S, id) then
-      pc[id] = Ops.stackMax(S)
+    local target = stackTarget(S, id, qty)
+    if qty > 0 and qty < target and Ops.itemStacks(S, id) then
+      pc[id] = target
       n = n + 1
     end
   end
@@ -1495,7 +1781,7 @@ function Ops.clearTrainers(S)
       S.save.vsSeeker.rematches = {}
     end
     if S.save.trainerRematches then S.save.trainerRematches = {} end
-    if S.save.vars then S.save.vars[0x40AA] = 0 end
+    if S.save.vars and not require("Gen3Flags").rseGame() then S.save.vars[0x40AA] = 0 end
     S.save.defeatedTrainers = {}
     return Ops.mark(S, ("Cleared %d defeated trainers"):format(count))
   end
@@ -1732,7 +2018,13 @@ function Ops.toggleNationalDex(S)
   dex.national = on
   if S.save.dex then S.save.dex.national = on end
   local okF, Flags = pcall(require, "src.core.game3.scripting.flags")
-  if okF and Flags then
+  local game = require("Gen3Flags").rseGame()
+  if okF and Flags and game then
+    local t = Flags.forVersion(game)
+    Flags.setFlag(S.save, nil, t.IDS.FLAG_SYS_NATIONAL_DEX, on)
+    -- pokeemerald/src/event_data.c:66
+    Flags.setVar(S.save, nil, t.VAR_IDS.VAR_NATIONAL_DEX, on and 0x302 or 0)
+  elseif okF and Flags then
     Flags.setFlag(S.save, nil, "FLAG_SYS_NATIONAL_DEX", on)
   else
     S.save.flags = S.save.flags or {}
@@ -1859,6 +2151,16 @@ function Ops.setLastHeal(S)
   return Ops.mark(S, ("lastHeal set to %s (%d,%d)"):format(S.mapId, cell.cx, cell.cy))
 end
 
+function Ops.itemHoldable(S, id)
+  if Gen.ofState(S) == 1 or not (S.data.items and S.data.items[id]) then return false end
+  if Gen.ofState(S) == 3 then
+    local Items = require("src.core.game3.items_data")
+    local n = require("Game3Adapter").itemId(S.data, id)
+    return Items.pocketOf(n) ~= "KEY_ITEMS" and not Items.isHm(n)
+  end
+  return Bag.pocketOf(id, S.data) ~= "KEY_ITEM" and tostring(id):sub(1, 3) ~= "HM_"
+end
+
 function Ops.setHeldItem(S, mon, id)
   if not mon then return false end
   if id == "" or id == nil then
@@ -1873,6 +2175,7 @@ function Ops.setHeldItem(S, mon, id)
   if not def then
     return Ops.say(S, ("%s is not an item"):format(tostring(id)))
   end
+  if not Ops.itemHoldable(S, id) then return Ops.say(S, "This item cannot be held") end
   local was = mon.item or mon.heldItem
   MonOps.setHeldItem(S.data, mon, def.itemId or def.id or id, Gen.ofState(S))
   syncPartyMailHeldItem(S, mon, was, id)
@@ -1901,12 +2204,22 @@ end
 function Ops.setAbility(S, mon, abilitySlot)
   if not mon then return false end
   abilitySlot = (tonumber(abilitySlot) or 0) % 2
+  if Gen.ofState(S) == 3 then
+    local pair=require("src.core.game3.pokemon").abilities(mon.speciesId or mon.species)
+    if abilitySlot==1 and (not pair[2] or pair[2]==0) then return Ops.say(S,"This species has only one ability") end
+  end
   MonOps.setAbility(S.data, mon, abilitySlot, Gen.ofState(S))
   return Ops.mark(S, ("%s ability set to slot %d"):format(mon.species, abilitySlot + 1))
 end
 
 function Ops.setMonGender(S, mon, gender)
   if not mon then return false end
+  if Gen.ofState(S)==3 then
+    local PokemonG3=require("src.core.game3.pokemon")
+    local meta=PokemonG3.speciesMeta(mon.speciesId or mon.species)
+    local ratio=meta and meta.genderRatio
+    if ratio==255 or (ratio==0 and gender~="M") or (ratio==254 and gender~="F") then return Ops.say(S,"This species has a fixed gender") end
+  end
   MonOps.setGender(S.data, mon, gender, Gen.ofState(S))
   return Ops.mark(S, ("%s gender set to %s"):format(mon.species, tostring(gender)))
 end
@@ -1997,4 +2310,95 @@ function Ops.setPlayerGender(S, gender)
   return Ops.mark(S, ("Player gender %s"):format(Gen.setPlayerGender(S.save, gender)))
 end
 
+function Ops.cloneMonToBox(S, mon)
+  if not mon then return Ops.say(S,"Select a Pokemon first") end
+  local boxes=Ops.boxes(S)
+  for offset=0,Ops.boxCount(S)-1 do
+    local b=((S.selectedBox or 1)-1+offset)%Ops.boxCount(S)+1
+    if Ops.boxSize(S,boxes[b])<Ops.boxCapacity(S) then
+      local clone=require("src.mods.Merge").deepCopy(mon)
+      local slot=boxInsert(S,boxes[b],clone)
+      S.selectedBox,S.selectedBoxSlot,S.editingMon=b,slot,clone
+      return Ops.mark(S,"Cloned Pokemon to box "..b.." slot "..slot)
+    end
+  end
+  return Ops.say(S,"All boxes are full")
+end
+
+function Ops.fixMonErrors(S, mon)
+  local was = mon and (mon.item or mon.heldItem)
+  local ok = require("MonActions").fixMon(S, mon)
+  if ok then
+    syncPartyMailHeldItem(S, mon, was, mon.item or mon.heldItem)
+  end
+  return ok
+end
+function Ops.fixAllErrors(S)
+  local before = {}
+  for i, mon in ipairs(S.save.party or {}) do
+    before[i] = mon.item or mon.heldItem
+  end
+  local ok = require("MonActions").fixAll(S)
+  if ok then
+    for i, mon in ipairs(S.save.party or {}) do
+      syncPartyMailHeldItem(S, mon, before[i], mon.item or mon.heldItem)
+    end
+  end
+  return ok
+end
+function Ops.randomizeMon(S, mon)
+  local was = mon and (mon.item or mon.heldItem)
+  local ok = require("MonActions").randomize(S, mon)
+  if ok then
+    syncPartyMailHeldItem(S, mon, was, mon.item or mon.heldItem)
+    syncPartyMailSpecies(S, mon)
+  end
+  return ok
+end
+function Ops.maxMon(S, mon)
+  return require("MonActions").maxMon(S, mon)
+end
+function Ops.maxDvs(S, mon)
+  for _, k in ipairs({ "attack", "defense", "speed", "special" }) do
+    MonOps.setDv(S.data, mon, k, 15, Gen.ofState(S))
+  end
+  return Ops.mark(S, "Maxed DVs")
+end
+function Ops.maxStatExp(S, mon)
+  for _, k in ipairs({ "hp", "attack", "defense", "speed", "special" }) do
+    Ops.setStatExp(S, mon, k, 65535)
+  end
+  return true
+end
+function Ops.itemMax(S, id, pc)
+  if not Ops.itemStacks(S, id) then
+    return 1
+  end
+  return Gen.ofState(S) == 3 and g3Max(S, id, pc) or Ops.stackMax(S)
+end
+
+-- Wrap only mutations. Nested helpers share one snapshot and one undo entry.
+for name, fn in pairs(Ops) do
+  local mutation=type(fn)=="function" and (name:match("^set") or name:match("^clear")
+    or name:match("^toggle") or name:match("^max") or name:match("^addTo")
+    or name:match("^bag[A-Z]") or name:match("^pc[A-Z]") or name:match("^dex[A-Z]"))
+  local extras={partyAdd=true,partyRemove=true,partyMove=true,boxAdd=true,boxAddSpecies=true,
+    deposit=true,withdraw=true,release=true,healMon=true,resetMoves=true,cloneMonToBox=true,addMoney=true,addCoins=true,
+    fixMonErrors=true,fixAllErrors=true,randomizeMon=true}
+  local excluded={pcItems=true,pcOrder=true,pcCanMax=true,pcCanMaxAll=true,bagCanMax=true,
+    bagCanMaxAll=true,dexCounts=true,dexList=true,dexSort=true,clearSelection=true}
+  if (mutation or extras[name]) and not excluded[name] then
+    Ops[name]=function(S,...)
+      if S._historyDepth then return fn(S,...) end
+      local before=require("History").capture(S)
+      local revision=S.revision or 0
+      S._historyDepth=true
+      local ok,result=pcall(fn,S,...)
+      S._historyDepth=nil
+      if not ok then error(result,0) end
+      if (S.revision or 0)~=revision then require("History").record(S,before) end
+      return result
+    end
+  end
+end
 return Ops

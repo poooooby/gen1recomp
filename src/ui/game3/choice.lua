@@ -3,6 +3,7 @@
 local Window = require("src.ui.game3.window")
 local Display = require("src.core.game3.display")
 local RomText = require("src.core.game3.rom_text")
+local SE = require("src.core.game3.se_ids")
 
 local Choice = {}
 
@@ -85,7 +86,7 @@ function Choice.move(dy, dx)
     if delta == 0 and dx then delta = dx end
     if delta ~= 0 then
       Choice.cursor = ((Choice.cursor - 1 + delta) % n) + 1
-      pcall(function() require("src.core.game3.audio").playSe(5) end)
+      pcall(function() require("src.core.game3.audio").playSe(SE.SE_SELECT) end)
     end
     return
   end
@@ -109,13 +110,13 @@ function Choice.move(dy, dx)
   end
   if target + 1 ~= Choice.cursor then
     Choice.cursor = target + 1
-    pcall(function() require("src.core.game3.audio").playSe(5) end)
+    pcall(function() require("src.core.game3.audio").playSe(SE.SE_SELECT) end)
   end
 end
 
 function Choice.confirm()
   if not Choice.active then return end
-  pcall(function() require("src.core.game3.audio").playSe(5) end)
+  pcall(function() require("src.core.game3.audio").playSe(SE.SE_SELECT) end)
   local cb = Choice.done
   local kind = Choice.kind
   local cursor = Choice.cursor
@@ -138,7 +139,7 @@ function Choice.cancel()
   if Choice.ignoreBPress then
     return
   end
-  pcall(function() require("src.core.game3.audio").playSe(5) end) -- pokefirered/src/menu_helpers.c:57
+  pcall(function() require("src.core.game3.audio").playSe(SE.SE_SELECT) end) -- pokefirered/src/menu_helpers.c:57
   local cb = Choice.done
   local kind = Choice.kind
   Choice.active = false
@@ -165,6 +166,16 @@ function Choice.autoPick(indexOrYes)
   Choice.confirm()
 end
 
+-- pokefirered/src/menu.c:531
+function Choice.drawYesNo(L, Tp, cursor, labels)
+  Window.stdFrame(Window.template(L, Tp, 6, 4))
+  for i, lab in ipairs(labels) do
+    local rowPx = Tp * 8 + 2 + (i - 1) * 14
+    if i == cursor then Window.cursorPx(L * 8, rowPx) end
+    Window.printPx(lab, L * 8 + 8, rowPx)
+  end
+end
+
 function Choice.draw()
   if not Choice.active or not Choice.options then return end
   if Choice.style == "battle" and Choice.kind == "yesno" then
@@ -186,14 +197,7 @@ function Choice.draw()
   end
 
   if Choice.kind == "yesno" then
-    -- pokefirered/src/menu.c:531
-    local L, Tp = Choice.left, Choice.top
-    Window.stdFrame(Window.template(L, Tp, 6, 4))
-    for i, lab in ipairs(Choice.options) do
-      local rowPx = Tp * 8 + 2 + (i - 1) * 14
-      if i == Choice.cursor then Window.cursorPx(L * 8, rowPx) end
-      Window.printPx(lab, L * 8 + 8, rowPx)
-    end
+    Choice.drawYesNo(Choice.left, Choice.top, Choice.cursor, Choice.options)
     return
   end
 

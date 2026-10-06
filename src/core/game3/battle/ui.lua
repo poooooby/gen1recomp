@@ -25,11 +25,13 @@ local Oak = require("src.core.game3.battle.oak_advice")
 local Strings = require("src.core.Strings")
 local RomText = require("src.core.game3.rom_text")
 local BattleText = require("src.core.game3.battle.battle_text")
+local SummaryChrome = require("src.ui.game3.summary_chrome")
 local Anim = require("src.core.game3.battle.anim")
 local PicCoords = require("src.core.game3.battle.pic_coords")
 local TrainerPic = require("src.core.game3.trainer_pic")
 local Audio = require("src.core.game3.audio")
 local SE = require("src.core.game3.se_ids")
+local LevelUpStreaks = require("src.core.game3.battle.level_up_streaks")
 local bit = require("bit")
 
 local Ui = {}
@@ -125,12 +127,14 @@ local function is_double(st)
 end
 
 local function battler_sprite_center(side, species, base, form, ghost)
+  local ui = require("src.core.game3.profile").forSession().ui
+  local rs = ui and ui.battleSpriteLayout == "rs"
   if type(side) == "number" then
     local id = side
     side = (id % 2 == 0) and "player" or "enemy"
     local _, st = live_battler(id)
     base = base or (PicCoords and PicCoords.battlerCoords and PicCoords.battlerCoords(is_double(st), id))
-    if is_double(st) and side == "player" and PicCoords and species then
+    if not rs and is_double(st) and side == "player" and PicCoords and species then
       local sp = tonumber(species) or 0
       local yo = (PicCoords.back and PicCoords.back[sp]) or 0
       if sp == SPECIES_CASTFORM then yo = CASTFORM_BACK_Y[form or 0] or 0 end
@@ -139,7 +143,7 @@ local function battler_sprite_center(side, species, base, form, ghost)
       return base.x, y - 4
     end
   end
-  local cx, cy = base.x, (side == "player") and (base.y - 4) or base.y
+  local cx, cy = base.x, (side == "player" and not rs) and (base.y - 4) or base.y
   if not PicCoords or not species then return cx, cy end
   local sp = tonumber(species) or 0
   if ghost == nil or (form == nil and sp == SPECIES_CASTFORM) then
@@ -150,7 +154,8 @@ local function battler_sprite_center(side, species, base, form, ghost)
   if side == "player" then
     local yo = (PicCoords.back and PicCoords.back[sp]) or 0
     if sp == SPECIES_CASTFORM then yo = CASTFORM_BACK_Y[form or 0] or 0 end
-    cy = base.y + yo + 4 -- shifted up 4px
+    -- pokeruby/src/rom_8077ABC.c:305
+    cy = base.y + yo + (rs and 0 or 4)
   elseif ghost then
     -- pokefirered/src/battle_anim_mons.c:297
     cy = base.y
@@ -202,7 +207,9 @@ function Ui.battlerPic(side, battler, species)
 end
 
 function Ui.reset(opts)
+  LevelUpStreaks.reset()
   opts = opts or {}
+  Ui._caughtDexScene = nil
   Ui._timed = nil
   Ui._linger = false
   Ui._queue = {}
@@ -223,6 +230,7 @@ function Ui.reset(opts)
   Ui._actionCursor = {}
   Ui._moveCursor = {}
   Ui._moveCursorMon = {}
+  Ui._swap = nil
   Ui._target = nil
   Ui._bounce = { hb = {}, mon = {} }
   Ui._preview = nil
@@ -235,7 +243,7 @@ function Ui.reset(opts)
   Ui._oldManSubstate = nil
   if Message and Message.isHeld and Message.isHeld() then Message.close() end
   if not Ui._headless then
-    local okC, errC = pcall(BattleChrome.install, nil)
+    local okC, errC = pcall(BattleChrome.ensureInstalled)
     if not okC and not chromeInstallWarned then
       chromeInstallWarned = true
       print("[game3/battle.ui] BattleChrome.install failed: " .. tostring(errC))
@@ -459,12 +467,39 @@ local function confirm_link_forfeit(act)
   end)
 end
 
+local function is_frontier_forfeit(st)
+  local Kinds = require("src.core.game3.battle.kinds")
+  return st and not st.wild and (Kinds.has(st, "frontier") or Kinds.has(st, "trainerHill"))
+end
+
 local function open_battle_bag()
   if Ui._st and Ui._st.link then return Ui.refuseItems() end
   local BagMenu = require("src.ui.game3.bag_menu")
   local Runtime = package.loaded["src.core.game3.runtime"]
   local session = Ui._session
     or (Runtime and Runtime.getSession and Runtime.getSession())
+  local Pyramid = package.loaded["src.core.game3.rse.frontier.pyramid"]
+  if not Pyramid then
+    local okP, loaded = pcall(require, "src.core.game3.rse.frontier.pyramid")
+    if okP then Pyramid = loaded end
+  end
+  if session and Pyramid and Pyramid.inPyramid and Pyramid.inPyramid(session) then
+    -- pokeemerald/src/battle_pyramid_bag.c:379
+    Ui._mode = "bag"
+    require("src.ui.game3.rse.pyramid_bag").show({
+      session = session,
+      location = "battle",
+      onUse = function(itemId)
+        Ui._pendingCommand = { kind = "bag", user = "player", itemId = itemId, usedInMenu = true }
+        if is_double() then Ui._pendingCommand.battler = Ui._active or 0 end
+        Ui._mode = "none"
+      end,
+      onClose = function()
+        if Ui._mode == "bag" then restore_action_menu() end
+      end,
+    })
+    return
+  end
   local bag = session and session.bag
   if not bag then
     Ui.push(Strings("The BAG is empty."))
@@ -502,6 +537,7 @@ local function open_battle_bag()
     end,
   })
 end
+Ui.openBattleBag = open_battle_bag
 
 function Ui.isShowing()
   return Ui._showing or Ui.busy() or (Message and Message.isOpen and Message.isOpen())
@@ -686,6 +722,17 @@ function Ui.openMenu(battlerId, opts)
     Ui._menuIndex = 1
   end
   Ui._pendingCommand = nil
+  Ui._wally = nil
+  local Wally = require("src.core.game3.battle.tutorial_wally")
+  if Wally.active(Ui._st) then
+    -- pokeemerald/src/battle_controller_wally.c:1203
+    if Ui._headless then
+      Ui._pendingCommand = Wally.take(Ui._st)
+      Ui._mode = "none"
+    else
+      Ui._wally = { timer = 0, sub = 0 }
+    end
+  end
   if Ui._st and Ui._st.oldManTutorial then
     Ui._oldManTimer = 0
     Ui._oldManSubstate = 0
@@ -921,8 +968,46 @@ local function move_count(mon)
   return n
 end
 
+-- pokeemerald/src/battle_controller_player.c:599
+local function move_swap_input(input, st, battler, id)
+  local MoveSwap = require("src.core.game3.battle.move_swap")
+  local sw = Ui._swap
+  local cur = (Ui._moveIndex or 1) - 1
+  if not sw then
+    if input:wasPressed("select") and MoveSwap.canStart(st, battler) then
+      Ui._swap = { cursor = MoveSwap.initialCursor(cur) }
+      return true
+    end
+    return false
+  end
+  if input:wasPressed("a") or input:wasPressed("select") then
+    play_select()
+    if sw.cursor ~= cur then MoveSwap.apply(battler, cur + 1, sw.cursor + 1) end
+    Ui._moveIndex = sw.cursor + 1
+    if id then Ui._moveCursor[id] = Ui._moveIndex end
+    Ui._swap = nil
+  elseif input:wasPressed("b") then
+    play_select()
+    Ui._swap = nil
+  else
+    local n = MoveSwap.moveCount(battler and battler.mon)
+    for _, dir in ipairs({ "left", "right", "up", "down" }) do
+      if input:wasPressed(dir) then
+        local nc = MoveSwap.step(sw.cursor, dir, n)
+        if nc ~= sw.cursor then
+          sw.cursor = nc
+          play_select()
+        end
+        break
+      end
+    end
+  end
+  return true
+end
+
 -- pokefirered/src/battle_main.c:2380
 local function open_move_menu()
+  Ui._swap = nil
   if is_double() then
     local id = Ui._active or 0
     local battler = active_battler()
@@ -952,6 +1037,7 @@ local function open_move_menu()
   Ui._moveIndex = idx
   Ui._mode = "moves"
 end
+Ui._openMoveMenu = open_move_menu
 
 local MT = { SELECTED = 0, DEPENDS = 1, USER_OR_SELECTED = 2, RANDOM = 4, BOTH = 8, USER = 16, FOES_AND_ALLY = 32, OPPONENTS_FIELD = 64 }
 local MOVE_CURSE = 174
@@ -1250,6 +1336,9 @@ function Ui.tick()
         end
       end
     end
+    if Ui._wally and Ui._st and (m == "menu" or m == "moves") and not Ui._headless then
+      require("src.core.game3.battle.tutorial_wally").menuStep(Ui, Ui._st, play_select)
+    end
   elseif m ~= "bag" and m ~= "party" then
     end_all_bounces()
   end
@@ -1421,8 +1510,10 @@ local function handle_double_input(input)
           Ui.push(why)
           -- pokefirered/src/battle_controller_oak_old_man.c:1782
           Oak.say(st, "noRunning")
-        elseif st and st.link then
-          confirm_link_forfeit(Commands.playerAction(st, Ui._menuIndex, nil, id))
+        elseif st and (st.link or is_frontier_forfeit(st)) then
+          local act = Commands.playerAction(st, Ui._menuIndex, nil, id)
+          if is_frontier_forfeit(st) then act.forfeit = true end
+          confirm_link_forfeit(act)
         else
           Ui._pendingCommand = Commands.playerAction(st, Ui._menuIndex, nil, id)
           Ui._mode = "none"
@@ -1473,6 +1564,7 @@ local function handle_double_input(input)
     return true
   elseif Ui._mode == "moves" then
     local b = active_battler(st)
+    if move_swap_input(input, st, b, id) then return true end
     local n = move_count(b and b.mon)
     local c = (Ui._moveIndex or 1) - 1
     local nc = c
@@ -1543,6 +1635,7 @@ function Ui.handleInput(input)
     -- Old Man tutorial script controls the actions automatically
     return true
   end
+  if Ui._wally then return true end
   if is_double() then return handle_double_input(input) end
   if Ui._mode == "menu" then
     local idx, moved = grid_nav(Ui._menuIndex, input, 4)
@@ -1555,7 +1648,18 @@ function Ui.handleInput(input)
       play_select()
       if Ui._st and Ui._st.safari then
         -- pokefirered/src/battle_controller_safari.c:162
-        Ui._pendingCommand = Commands.playerAction(Ui._st, Ui._menuIndex, nil)
+        local act = Commands.playerAction(Ui._st, Ui._menuIndex, nil)
+        -- pokeruby/src/battle_main.c:4362
+        local Runtime = package.loaded["src.core.game3.runtime"]
+        local session = Ui._session or (Runtime and Runtime.getSession and Runtime.getSession())
+        if act.action == "ball" and require("src.ui.game3.bag_menu").partyAndStorageFull(session) then
+          Ui._selCmd = nil
+          Ui._selReturn = "menu"
+          Ui._mode = "selmsg"
+          Ui.push(BattleText.get("STRINGID_BOXISFULL"))
+          return true
+        end
+        Ui._pendingCommand = act
         Ui._mode = "none"
         return true
       end
@@ -1592,8 +1696,10 @@ function Ui.handleInput(input)
           Ui.push(why)
           -- pokefirered/src/battle_controller_oak_old_man.c:1782
           Oak.say(Ui._st, "noRunning")
-        elseif Ui._st and Ui._st.link then
-          confirm_link_forfeit(Commands.playerAction(Ui._st, Ui._menuIndex, nil))
+        elseif Ui._st and (Ui._st.link or is_frontier_forfeit(Ui._st)) then
+          local act = Commands.playerAction(Ui._st, Ui._menuIndex, nil)
+          if is_frontier_forfeit(Ui._st) then act.forfeit = true end
+          confirm_link_forfeit(act)
         else
           Ui._pendingCommand = Commands.playerAction(Ui._st, Ui._menuIndex, nil)
           Ui._mode = "none"
@@ -1607,6 +1713,7 @@ function Ui.handleInput(input)
     -- Input owned by BagMenu / PartyMenu via Battle.update
     return true
   elseif Ui._mode == "moves" then
+    if move_swap_input(input, Ui._st, Ui._st and Ui._st.player, nil) then return true end
     -- pokefirered/src/battle_controller_player.c:526
     local idx, moved = grid_nav(Ui._moveIndex, input, move_count(Ui._st and Ui._st.player and Ui._st.player.mon))
     if moved then
@@ -1642,6 +1749,45 @@ local function draw_menu_text(text, x, y, opts)
     small = opts.small ~= nil and opts.small or false,
     colors = opts.colors or FrlgFont.COLOR.NORMAL,
   })
+end
+
+local PP_STATE_TO_COLOR_INDEX = {
+  [0] = 1,
+  [1] = 2,
+  [2] = 3,
+  [3] = 0,
+}
+
+function Ui.ppColorState(currentPp, maxPp)
+  currentPp = tonumber(currentPp) or 0
+  maxPp = tonumber(maxPp) or 0
+  if maxPp == currentPp then return 3 end
+  if maxPp <= 2 then
+    if currentPp > 1 then return 3 end
+    return 2 - currentPp
+  elseif maxPp <= 7 then
+    if currentPp > 2 then return 3 end
+    return 2 - currentPp
+  end
+  if currentPp == 0 then return 2 end
+  if currentPp <= math.floor(maxPp / 4) then return 1 end
+  if currentPp > math.floor(maxPp / 2) then return 3 end
+  return 0
+end
+
+function Ui.ppColorIndex(currentPp, maxPp)
+  return PP_STATE_TO_COLOR_INDEX[Ui.ppColorState(currentPp, maxPp)]
+end
+
+local function pp_text_colors(currentPp, maxPp)
+  local manifest = SummaryChrome.manifest and SummaryChrome.manifest()
+  local rows = manifest and manifest.moveTextColors
+  local row = rows and rows[Ui.ppColorIndex(currentPp, maxPp)]
+  if not row then return FrlgFont.COLOR.NORMAL end
+  local function rgb(c)
+    return { (c[1] or 0) / 255, (c[2] or 0) / 255, (c[3] or 0) / 255, 1 }
+  end
+  return { fg = rgb(row.fg), shadow = rgb(row.shadow), bg = FrlgFont.STDPAL[0] }
 end
 
 local function draw_prompt_text(text, x, y)
@@ -1823,6 +1969,30 @@ end
 
 --- Draw mon pic at GetBattlerSpriteFinal_Y center (64×64 → TL = center−32).
 -- Applies Anim present offsets / alpha / visibility / z (Dig/Fly hide).
+function Ui.levelUpSpriteSnapshot(st, id)
+  if not st or (id ~= 0 and id ~= 2) or (st.absent and st.absent[id]) then return nil end
+  local b = id == 0 and st.player or (st.battlers and st.battlers[id])
+  if not b then return nil end
+  local key = st.double and id or "player"
+  local pres = Anim.present(key)
+  if pres and (pres.visible == false or pres.blinkHidden or pres.battlerInvisible or pres.invisible) then return nil end
+  if st.double and Ui.targetHidden(id) then return nil end
+  local shown = Anim.shownBattler(key, b) or b
+  local sp = shown.species or (shown.mon and (shown.mon.species or shown.mon.speciesId))
+  if shown.expTransform then
+    sp = pres and pres.transformSpecies or (not (pres and pres.pendingTransform) and shown.expTransform.species) or sp
+  end
+  local base = st.double and ((Anim.coords and Anim.coords(st, id)) or PicCoords.battlerCoords(true, id)) or PLAYER_MON
+  local form = tonumber(sp) == SPECIES_CASTFORM and castform_form(key, shown) or 0
+  local x, y = battler_sprite_center(st.double and id or "player", sp, base, form, false)
+  if pres and pres.substitute and Anim.substituteImage(key) then
+    x, y = base.x, pres.substituteY or Anim.substituteY(key)
+  end
+  x = x + (pres and pres.ox or 0)
+  y = y + (pres and pres.oy or 0) + Ui.bounceOffset("mon", id)
+  return {x = x, y = y}
+end
+
 local function draw_mon_sprite(battler, base, back, id)
   if not battler then return end
   local side = back and "player" or "enemy"
@@ -1871,6 +2041,10 @@ local function draw_mon_sprite(battler, base, back, id)
   end
   if not entry then
     entry = Pokemon.frontPic and Pokemon.frontPic(picSp, form, shiny, personality)
+  end
+  if not back and not ghost and not dollImg and pres and (tonumber(pres.monFrame) or 0) ~= 0 then
+    -- pokeemerald/src/sprite.c:917
+    entry = require("src.core.game3.mon_anim").framePic(picSp, pres.monFrame, shiny) or entry
   end
   if entry and entry.image then
     local a = (pres and pres.alpha) or 1
@@ -1974,6 +2148,9 @@ local function menu_labels(key)
   for _, seg in ipairs(RomText.ir(key)) do
     if seg.t == "text" then
       buf[#buf + 1] = seg.s
+    elseif seg.t == "tag" and seg.tag then
+      -- pokeemerald/src/battle_message.c:1276
+      buf[#buf + 1] = seg.tag
     elseif seg.t == "nl" or (seg.t == "ext" and seg.cmd == 19) then
       flush()
     end
@@ -1984,7 +2161,8 @@ local function menu_labels(key)
 end
 
 local function action_prompt(st, ab)
-  local mode = (st and st.safari and "safari") or (st and st.oldManTutorial and "oldman") or "pkmn"
+  local mode = (st and st.safari and "safari") or (st and st.oldManTutorial and "oldman")
+    or (st and st.kinds and st.kinds.tutorial == "wally" and "wally") or "pkmn"
   local mon = ab and ab.mon
   local cached = Ui._promptFor
   if cached and cached.st == st and cached.mode == mode and cached.mon == mon and Ui._promptText then
@@ -1993,10 +2171,14 @@ local function action_prompt(st, ab)
   local text
   if mode == "safari" then
     -- pokefirered/src/battle_controller_safari.c:446
-    text = BattleText.get("gText_WhatWillPlayerThrow", { playerName = st.playerName })
+    text = BattleText.get(require("src.core.game3.battle.profile").of(st).strings.safariPrompt,
+      { playerName = st.playerName })
   elseif mode == "oldman" then
     -- pokefirered/src/battle_controller_oak_old_man.c:1825
     text = BattleText.get("gText_WhatWillOldManDo")
+  elseif mode == "wally" then
+    -- pokeemerald/src/battle_controller_wally.c:1214
+    text = BattleText.get("gText_WhatWillWallyDo")
   else
     -- pokefirered/src/battle_controller_player.c:2422
     text = BattleText.get("gText_WhatWillPkmnDo", { active = ab, trainer = st and not st.wild })
@@ -2006,7 +2188,199 @@ local function action_prompt(st, ab)
   return text
 end
 
+local function battle_font()
+  local P = require("src.core.game3.profile").forSession(Ui._session)
+  return require(P.font.module)
+end
+
+local function is_rs_battle()
+  local P = require("src.core.game3.profile").forSession(Ui._session)
+  return P.font.nativeLayout == "rs"
+end
+
+local function c5to8(x)
+  return (x * 8 + math.floor(x / 4)) / 255
+end
+
+local function bgr555_rgba(v)
+  v = tonumber(v) or 0
+  return { c5to8(v % 32), c5to8(math.floor(v / 32) % 32), c5to8(math.floor(v / 1024) % 32), 1 }
+end
+
+-- pokeemerald/src/battle_bg.c:748
+local function rse_window_colors(fgIdx, shadowIdx)
+  local pal = BattleChrome.manifest().windowTextPal or {}
+  return {
+    fg = bgr555_rgba(pal[(fgIdx or 13) + 1]),
+    shadow = bgr555_rgba(pal[(shadowIdx or 15) + 1]),
+    bg = { 0, 0, 0, 0 },
+  }
+end
+
+-- The default (13, 15) window colours, rebuilt only when the manifest's
+-- palette table changes.  Callers must not modify the returned table
+-- (rse_pp_colors, which does, builds its own with rse_window_colors).
+local _defaultWinColors, _defaultWinPal = nil, nil
+local function rse_default_colors()
+  local pal = BattleChrome.manifest().windowTextPal or nil
+  if not _defaultWinColors or pal ~= _defaultWinPal then
+    _defaultWinColors = rse_window_colors()
+    _defaultWinPal = pal
+  end
+  return _defaultWinColors
+end
+
+-- pokeemerald/src/battle_message.c:3033
+local function rse_pp_colors(pp, maxPp)
+  local pp2 = BattleChrome.manifest().ppTextPal or {}
+  local state = Ui.ppColorState(pp, maxPp)
+  local c = rse_window_colors(13, 15)
+  c.fg = bgr555_rgba(pp2[state * 2 + 1])
+  c.shadow = bgr555_rgba(pp2[state * 2 + 2])
+  return c
+end
+
+local function rse_text(win, text, dx, opts)
+  local x, y, _, narrow = BattleChrome.textOrigin(win)
+  opts = opts or {}
+  local F = battle_font()
+  local useNarrow = opts.narrow == nil and narrow or opts.narrow
+  F.draw(tostring(text or ""), x + (dx or 0), y, {
+    font = useNarrow and "narrow" or nil,
+    colors = opts.colors or rse_default_colors(),
+  })
+end
+
+local function rs_menu_colors()
+  return { fg = bgr555_rgba(0x2529), shadow = bgr555_rgba(0x675a), bg = { 0, 0, 0, 0 } }
+end
+
+-- pokeruby/src/battle_controller_player.c:2603
+local function draw_action_menu_rs(st)
+  local ab = st and (is_double(st) and active_battler(st) or st.player)
+  local labels = menu_labels((st and st.safari) and "gText_SafariZoneMenu" or "gText_BattleMenu")
+  local F, colors = battle_font(), rs_menu_colors()
+  F.draw(tostring(action_prompt(st, ab) or ""), 16, 120, { colors = BattleChrome.textboxColors(1, 8) })
+  local c = Ui._menuIndex - 1
+  require("src.ui.game3.rs.menu_cursor").draw(144 + 46 * (c % 2), 120 + 16 * math.floor(c / 2), 42)
+  for i = 1, 4 do
+    local cc, rr = (i - 1) % 2, math.floor((i - 1) / 2)
+    F.draw(tostring(labels[i] or ""), 144 + 46 * cc, 120 + 16 * rr, { colors = colors })
+  end
+end
+
+-- pokeemerald/src/battle_controller_player.c:1530
+local function draw_action_menu_rse(st)
+  local W = BattleChrome.WIN
+  local ab = st and (is_double(st) and active_battler(st) or st.player)
+  local labels = menu_labels((st and st.safari) and "gText_SafariZoneMenu" or "gText_BattleMenu")
+  local px, py = BattleChrome.textOrigin(W.ACTION_PROMPT)
+  battle_font().draw(tostring(action_prompt(st, ab) or ""), px, py, { colors = BattleChrome.textboxColors(1, 6) })
+  local mx, my = BattleChrome.textOrigin(W.ACTION_MENU)
+  local c = Ui._menuIndex - 1
+  local col, row = c % 2, math.floor(c / 2)
+  Window.cursorPx(8 * (7 * col + 16), my + 16 * row, { colors = rse_default_colors() })
+  for i = 1, 4 do
+    local cc, rr = (i - 1) % 2, math.floor((i - 1) / 2)
+    battle_font().draw(tostring(labels[i] or ""), mx + 56 * cc, my + 16 * rr, { colors = rse_default_colors() })
+  end
+end
+
+local function swap_cursor_colors(variant, base)
+  local clear = { 0, 0, 0, 0 }
+  if variant == 27 then return { fg = base.fg, shadow = clear, bg = base.bg } end
+  return { fg = base.shadow, shadow = clear, bg = base.bg }
+end
+
+-- pokeemerald/src/battle_controller_player.c:608
+local function draw_move_cursors(pos_of, base)
+  local cur = Ui._moveIndex - 1
+  local sw = Ui._swap
+  local p = pos_of(cur)
+  if not sw or sw.cursor == cur then
+    Window.cursorPx(p[1], p[2], { colors = base })
+    return
+  end
+  Window.cursorPx(p[1], p[2], { colors = swap_cursor_colors(29, base) })
+  local q = pos_of(sw.cursor)
+  Window.cursorPx(q[1], q[2], { colors = swap_cursor_colors(27, base) })
+end
+
+-- pokeruby/src/battle_controller_player.c:1580
+local function draw_move_menu_rs(st)
+  local ab = st and (is_double(st) and active_battler(st) or st.player)
+  local mon = ab and ab.mon
+  local F, colors = battle_font(), rs_menu_colors()
+  local cursor = Ui._swap and Ui._swap.cursor or Ui._moveIndex - 1
+  require("src.ui.game3.rs.menu_cursor").draw(8 + 80 * (cursor % 2), 120 + 16 * math.floor(cursor / 2), 72)
+  for i = 1, 4 do
+    local mv = mon and mon.moves and mon.moves[i]
+    local label = mv and mv ~= 0 and mv ~= "" and Moves.displayName(mv) or "-"
+    local labelColors = colors
+    -- pokeruby/src/battle_controller_player.c:597
+    if Ui._swap and i == Ui._moveIndex then
+      labelColors = { fg = bgr555_rgba(0x7fe0), shadow = colors.shadow, bg = colors.bg }
+    end
+    F.draw(label, 8 + 80 * ((i - 1) % 2), 120 + 16 * math.floor((i - 1) / 2), { colors = labelColors })
+  end
+  if Ui._swap then
+    F.draw(RomText.plain("gText_BattleSwitchWhich"), 184, 120, { colors = colors })
+    return
+  end
+  local slot = Ui._moveIndex
+  local mv = mon and mon.moves and mon.moves[slot]
+  if mv and mv ~= 0 and mv ~= "" then
+    local def = Moves.get(mv)
+    local pp = mon.pp and mon.pp[slot] or 0
+    local maxPp = mon.maxPp and mon.maxPp[slot] or (def and def.pp) or pp
+    F.draw(RomText.plain("gText_MoveInterfacePP"), 184, 120, { colors = colors })
+    F.draw(string.char(0xfc, 0x11, 2, 0xfc, 0x14, 6) .. string.format("%2d/%2d", pp, maxPp),
+      200, 120, { colors = colors })
+    F.draw(Types.name(def.type), 184, 136, { colors = colors })
+  end
+end
+
+-- pokeemerald/src/battle_controller_player.c:1456
+local function draw_move_menu_rse(st)
+  local W = BattleChrome.WIN
+  local ab = st and (is_double(st) and active_battler(st) or st.player)
+  local mon = ab and ab.mon
+  local _, cy = BattleChrome.textOrigin(W.MOVE_NAME_1)
+  draw_move_cursors(function(c)
+    return { 8 * (9 * (c % 2) + 1), cy + 16 * math.floor(c / 2) }
+  end, rse_default_colors())
+  for i = 1, 4 do
+    local mv = mon and mon.moves and mon.moves[i]
+    local label = "-"
+    if mv and mv ~= 0 and mv ~= "" then label = Moves.displayName(mv) end
+    rse_text(W.MOVE_NAME_1 + i - 1, label)
+  end
+  if Ui._swap then
+    rse_text(W.SWITCH_PROMPT, RomText.plain("gText_BattleSwitchWhich"))
+    return
+  end
+  local slot = Ui._moveIndex
+  local mv = mon and mon.moves and mon.moves[slot]
+  if mv and mv ~= 0 and mv ~= "" then
+    local def = Moves.get(mv)
+    local pp = mon.pp and mon.pp[slot] or 0
+    local maxPp = mon.maxPp and mon.maxPp[slot] or (def and def.pp) or pp
+    -- pokeemerald/src/battle_controller_player.c:1473
+    rse_text(W.PP, RomText.plain("gText_MoveInterfacePP"), 0, { colors = rse_pp_colors(pp, maxPp) })
+    -- pokeemerald/src/battle_controller_player.c:1479
+    rse_text(W.PP_REMAINING, string.format("%2d/%2d", pp, maxPp), 0, { colors = rse_pp_colors(pp, maxPp) })
+    -- pokeemerald/src/battle_controller_player.c:1496
+    local typeLabel = RomText.plain("gText_MoveInterfaceType")
+    rse_text(W.MOVE_TYPE, typeLabel)
+    local F = battle_font()
+    local tw = F.measure(typeLabel, { font = "narrow" })
+    rse_text(W.MOVE_TYPE, Types.name(def.type), tw, { narrow = false })
+  end
+end
+
 local function draw_action_menu(st)
+  if is_rs_battle() then return draw_action_menu_rs(st) end
+  if BattleChrome.isRse() then return draw_action_menu_rse(st) end
   -- B_WIN_ACTION_PROMPT @ (1,15) after scroll → px (8,120); printer (2,2) → (10,122)
   -- B_WIN_ACTION_MENU @ (17,15) → (136,120); printer (0,2) → (136,122)
   -- ActionSelectionCreateCursorAt: tile (16+7*col, 35+row) → after scroll (128,120);
@@ -2015,13 +2389,13 @@ local function draw_action_menu(st)
   local labels = menu_labels((st and st.safari) and "gText_SafariZoneMenu" or "gText_BattleMenu")
   draw_prompt_text(action_prompt(st, ab), 10, 122)
   local positions = {
-    { 136, 122 }, { 184, 122 },
-    { 136, 138 }, { 184, 138 },
+    { 136, 122 }, { 192, 122 },
+    { 136, 138 }, { 192, 138 },
   }
   local c = Ui._menuIndex - 1
   local cursorPos = {
-    { 128, 122 }, { 176, 122 },
-    { 128, 138 }, { 176, 138 },
+    { 128, 122 }, { 184, 122 },
+    { 128, 138 }, { 184, 138 },
   }
   local cp = cursorPos[c + 1] or cursorPos[1]
   Window.cursorPx(cp[1], cp[2], { colors = FrlgFont.COLOR.NORMAL })
@@ -2031,6 +2405,8 @@ local function draw_action_menu(st)
 end
 
 local function draw_move_menu(st)
+  if is_rs_battle() then return draw_move_menu_rs(st) end
+  if BattleChrome.isRse() then return draw_move_menu_rse(st) end
   local ab = st and (is_double(st) and active_battler(st) or st.player)
   local mon = ab and ab.mon
   local positions = {
@@ -2041,9 +2417,7 @@ local function draw_move_menu(st)
     { 8, 122 }, { 80, 122 },
     { 8, 138 }, { 80, 138 },
   }
-  local c = Ui._moveIndex - 1
-  local cp = cursorPos[c + 1] or cursorPos[1]
-  Window.cursorPx(cp[1], cp[2], { colors = FrlgFont.COLOR.NORMAL })
+  draw_move_cursors(function(c) return cursorPos[c + 1] or cursorPos[1] end, FrlgFont.COLOR.NORMAL)
   for i = 1, 4 do
     local mv = mon and mon.moves and mon.moves[i]
     -- pokefirered/src/data/text/move_names.h:2
@@ -2053,16 +2427,23 @@ local function draw_move_menu(st)
     end
     draw_menu_text(label, positions[i][1], positions[i][2], { small = true, colors = FrlgFont.COLOR.NORMAL })
   end
+  if Ui._swap then
+    draw_menu_text(RomText.plain("gText_BattleSwitchWhich"), 168, 122,
+      { small = false, colors = FrlgFont.COLOR.NORMAL })
+    return
+  end
   local slot = Ui._moveIndex
   local mv = mon and mon.moves and mon.moves[slot]
   if mv and mv ~= 0 and mv ~= "" then
     local def = Moves.get(mv)
     local pp = mon.pp and mon.pp[slot] or 0
     local maxPp = mon.maxPp and mon.maxPp[slot] or (def and def.pp) or pp
+    local ppColors = pp_text_colors(pp, maxPp)
     -- pokefirered/src/battle_controller_player.c:1387
-    draw_menu_text(RomText.plain("gText_MoveInterfacePP"), 168, 122, { small = true, colors = FrlgFont.COLOR.NORMAL })
+    draw_menu_text(RomText.plain("gText_MoveInterfacePP"), 168, 122,
+      { small = true, colors = FrlgFont.COLOR.NORMAL })
     -- pokefirered/src/battle_controller_player.c:1402
-    draw_menu_text(string.format("%2d/%2d", pp, maxPp), 202, 122, { small = false, colors = FrlgFont.COLOR.NORMAL })
+    draw_menu_text(string.format("%2d/%2d", pp, maxPp), 202, 122, { small = false, colors = ppColors })
     -- pokefirered/src/battle_controller_player.c:1413
     draw_menu_text(RomText.plain("gText_MoveInterfaceType") .. Types.name(def.type), 168, 138,
       { small = true, colors = FrlgFont.COLOR.NORMAL })
@@ -2270,10 +2651,54 @@ local function draw_party_bars(stage)
   end
 end
 
+-- pokeemerald/src/battle_script_commands.c:10131
+function Ui.beginCaughtDexScene(caught)
+  local Pal = require("src.core.game3.pal_fade")
+  caught.pal = Pal.new()
+  -- pokefirered/src/battle_script_commands.c:9709
+  caught.pal:beginFade(caught.family == "frlg" and 0x1FFFF or Pal.BG, 0, 16, 0, Pal.BLACK)
+  Ui._caughtDexScene = caught
+end
+
+-- pokeemerald/src/pokedex.c:4079
+function Ui.updateCaughtDexScene()
+  local c = Ui._caughtDexScene
+  if not c then return true end
+  local spr = c.sprite
+  local centerY = c.family == "frlg" and 64 or 80
+  if spr.x < 120 then spr.x = math.min(120, spr.x + 2) end
+  if spr.x > 120 then spr.x = math.max(120, spr.x - 2) end
+  if spr.y < centerY then spr.y = math.min(centerY, spr.y + 1) end
+  if spr.y > centerY then spr.y = math.max(centerY, spr.y - 1) end
+  c.pal:updateFade()
+  return not c.pal:fadeActive()
+end
+
+function Ui.clearCaughtDexScene()
+  Ui._caughtDexScene = nil
+end
+
 function Ui.draw(w, h)
   if not (love and love.graphics) then return end
   w = w or Display.W
   h = h or Display.H
+
+  local caught = Ui._caughtDexScene
+  if caught then
+    -- pokeemerald/src/battle_script_commands.c:10133
+    local Fx = require("src.core.game3.gba_fx")
+    Fx.draw(function()
+      BattleChrome.drawPostDexBg(BattleBg.sheetKey())
+      BattleChrome.drawPanel("none")
+    end, caught.pal:fx(0))
+    local spr = caught.sprite
+    Fx.draw(function()
+      love.graphics.setColor(1, 1, 1, 1)
+      love.graphics.draw(spr.img, spr.x + (spr.x2 or 0), spr.y + (spr.y2 or 0), 0, 1, spr.scaleY or 1, 32, 32)
+    end, caught.pal:fx(16))
+    if Choice and Choice.active and Choice.draw then Choice.draw() end
+    return
+  end
 
   local st = Ui._st
   local stage = Anim.stage and Anim.stage()
@@ -2338,6 +2763,7 @@ function Ui.draw(w, h)
   -- 4. Player Mon (Z: 200)
   -- 5. In front of Player & Global Foreground (Z: 201 .. 999)
   local dbl = st and is_double(st)
+  if Anim.beginParticleFrame then Anim.beginParticleFrame() end
   if dbl then
     draw_double_mons(st, stage, Anim, screenFxActive)
   else
@@ -2357,6 +2783,8 @@ function Ui.draw(w, h)
   if screenFxActive then Anim.beginScreenEffect() end
   Anim.drawParticles(201, 999)
   end
+  if Anim.endParticleFrame then Anim.endParticleFrame() end
+  LevelUpStreaks.draw(st)
   draw_intro_ball(stage)
   -- pokefirered/src/pokeball.c:770
   BallOpen.draw()
@@ -2376,6 +2804,7 @@ function Ui.draw(w, h)
     panelMode = "moves"
   end
   BattleChrome.drawPanel(panelMode)
+  BattleChrome.drawMenuFrames(panelMode)
 
   if Ui._mode == "menu" then
     draw_action_menu(st)
@@ -2401,7 +2830,7 @@ function Ui.draw(w, h)
     if ok then BagMenu = M end
   end
   if BagMenu and BagMenu.isOpen and BagMenu.isOpen() and BagMenu.draw then
-    BagMenu.draw()
+    require("src.ui.game3.screens").draw("bag", BagMenu)
   end
 
   if Choice and Choice.active and Choice.draw then
@@ -2421,6 +2850,8 @@ function Ui.draw(w, h)
   if Pokedex and Pokedex.isOpen and Pokedex.isOpen() and Pokedex.draw then
     Pokedex.draw()
   end
+  local RseDex = package.loaded["src.ui.game3.rse.pokedex"]
+  if RseDex and RseDex.active and RseDex.active() then RseDex.Host.draw() end
 
   local StatGrowth = package.loaded["src.ui.game3.stat_growth"]
   if StatGrowth and StatGrowth.isOpen and StatGrowth.isOpen() and StatGrowth.draw

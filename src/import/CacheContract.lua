@@ -15,15 +15,19 @@ CacheContract.VERSION_FORMAT = {
   -- export re-anchoring a save onto another map writes back into
   -- wCurMapObjectEventsPointer. A v10 cache has no address to write, and
   -- such an export is refused until the ROM re-imports.
-  gold = "rom-cache-v12:",
-  silver = "rom-cache-v12:",
-  crystal = "rom-cache-v12-crystal4:",
+  gold = "rom-cache-v13:",
+  silver = "rom-cache-v13:",
+  crystal = "rom-cache-v13-crystal6:",
   -- engine/overworld/map_sprites.asm:181, engine/battle/animations.asm:2600
   -- data/pikachu/pikachu_pic_animation.asm:340
   yellow = "rom-cache-v12-yellow2:",
   -- v8: M4A tracks retain reachable patterns and explicit entry offsets.
-  firered = "rom-cache-v17-firered:",
-  leafgreen = "rom-cache-v2-leafgreen:",
+  firered = "rom-cache-v25-firered:",
+  leafgreen = "rom-cache-v10-leafgreen:",
+  emerald = "rom-cache-v5-emerald:",
+  -- pokeruby/src/string_util.c:408
+  ruby = "rom-cache-v7-ruby:",
+  sapphire = "rom-cache-v7-sapphire:",
 }
 CacheContract.MARKER_PATH = "rom-cache.complete"
 
@@ -170,6 +174,7 @@ CacheContract.VERSION_REQUIRED_FILES_OVERRIDE = {
     "data/generated/scripts.lua",
     "data/generated/text.lua",
     "data/generated/rom_text.lua",
+    "data/generated/events.lua",
     "data/generated/pokemon.lua",
     "data/generated/encounters.lua",
     "data/generated/tilesets.lua",
@@ -243,6 +248,7 @@ CacheContract.VERSION_REQUIRED_FILES_OVERRIDE = {
     "data/generated/gba/intro/nidoran_f.png",
     "data/generated/gba/naming/manifest.lua",
     "data/generated/gba/ow/manifest.lua",
+    "data/generated/gba/ow/palette_manifest.lua",
     "data/generated/gba/ow/0.rgba",
     "data/generated/gba/ow/7.rgba",
     "data/generated/gba/pokemon/manifest.lua",
@@ -525,6 +531,7 @@ CacheContract.VERSION_REQUIRED_FILES_OVERRIDE = {
     -- src/data/field_effects/field_effect_objects.h:288, src/itemfinder.c:39
     "data/generated/gba/field_effects/ground_impact_dust.rgba",
     "data/generated/gba/field_effects/itemfinder_arrow_star.rgba",
+    "data/generated/gba/field_effects/arrow.rgba",
     -- src/field_effect.c:73, :77
     "data/generated/gba/field_effects/field_move_streaks_outdoors.rgba",
     "data/generated/gba/field_effects/field_move_streaks_indoors.rgba",
@@ -683,6 +690,28 @@ CacheContract.VERSION_REQUIRED_FILES_OVERRIDE = {
     "data/generated/gba/pokemon_jump/vine4_pal2.rgba",
   },
 }
+do
+  local frlg = CacheContract.VERSION_REQUIRED_FILES_OVERRIDE.firered
+  for _, path in ipairs(require("src.import.gba.battle_anim_extract").FRLG_REQUIRED) do
+    frlg[#frlg + 1] = "data/generated/gba/" .. path
+  end
+  -- src/trainer_card.c:155, :293
+  local hoenn = "data/generated/gba/rse/trainer_card/"
+  frlg[#frlg + 1] = hoenn .. "manifest.lua"
+  frlg[#frlg + 1] = hoenn .. "badges.png"
+  frlg[#frlg + 1] = hoenn .. "star.png"
+  for stars = 0, 4 do
+    for _, side in ipairs({ "screen", "front", "back" }) do
+      frlg[#frlg + 1] = string.format("%s%s_%d.png", hoenn, side, stars)
+      frlg[#frlg + 1] = string.format("%s%s_%d_female.png", hoenn, side, stars)
+    end
+  end
+  -- pokefirered/src/battle_script_commands.c:9693
+  local terrainKeys = require("src.import.gba.battle_chrome_extract").TERRAIN_KEYS
+  for id = 0, 19 do
+    frlg[#frlg + 1] = "data/generated/gba/pokemon/battle/terrain_" .. terrainKeys[id] .. "_post_dex.rgba"
+  end
+end
 CacheContract.VERSION_REQUIRED_FILES_OVERRIDE.leafgreen = {}
 for i, path in ipairs(CacheContract.VERSION_REQUIRED_FILES_OVERRIDE.firered) do
   CacheContract.VERSION_REQUIRED_FILES_OVERRIDE.leafgreen[i] = path
@@ -718,9 +747,57 @@ local function copy(values)
   return out
 end
 
+CacheContract.PLAN_CORE_FILES = {
+  "data/generated/gba/meta.json",
+  "data/generated/gba/maps.json",
+  "data/generated/gba/audio/meta.json",
+  "data/generated/gba/intro/meta.json",
+  "data/generated/maps.lua",
+  "data/generated/intro.lua",
+  "data/generated/audio.lua",
+}
+
+local composed = {}
+
+function CacheContract.planFilesFor(version)
+  if composed[version] then return composed[version] end
+  local Plans = require("src.import.gba.plans.registry")
+  local CachePaths = require("src.core.game3.cache_paths")
+  local files, seen = {}, {}
+  local function add(path)
+    if not seen[path] then
+      seen[path] = true
+      files[#files + 1] = path
+    end
+  end
+  for _, path in ipairs(CacheContract.PLAN_CORE_FILES) do add(path) end
+  for _, path in ipairs(Plans.required(Plans.of(version), CachePaths.CACHE_ROOT)) do add(path) end
+  if version == "emerald" then
+    local cfg = require("src.import.gba.games.emerald").BATTLE_UI
+    local keys = require("src.import.gba.battle_chrome_extract").TERRAIN_KEYS
+    -- pokeemerald/src/battle_script_commands.c:10133
+    local function postDex(key)
+      add(CachePaths.CACHE_ROOT .. "/pokemon/battle/terrain_" .. key .. "_post_dex.rgba")
+    end
+    for id = 0, cfg.terrain_count - 1 do postDex(keys[id]) end
+    for _, scene in ipairs(cfg.scenes) do postDex(scene.key) end
+  end
+  composed[version] = files
+  return files
+end
+
+local function planComposed(version)
+  return CacheContract.VERSION_REQUIRED_FILES_OVERRIDE[version] == nil
+    and CacheContract.VERSION_FORMAT[version] ~= nil
+    and GameVersion.VERSIONS[version] ~= nil
+    and GameVersion.generation(version) == 3
+    and GameVersion.layout(version) ~= nil
+end
+
 function CacheContract.requiredFilesFor(version)
   local override = CacheContract.VERSION_REQUIRED_FILES_OVERRIDE[version]
   if override then return override, true end
+  if planComposed(version) then return CacheContract.planFilesFor(version), true end
   return CacheContract.REQUIRED_FILES, false
 end
 
@@ -787,7 +864,34 @@ local function withVersionPrefix(version, fs, action)
   return true, first, second
 end
 
-function CacheContract.allRequiredFilesExist(version, fs)
+local function nativeRs(version)
+  return version == "ruby" or version == "sapphire"
+end
+
+local function nativeMeta(fs)
+  local raw = fs.read and fs.read("data/generated/gba/meta.json")
+  if type(raw) ~= "string" then return nil end
+  local ok, meta = pcall(require("src.link.Json").decode, raw)
+  if ok and type(meta) == "table" then return meta end
+end
+
+local function nativeDataReady(version, fs, sha1)
+  if not nativeRs(version) then return true end
+  local path = "data/generated/gba/meta.json"
+  if sha1 ~= nil and type(sha1) ~= "string" then return false, path end
+  local meta = nativeMeta(fs)
+  local V = require("src.import.gba.versions").forGame(version)
+  if not meta or meta.version ~= version or meta.cache_version ~= V.CACHE_VERSION
+      or meta.native_version ~= V.NATIVE_VERSION
+      or type(meta.romSha1) ~= "string" then return false, path end
+  if meta.md5 ~= nil and (type(meta.md5) ~= "string"
+      or meta.md5:lower() ~= meta.romSha1:lower()) then return false, path end
+  local expected = type(sha1) == "string" and sha1:lower() or meta.romSha1:lower()
+  if meta.romSha1:lower() ~= expected then return false, path end
+  return require("src.import.gba.rs.cache_readiness").check(version, fs, expected)
+end
+
+function CacheContract.allRequiredFilesExist(version, fs, sha1)
   fs = fs or require("src.import.CacheFs")
   local ok, complete, missing = withVersionPrefix(version, fs, function()
     local required, isOverride = CacheContract.requiredFilesFor(version)
@@ -800,7 +904,8 @@ function CacheContract.allRequiredFilesExist(version, fs)
         if not fs.exists(path) then missingPath = path; break end
       end
     end
-    return missingPath == nil, missingPath
+    if missingPath then return false, missingPath end
+    return nativeDataReady(version, fs, sha1)
   end)
   if not ok then return false, complete end
   return complete, missing
@@ -822,7 +927,9 @@ end
 function CacheContract.cacheVersionCurrent(version, fs)
   if GameVersion.generation(version) ~= 3 then return true end
   fs = fs or require("src.import.CacheFs")
-  local okV, Versions = pcall(require, "src.import.gba.versions")
+  local okV, Versions = pcall(function()
+    return require("src.import.gba.versions").forGame(version)
+  end)
   if not okV or not Versions or not Versions.CACHE_VERSION then return true end
   local ok, raw = withVersionPrefix(version, fs, function()
     return fs.read("data/generated/gba/meta.json")
@@ -838,12 +945,20 @@ function CacheContract.isReady(version, fs)
   local marker, readError = CacheContract.readMarker(version, fs)
   if readError or not CacheContract.markerMatches(version, marker) then return false end
   if not CacheContract.cacheVersionCurrent(version, fs) then return false end
-  return CacheContract.allRequiredFilesExist(version, fs)
+  local sha1 = nativeRs(version) and marker:match(":([%x]+)$") or nil
+  return CacheContract.allRequiredFilesExist(version, fs, sha1)
 end
 
 function CacheContract.publish(version, fs, sha1)
   fs = fs or require("src.import.CacheFs")
-  local complete, missing = CacheContract.allRequiredFilesExist(version, fs)
+  if nativeRs(version) then
+    if sha1 == nil then
+      local ok, meta = withVersionPrefix(version, fs, function() return nativeMeta(fs) end)
+      sha1 = ok and meta and meta.romSha1 or nil
+    end
+    if type(sha1) == "string" then sha1 = sha1:lower() end
+  end
+  local complete, missing = CacheContract.allRequiredFilesExist(version, fs, sha1)
   if not complete then
     -- A caller may be retrying over a partially replaced cache.  Do not
     -- leave its old marker advertising readiness after this failed check.
@@ -890,6 +1005,20 @@ function CacheContract.sourceTreeHasData(version)
       end
     end
   end
+  if nativeRs(version) then
+    local exact = {
+      read = function(path)
+        local full = prefix .. path
+        if love.filesystem.getRealDirectory(full) == source then return require("src.import.CacheBlob").readFs(full) end
+      end,
+      exists = function(path)
+        local full = prefix .. path
+        return love.filesystem.getInfo(full, "file") ~= nil
+          and love.filesystem.getRealDirectory(full) == source
+      end,
+    }
+    return nativeDataReady(version, exact)
+  end
   return true
 end
 
@@ -924,6 +1053,23 @@ local function sourceReady(version, fs, semantic)
   if not complete then return nil end
   local first = prefix .. CacheContract.requiredFiles(version, semantic)[1]
   if fs.getRealDirectory(first) ~= fs.getSource() then return nil end
+  if nativeRs(version) then
+    local source = fs.getSource()
+    for _, path in ipairs(CacheContract.requiredFiles(version, semantic)) do
+      if fs.getRealDirectory(prefix .. path) ~= source then return nil end
+    end
+    local relative = {
+      read = function(path)
+        local full = prefix .. path
+        if fs.getRealDirectory(full) == source then return readAt(fs, full) end
+      end,
+      exists = function(path)
+        local full = prefix .. path
+        return isFileAt(fs, full) and fs.getRealDirectory(full) == source
+      end,
+    }
+    if not nativeDataReady(version, relative) then return nil end
+  end
   return { kind = "source", prefix = prefix }
 end
 
@@ -944,6 +1090,14 @@ function CacheContract.inspect(version, fs, opts)
   local complete, missing = hasExactFiles(version, fs, prefix, opts.semantic)
   if not complete then
     return nil, "not_imported", "required cache file is missing: " .. tostring(missing)
+  end
+  if nativeRs(version) then
+    local relative = {
+      read = function(path) return readAt(fs, prefix .. path) end,
+      exists = function(path) return isFileAt(fs, prefix .. path) end,
+    }
+    local ready, invalid = nativeDataReady(version, relative, marker:match(":([%x]+)$"))
+    if not ready then return nil, "not_imported", "native cache data is missing or stale: " .. tostring(invalid) end
   end
   return { kind = "cache", prefix = prefix, marker = marker }
 end
