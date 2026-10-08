@@ -79,8 +79,10 @@ imported side by side. Gen 2 support is still under construction.
    [latest release](https://github.com/bryanthaboi/gen1recomp/releases/latest).
 2. Launch it. The packaged app contains no ROM and no game data, so the
    launcher will ask for one.
-3. Choose your legally obtained `.gb` / `.gbc` / `.gba` file, or drop it onto
-   the window. Import takes a few seconds and the game starts automatically.
+3. Choose your legally obtained `.gb` / `.gbc` / `.gba` file, a `.zip` /
+   `.7z` that holds one (offered only where your platform's build supports
+   archives), or drop it onto the window. Import takes a few seconds and the
+   game starts automatically.
 4. Repeat for any other game you own. Each one gets its own tab in the launcher.
 
 Only the canonical US English ROMs below are accepted. The importer checks the
@@ -109,8 +111,9 @@ SHA-1 before creating any game data. FireRed, LeafGreen, Ruby, Sapphire, and Eme
 
 **Platform notes:** [Linux](docs/platforms/linux.md),
 [iOS](docs/platforms/ios.md), [Xbox Dev Mode](docs/platforms/xbox.md),
-[handhelds](docs/platforms/handhelds.md), and
-[Nintendo Switch](docs/platforms/switch.md) each have their own install steps.
+[handhelds](docs/platforms/handhelds.md),
+[Nintendo Switch](docs/platforms/switch.md), and
+[PlayStation 4](docs/platforms/ps4.md) each have their own install steps.
 
 **Windows Defender:** it sometimes flags the Windows build with a generic
 detection such as `Trojan:Win32/Wacatac!ml` (#621). This is a known false
@@ -134,7 +137,7 @@ Rebind any of these in-game under **OPTIONS > CONTROLS**.
 | Key       | What it does                                           |
 | --------- | ------------------------------------------------------ |
 | `-` / `=` | Zoom out / in (overworld; also mouse wheel)            |
-| `1`       | Cycle GAME SPEED up (controller: R2 faster, L2 slower) |
+| `1` / `0` | GAME SPEED up / down (controller: R2 faster, L2 slower) |
 | `2`       | Cycle COLORS                                           |
 | `3`       | Cycle TILT (free-roam overworld)                       |
 | `4`       | Cycle ZOOM through every level (free-roam overworld)   |

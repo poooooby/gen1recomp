@@ -907,14 +907,6 @@ function Field.interact(game)
   -- 1) EventObject (nurse behind counter uses doubled cell; Cut tree / Rock / Boulder)
   local ox, oy = facing_object_cell(fx, fy, P.facing)
   local eo = Objects.at(ox, oy)
-  if not eo then
-    local under = Objects.at(P.cellX, P.cellY)
-    local Faraway = package.loaded["src.core.game3.faraway_island"]
-    if under and (under.copy or (Faraway and Faraway.isMew and Faraway.isMew(under))) then
-      eo = under
-      ox, oy = P.cellX, P.cellY
-    end
-  end
   if eo and eo.def then
     local gfx = eo.def.graphicsId or eo.def.gfx
     local FP = lazyReq("src.core.game3.profile").forSession(Field._session)
@@ -1425,9 +1417,20 @@ function Field.executeFieldMove(payload)
           Flags.setFlag(Space.store, nil, payload.flag, true)
         end
       end
-      FieldEffects.startFlash(function()
-        Field.locked = false
-      end)
+      local profile = lazyReq("src.core.game3.profile").forSession(Field._session)
+      local script = profile.field and profile.field.flashScript
+      if script then
+        local Space = lazyReq("src.core.game3.scripting.space")
+        local key = assert(Space.scriptKey(script), "ROM Flash script is not in the script cache: " .. script)
+        assert(Space.vm, "Flash requires the field script VM")
+        -- pokeruby/src/script.c:230
+        Space.vm.ctx.fieldControlsLocked = true
+        assert(Space.startScript(key), "ROM Flash script could not start: " .. script)
+      else
+        FieldEffects.startFlash(function()
+          Field.locked = false
+        end)
+      end
     end)
   elseif act == "dig" or act == "braille_rs_dig" then
     Field.locked = true
@@ -2118,6 +2121,11 @@ function Field.respawnAtHeal(opts)
       local Ctx = lazyReq("src.core.game3.scripting.ctx")
       Flags.setVar(Space.store, Space.vm and Space.vm.ctx or nil, Ctx.VAR_LAST_TALKED, healerId)
     end
+  end
+  if whiteOut and healRow then
+    -- pokeemerald/src/overworld.c:1563
+    local Fade = lazyReq("src.ui.game3.fade")
+    if Fade.active or (Fade.t or 0) > 0 then Fade.begin(Fade.MODE.FROM_BLACK, 1) end
   end
   if whiteOut and not healRow then
     -- pokefirered/src/overworld.c:1558

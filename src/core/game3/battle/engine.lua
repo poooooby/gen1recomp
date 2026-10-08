@@ -802,6 +802,14 @@ end
 
 -- pokefirered/src/battle_script_commands.c:7519
 local function pick_metronome(M)
+  local cap = tonumber(M.st and M.st.moveMax)
+  if cap then
+    local pool, skip = {}, M.st.moveExcluded or {}
+    for m = 1, cap do
+      if not forbidden(m, false) and not skip[m] then pool[#pool + 1] = m end
+    end
+    return pool[roll(M.adapter, 1, #pool)]
+  end
   for _ = 1, 64 do
     local m = roll(M.adapter, 1, 511)
     if m < 355 and not forbidden(m, false) then return m end
@@ -1280,25 +1288,22 @@ function Engine.moveLimitations(b, ad)
 end
 
 local function player_identity(st)
-  local id, nm = st.playerTrainerId, st.playerOtName or st.playerName
-  if id == nil then
+  local sess = st.session
+  if not sess then
     local Runtime = package.loaded["src.core.game3.runtime"]
-    local ok, sess = pcall(function() return Runtime and Runtime.getSession and Runtime.getSession() end)
-    if ok and sess then
-      id = sess.trainerId or sess.id or sess.playerId or 12345
-      nm = sess.name or sess.playerName or nm or "RED"
-    end
+    local ok, current = pcall(function() return Runtime and Runtime.getSession and Runtime.getSession() end)
+    if ok then sess = current end
   end
-  return id, nm
+  sess = sess or {}
+  return { trainerId = st.playerTrainerId or sess.trainerId or sess.id or sess.playerId,
+    secretId = st.playerSecretId or sess.secretId,
+    name = st.playerOtName or st.playerName or sess.name or sess.playerName }
 end
 
 -- pokefirered/src/pokemon.c:5965
 function Engine.isTradedMon(st, mon)
   if not mon or mon.otId == nil then return false end
-  local pid, pname = player_identity(st or {})
-  if pid == nil then return false end
-  return tonumber(mon.otId) ~= tonumber(pid)
-    or (mon.otName ~= nil and pname ~= nil and tostring(mon.otName) ~= tostring(pname))
+  return require("src.core.game3.pokemon").isTradedMon(mon, player_identity(st or {}))
 end
 
 -- src/battle_message.c:1180

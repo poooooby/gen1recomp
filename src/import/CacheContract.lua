@@ -15,9 +15,11 @@ CacheContract.VERSION_FORMAT = {
   -- export re-anchoring a save onto another map writes back into
   -- wCurMapObjectEventsPointer. A v10 cache has no address to write, and
   -- such an export is refused until the ROM re-imports.
-  gold = "rom-cache-v13:",
-  silver = "rom-cache-v13:",
-  crystal = "rom-cache-v13-crystal6:",
+  -- gfx/sgb/predef.pal:28
+  -- data/items/catch_rate_items.asm:5
+  gold = "rom-cache-v15:",
+  silver = "rom-cache-v15:",
+  crystal = "rom-cache-v15-crystal6:",
   -- engine/overworld/map_sprites.asm:181, engine/battle/animations.asm:2600
   -- data/pikachu/pikachu_pic_animation.asm:340
   yellow = "rom-cache-v12-yellow2:",
@@ -135,6 +137,8 @@ CacheContract.VERSION_REQUIRED_FILES_OVERRIDE = {
     "data/generated/tilesets.lua",
     "data/generated/audio.lua",
     "data/generated/marts.lua",
+    -- engine/gfx/cgb_layouts.asm:495
+    "data/generated/diploma.lua",
     "assets/generated/fonts/font.png",
     "assets/generated/fonts/frames.png",
     "assets/generated/title/pokemon_logo.png",
@@ -184,6 +188,8 @@ CacheContract.VERSION_REQUIRED_FILES_OVERRIDE = {
     "data/generated/oak_speech.lua",
     "data/generated/title.lua",
     "data/generated/intro.lua",
+    -- engine/gfx/cgb_layouts.asm:517
+    "data/generated/diploma.lua",
     "assets/generated/fonts/font.png",
     "assets/generated/fonts/frames.png",
     -- ../pokecrystal/gfx/font.asm:60
@@ -381,6 +387,7 @@ CacheContract.VERSION_REQUIRED_FILES_OVERRIDE = {
     "data/generated/gba/trainers.lua",
     "data/generated/gba/trainers/back_0.rgba",
     "data/generated/gba/trainers/back_1.rgba",
+    "data/generated/gba/trainers/back_anims.lua",
     "data/generated/gba/trainer_card/manifest.lua",
     "data/generated/gba/trainer_card/bg.rgba",
     "data/generated/gba/field_effects/tall_grass.rgba",

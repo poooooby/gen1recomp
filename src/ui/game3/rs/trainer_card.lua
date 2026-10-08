@@ -4,6 +4,7 @@ local Font = require("src.ui.game3.frlg_font")
 local Pal = require("src.core.game3.pal_fade")
 local Fx = require("src.core.game3.gba_fx")
 local Policy = require("src.ui.game3.rs.trainer_card_policy")
+local PixelCanvas = require("src.render.PixelCanvas")
 local T = {isMenu = true, open = false, side = "front", _phase = "idle"}
 function T.manifest()
   local m = assert(Kit.manifest("rse/trainer_card"), "native RS trainer card pack missing")
@@ -18,6 +19,12 @@ local function copiedCard(card)
   out.stars = math.max(0, math.min(4, math.floor(tonumber(out.stars) or 0)))
   return out
 end
+local function profilePhrase(card)
+  local Easy, words = require("src.core.game3.easy_chat_text"), card.easyChatProfile or {}
+  local out = {}
+  for row = 0, 1 do out[row + 1] = Easy.word(words[row * 2 + 1] or 65535) .. " " .. Easy.word(words[row * 2 + 2] or 65535) end
+  return out
+end
 function T.show(opts)
   opts = opts or {}
   local rt = package.loaded["src.core.game3.runtime"]
@@ -25,6 +32,7 @@ function T.show(opts)
   T._clockSession = opts.clockSession or (rt and rt.getSession and rt.getSession()) or T._session
   T._link = opts.linkCard == true or (T._session.dex == nil and T._session.stars ~= nil)
   T._card = T._link and copiedCard(T._session) or Policy.generate(T._session)
+  T._phrase = T._link and profilePhrase(T._card) or nil
   T._man, T._onClose = T.manifest(), opts.onClose
   T.open, T.side, T._phase, T._setup = true, "front", "setup", 0
   T._pal, T._stepper = Pal.new(), Kit.stepper()
@@ -143,8 +151,8 @@ function T.texts(card, side, colon)
     local time = T._link and c or T._session
     put("time", tostring(tonumber(time.playTimeHours) or 0) .. (colon and " : " or "   ") .. string.format("%02d", tonumber(time.playTimeMinutes) or 0), 80, 96, "values", false, 48)
     if T._link then
-      local Easy, words = require("src.core.game3.easy_chat_text"), c.easyChatProfile or {}
-      for row = 0, 1 do put("phrase" .. row, Easy.rawWord(words[row * 2 + 1] or 65535) .. " " .. Easy.rawWord(words[row * 2 + 2] or 65535), 16, 112 + row * 16) end
+      local phrase = T._phrase or profilePhrase(c)
+      for row = 0, 1 do put("phrase" .. row, phrase[row + 1], 16, 112 + row * 16) end
     end
   else
     put("name", c.name .. s.nameSuffix, 224, 16, "values", true)
@@ -203,7 +211,7 @@ local function drawContent()
 end
 function T.draw()
   if not T.open then return end
-  if not T._canvas then T._canvas = love.graphics.newCanvas(256, 256); T._canvas:setFilter("nearest", "nearest") end
+  if not T._canvas then T._canvas = PixelCanvas.new(256, 256); T._canvas:setFilter("nearest", "nearest") end
   local previous = love.graphics.getCanvas()
   love.graphics.push("all")
   love.graphics.setCanvas(T._canvas); love.graphics.origin(); love.graphics.setColor(1, 1, 1, 1)

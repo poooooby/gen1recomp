@@ -63,6 +63,7 @@ Ui._pendingYesNo = nil
 Ui._session = nil
 Ui._active = 0
 Ui._actionCursor = {}
+Ui._actionCursorBattler = {}
 Ui._moveCursor = {}
 Ui._moveCursorMon = {}
 Ui._target = nil
@@ -228,6 +229,7 @@ function Ui.reset(opts)
   Ui._pendingYesNo = nil
   Ui._active = 0
   Ui._actionCursor = {}
+  Ui._actionCursorBattler = {}
   Ui._moveCursor = {}
   Ui._moveCursorMon = {}
   Ui._swap = nil
@@ -715,12 +717,14 @@ function Ui.openMenu(battlerId, opts)
   Ui._target = nil
   Ui._active = tonumber(battlerId) or 0
   Ui._partnerAction = opts and opts.partnerAction or nil
-  if is_double() then
-    -- pokefirered/src/battle_controller_player.c:2421
-    Ui._menuIndex = Ui._actionCursor[Ui._active] or 1
-  else
-    Ui._menuIndex = 1
+  local battler = Ui._st and State.battler(Ui._st, Ui._active)
+  -- pokefirered/src/battle_controller_player.c:2099
+  if Ui._actionCursorBattler[Ui._active] ~= battler then
+    Ui._actionCursorBattler[Ui._active] = battler
+    Ui._actionCursor[Ui._active] = 1
   end
+  -- pokefirered/src/battle_controller_player.c:2421
+  Ui._menuIndex = Ui._actionCursor[Ui._active] or 1
   Ui._pendingCommand = nil
   Ui._wally = nil
   local Wally = require("src.core.game3.battle.tutorial_wally")
@@ -1641,11 +1645,13 @@ function Ui.handleInput(input)
     local idx, moved = grid_nav(Ui._menuIndex, input, 4)
     if moved then
       Ui._menuIndex = idx
+      Ui._actionCursor[Ui._active] = idx
       play_select()
       return true
     end
     if input:wasPressed("a") then
       play_select()
+      Ui._actionCursor[Ui._active] = Ui._menuIndex
       if Ui._st and Ui._st.safari then
         -- pokefirered/src/battle_controller_safari.c:162
         local act = Commands.playerAction(Ui._st, Ui._menuIndex, nil)
@@ -1757,6 +1763,12 @@ local PP_STATE_TO_COLOR_INDEX = {
   [2] = 3,
   [3] = 0,
 }
+
+function Ui.moveTypeOf(mon, slot, def)
+  local t = mon and mon.moveTypes and mon.moveTypes[slot]
+  if t ~= nil then return t end
+  return def.type
+end
 
 function Ui.ppColorState(currentPp, maxPp)
   currentPp = tonumber(currentPp) or 0
@@ -2193,9 +2205,8 @@ local function battle_font()
   return require(P.font.module)
 end
 
-local function is_rs_battle()
-  local P = require("src.core.game3.profile").forSession(Ui._session)
-  return P.font.nativeLayout == "rs"
+function Ui.drawMenuFrames(panelMode)
+  BattleChrome.drawMenuFrames(panelMode)
 end
 
 local function c5to8(x)
@@ -2336,7 +2347,7 @@ local function draw_move_menu_rs(st)
     F.draw(RomText.plain("gText_MoveInterfacePP"), 184, 120, { colors = colors })
     F.draw(string.char(0xfc, 0x11, 2, 0xfc, 0x14, 6) .. string.format("%2d/%2d", pp, maxPp),
       200, 120, { colors = colors })
-    F.draw(Types.name(def.type), 184, 136, { colors = colors })
+    F.draw(Types.name(Ui.moveTypeOf(mon, slot, def)), 184, 136, { colors = colors })
   end
 end
 
@@ -2374,13 +2385,14 @@ local function draw_move_menu_rse(st)
     rse_text(W.MOVE_TYPE, typeLabel)
     local F = battle_font()
     local tw = F.measure(typeLabel, { font = "narrow" })
-    rse_text(W.MOVE_TYPE, Types.name(def.type), tw, { narrow = false })
+    rse_text(W.MOVE_TYPE, Types.name(Ui.moveTypeOf(mon, slot, def)), tw, { narrow = false })
   end
 end
 
 local function draw_action_menu(st)
-  if is_rs_battle() then return draw_action_menu_rs(st) end
-  if BattleChrome.isRse() then return draw_action_menu_rse(st) end
+  local L = BattleChrome.layout()
+  if L == "rs" then return draw_action_menu_rs(st) end
+  if L == "emerald" then return draw_action_menu_rse(st) end
   -- B_WIN_ACTION_PROMPT @ (1,15) after scroll → px (8,120); printer (2,2) → (10,122)
   -- B_WIN_ACTION_MENU @ (17,15) → (136,120); printer (0,2) → (136,122)
   -- ActionSelectionCreateCursorAt: tile (16+7*col, 35+row) → after scroll (128,120);
@@ -2405,8 +2417,9 @@ local function draw_action_menu(st)
 end
 
 local function draw_move_menu(st)
-  if is_rs_battle() then return draw_move_menu_rs(st) end
-  if BattleChrome.isRse() then return draw_move_menu_rse(st) end
+  local L = BattleChrome.layout()
+  if L == "rs" then return draw_move_menu_rs(st) end
+  if L == "emerald" then return draw_move_menu_rse(st) end
   local ab = st and (is_double(st) and active_battler(st) or st.player)
   local mon = ab and ab.mon
   local positions = {
@@ -2445,7 +2458,7 @@ local function draw_move_menu(st)
     -- pokefirered/src/battle_controller_player.c:1402
     draw_menu_text(string.format("%2d/%2d", pp, maxPp), 202, 122, { small = false, colors = ppColors })
     -- pokefirered/src/battle_controller_player.c:1413
-    draw_menu_text(RomText.plain("gText_MoveInterfaceType") .. Types.name(def.type), 168, 138,
+    draw_menu_text(RomText.plain("gText_MoveInterfaceType") .. Types.name(Ui.moveTypeOf(mon, slot, def)), 168, 138,
       { small = true, colors = FrlgFont.COLOR.NORMAL })
   end
 end
@@ -2804,7 +2817,7 @@ function Ui.draw(w, h)
     panelMode = "moves"
   end
   BattleChrome.drawPanel(panelMode)
-  BattleChrome.drawMenuFrames(panelMode)
+  Ui.drawMenuFrames(panelMode)
 
   if Ui._mode == "menu" then
     draw_action_menu(st)

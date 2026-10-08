@@ -253,7 +253,10 @@ local function drawFieldPlane(game, vw, vh, Renderer)
   if Tilt.active() and not transitioning and Renderer and Renderer.beginUprightPass then
     FieldView.draw(game, vw, vh, { skipActors = true, exchangeCanvas = exchange })
     Renderer:beginUprightPass()
-    FieldView.draw(game, vw, vh, { actorsOnly = true, billboard = true })
+    FieldView.draw(game, vw, vh, {
+      actorsOnly = true, billboard = true,
+      endUnderActors = function(drawOverhead) Renderer:occludeUprightActors(drawOverhead) end,
+    })
     Renderer:endUprightPass()
   else
     FieldView.draw(game, vw, vh, { exchangeCanvas = exchange })
@@ -360,6 +363,7 @@ local function presentPlanes(game)
   local vw, vh = Renderer:worldViewSize()
   drawFieldPlane(game, vw, vh, Renderer)
   love.graphics.pop()
+  love.graphics.setCanvas(Renderer.worldCanvas)
   local Transition = package.loaded["src.core.game3.battle_transition"]
   if Transition and Transition.isActive and Transition.isActive() then
     Transition.drawWorld(Renderer.worldCanvas, vw, vh)

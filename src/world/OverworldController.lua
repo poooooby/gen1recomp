@@ -5,6 +5,7 @@
 
 local Assets = require("src.render.Assets")
 local Camera = require("src.render.Camera")
+local PixelCanvas = require("src.render.PixelCanvas")
 local Collision = require("src.world.Collision")
 local Encounter = require("src.world.Encounter")
 local FieldDefaults = require("src.world.FieldDefaults")
@@ -3980,13 +3981,10 @@ end
 -- for the original serial handshake; declining prints "Please come again!"
 function OverworldState:cableClubReceptionist(onDone)
   local t = Game.data.text
-  if self.map.id == "PEWTER_POKECENTER" and self.pikachuPewterSleepScene then
-    Game.stack:push(TextBox.new(Game,
-      t._LooksContentText or Strings("PIKACHU looks\ncontent."), onDone))
-    return
-  end
   local welcome = t._CableClubNPCWelcomeText or romText(Game.data, "_CableClubNPCWelcomeText", "Welcome to the\nCable Club!")
-  if not Game.save.flags.EVENT_GOT_POKEDEX then
+  -- engine/link/cable_club_npc.asm:4
+  if require("src.world.PikachuFollower").isFollowingDisabled(self)
+      or not Game.save.flags.EVENT_GOT_POKEDEX then
     -- CableClubNPC .didNotConnect path before the pokedex
     Game.stack:push(TextBox.new(Game, welcome .. "\f"
       .. (t._CableClubNPCMakingPreparationsText
@@ -4673,6 +4671,14 @@ function OverworldState:rollEncounter(encDef, terrain)
   return enc
 end
 
+function OverworldState.rollsIndoorEncounters(def, indoor)
+  if not indoor or Map.isOutdoor(def) then return false end
+  -- engine/battle/wild_encounters.asm:41
+  if def.index ~= nil and def.index < indoor.firstIndoorMap then return false end
+  -- engine/battle/wild_encounters.asm:44
+  return def.tileset ~= indoor.excludedTileset
+end
+
 function OverworldState:onStepComplete()
   local p = self.player
   -- Defaulted: a state built without the constructor (a mod harness, a test
@@ -4808,13 +4814,12 @@ function OverworldState:onStepComplete()
   if suppressWildEncounter then return end
   local encDef = Game.data.encounters[self.map.id]
   local enc
-  local indoor = Game.data.field.indoorEncounters
   if self.map:isGrassCell(p.cellX, p.cellY) then
     enc = self:rollEncounter(encDef, "grass")
   elseif p.surfing and self.map:isWaterCell(p.cellX, p.cellY) then
     enc = self:rollEncounter({ grass = encDef and encDef.water }, "water")
-  elseif indoor and self.map.def.index >= indoor.firstIndoorMap
-         and self.map.def.tileset ~= indoor.excludedTileset then
+  elseif OverworldState.rollsIndoorEncounters(self.map.def,
+                                              Game.data.field.indoorEncounters) then
     enc = self:rollEncounter(encDef, "indoor")
   end
   if enc then
@@ -5825,7 +5830,7 @@ function OverworldState:drawWorldFaded()
     scratch, self.fadeCanvas = nil, nil
   end
   if not scratch then
-    local ok, made = pcall(love.graphics.newCanvas, w, h)
+    local ok, made = pcall(PixelCanvas.new, w, h)
     if not ok or not made then return false end
     made:setFilter("nearest", "nearest")
     scratch = made

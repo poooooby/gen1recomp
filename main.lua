@@ -208,6 +208,17 @@ local function applySavedOrientation()
   end)
 end
 
+local function applySavedAudioMode()
+  local ok, savedOptions = pcall(function()
+    return require("src.core.SaveData").loadOptions()
+  end)
+  if not ok or type(savedOptions) ~= "table" then savedOptions = {} end
+  local mode = savedOptions.audioMode or "both"
+  if love and love.audio and love.audio.setMixWithSystem then
+    pcall(love.audio.setMixWithSystem, mode ~= "game_only")
+  end
+end
+
 local Game, EditorApp, Importer, TouchEditor, Studio, Prelaunch
 local launcherSplash
 
@@ -230,6 +241,26 @@ end
 local launchedIntoGame = false
 local RELAUNCH_MARKER = "relaunch_to_launcher.txt"
 local launchOptionsSuppressed = false
+local quitToLauncher = false
+local processEnded = false
+
+local function endProcessOnce()
+  if processEnded then return end
+  processEnded = true
+  pcall(function()
+    require("src.core.DiscordPresence").shutdown()
+  end)
+  require("src.core.SessionLifecycle").endProcess()
+end
+
+local function readRelaunchHandoff()
+  if not love.filesystem.getInfo(RELAUNCH_MARKER) then return nil end
+  local raw = love.filesystem.read(RELAUNCH_MARKER)
+  pcall(love.filesystem.remove, RELAUNCH_MARKER)
+  local data = require("src.core.SaveSerializer").decode(raw or "",
+    { maxBytes = 65536 })
+  return type(data) == "table" and data or {}
+end
 
 local onlineClient, onlineClientResolved
 local function onlineClientModule()
@@ -330,6 +361,12 @@ local function openEditor(version, slotId)
     Importer.saveNotice[version] = { ok = false, text = text }
   end
   local SaveData = require("src.core.SaveData")
+  local recovered, recoveryError, recoveryNotice = require("src.box.Transaction").recover(SaveData.persistenceFs())
+  if not recovered then refuse(recoveryError); return end
+  if recoveryNotice then
+    require("src.core.Logger").warn("%s", recoveryNotice)
+    if Importer and Importer._boxState then Importer._boxState.notice = recoveryNotice end
+  end
   local path = SaveData.slotDiskPath(version, slotId)
   if not path then
     refuse("Could not resolve that save slot on disk.")
@@ -499,15 +536,14 @@ local function makeLauncher(launcherOpts)
   })
 end
 
-local function returnToLauncher(opts)
-  if not Game then return end
+local deferredLaunchRequest
 
+local function rebuildLauncherInProcess(opts)
   if require("src.core.RequireGuard").repair() then
     print("boot: restored love.filesystem searcher (see #2001)")
   end
 
-  local GameVersion = require("src.core.GameVersion")
-  local currentVersion = GameVersion.get()
+  local currentVersion = require("src.core.GameVersion").get()
   SessionLifecycle.endGameSession(Game)
   Game = nil
   pcall(function() require("src.online.Trade").hostIsLive = nil end)
@@ -517,19 +553,12 @@ local function returnToLauncher(opts)
   end
   autopilot = nil
   driverCo = nil
-  -- Leave the cart's scope behind: the launcher's own settings and slots are
-  -- the base game's, not the cart's.  The speed ladder is cart state too, so
-  -- a 1x/2x cart must not pin the launcher or the next game.
   local SaveData = require("src.core.SaveData")
   local cartId = SaveData.getCart()
   SaveData.setCart(nil)
   require("src.core.GameSpeed").setAllowed(nil)
 
   SessionLifecycle.endMountedSession(currentVersion)
-
-  -- Slot lists are resolved once per process.  Invalidate only the game
-  -- (and cart, if any) we just left so the new launcher can migrate a flat
-  -- in-game SAVE into a visible slot -- nothing else is rewritten.
   SaveData.refreshSlotResolution(currentVersion)
   if cartId then SaveData.refreshSlotResolution("cart_" .. cartId) end
 
@@ -543,20 +572,51 @@ local function returnToLauncher(opts)
     love.window.setTitle(Version.title("Gen 1 Recompilation Project"))
   end
 
-  Importer = makeLauncher({ initialTab = opts and opts.tab or nil,
-    invite = opts and opts.invite or nil })
-  -- Finger that confirmed EXIT GAME is often still down over Import Save.
+  Importer = makeLauncher({ initialTab = opts.tab, invite = opts.invite })
   if Importer.ignoreReturningPointer then
     Importer:ignoreReturningPointer()
   end
+  if type(opts.request) == "table" then deferredLaunchRequest = opts.request end
+end
+
+local function returnToLauncher(opts)
+  if not Game or quitToLauncher then return end
+  opts = opts or {}
+  if not require("src.core.HostShell").canRestart() then
+    return rebuildLauncherInProcess(opts)
+  end
+  quitToLauncher = true
+  local handoff = { tab = opts.tab, invite = opts.invite, request = opts.request }
+  local okEncode, body = pcall(require("src.core.SaveSerializer").encode, handoff)
+  pcall(love.filesystem.write, RELAUNCH_MARKER, okEncode and body or "return {}\n")
+
+  SessionLifecycle.endGameSession(Game)
+  Game = nil
+  autopilot = nil
+  driverCo = nil
+  endProcessOnce()
+  if opts.restarting then return end
+  require("src.core.HostShell").restart()
 end
 
 local pendingLauncherReturn
+local driverHost = {
+  returnToLauncher = function(o) pendingLauncherReturn = o or {} end,
+}
 
 function bootGame(version, cartId, opts)
   opts = opts or {}
   if require("src.core.RequireGuard").repair() then
     print("boot: restored love.filesystem searcher (see #2001)")
+  end
+  local recovered, recoveryError, recoveryNotice = require("src.box.Transaction").recover(
+    require("src.core.SaveData").persistenceFs())
+  if recoveryNotice then require("src.core.Logger").warn("%s", recoveryNotice) end
+  if not recovered then
+    Importer = makeLauncher({ initialTab = "box" })
+    Importer._boxState = nil
+    require("src.import.BoxPanel").refresh(Importer).notice = recoveryError
+    return
   end
   pcall(function()
     require("src.online.Trade").hostIsLive = function() return true end
@@ -671,8 +731,6 @@ local function autoUpdateMods(request, tab)
   end
 end
 
-local deferredLaunchRequest
-
 local function launcherBusy()
   return launcherSplash ~= nil or Importer ~= nil and (Importer._updateAll ~= nil
     or Importer._modInstall ~= nil or Importer._cartInstall ~= nil
@@ -686,19 +744,19 @@ local function startLaunchRequest(request)
     return true
   end
 
+  if Game then
+    returnToLauncher({ request = request })
+    return true
+  end
+
   local version = request.game
   if request.launcher or not version then
-    if Game then
-      returnToLauncher({ tab = version })
-    else
-      showLauncher(version)
-    end
+    showLauncher(version)
     autoUpdateMods(request, not version and "mods" or nil)
     return true
   end
 
   local RomImporter = require("src.import.RomImporter")
-  if Game then returnToLauncher() end
   Importer = nil
   if Prelaunch then return true end
 
@@ -804,6 +862,7 @@ function love.load(args)
     end
   end
   love.graphics.setDefaultFilter("nearest", "nearest")
+  pcall(function() require("src.core.GamepadMap").initGamepadMappings() end)
   -- NX: handheld 720p / docked 1080p. Runs for every boot path (launcher,
   -- editor, scripted); no-op on desktop/mobile.
   NxDisplay.sync()
@@ -813,6 +872,7 @@ function love.load(args)
   -- the launcher would rotate freely until options are applied at boot.
   -- No-op on desktop / iOS / when options.lua does not exist yet.
   applySavedOrientation()
+  applySavedAudioMode()
 
   -- Standalone editor.  A bare `--editor` run has no launcher behind it, so
   -- Close quits; --save points it at a specific file, otherwise it opens the
@@ -858,6 +918,10 @@ function love.load(args)
     scriptedOpts = { arena = spec }
   end
 
+  local handoff = readRelaunchHandoff()
+  local relaunched = handoff ~= nil
+  if relaunched and os.getenv("POKEPORT_DRIVER") then scripted = nil end
+
   if scripted then
     if forceImport or not ready then
       -- The importer detects the dropped/loaded ROM's version by SHA-1 and
@@ -902,11 +966,7 @@ function love.load(args)
   -- marker behind: consume it and stay on the launcher, or the shortcut below
   -- would boot the same game again and that close would restart again,
   -- forever (#887).  Consumed on read, so the very next launch is normal.
-  local relaunched = love.filesystem.getInfo(RELAUNCH_MARKER) ~= nil
-  if relaunched then
-    launchOptionsSuppressed = true
-    pcall(love.filesystem.remove, RELAUNCH_MARKER)
-  end
+  if relaunched then launchOptionsSuppressed = true end
 
   if not relaunched and resolvedLaunch.game and not resolvedLaunch.launcher
       and startLaunchRequest(resolvedLaunch) then
@@ -922,12 +982,23 @@ function love.load(args)
   -- by its SHA-1 (GameVersion.forSha1); pressing Play boots that game (Gold
   -- goes to its own service owner, src/core/Game2.lua -- docs/gold-phase1.md).
   -- Edit on a save row opens the bundled editor on that slot (openEditor).
-  Importer = makeLauncher()
   if not relaunched then
+    Importer = makeLauncher()
     launcherSplash = require("src.import.LauncherSplash").new()
     autoUpdateMods(resolvedLaunch,
       not resolvedLaunch.game and "mods" or nil)
+    return
   end
+  Importer = makeLauncher({
+    initialTab = type(handoff.tab) == "string" and handoff.tab or nil,
+    invite = type(handoff.invite) == "string" and handoff.invite or nil,
+  })
+  if Importer.ignoreReturningPointer then Importer:ignoreReturningPointer() end
+  local driverPath = os.getenv("POKEPORT_DRIVER")
+  if driverPath then
+    driverCo = coroutine.create(assert(loadfile(driverPath))())
+  end
+  if type(handoff.request) == "table" then startLaunchRequest(handoff.request) end
 end
 
 function love.update(dt)
@@ -971,6 +1042,18 @@ function love.update(dt)
   if Importer then
     require("src.import.LauncherWindow").observe(dt)
     Importer._inputBlocked = splashBlocksInput()
+    if driverCo and not Game then
+      local ok, err = coroutine.resume(driverCo, Importer)
+      if not ok then
+        print("driver error: " .. tostring(err))
+        love.event.quit(1)
+        return
+      end
+      if coroutine.status(driverCo) == "dead" then
+        love.event.quit()
+        return
+      end
+    end
     return Importer:update(dt)
   end
   if not Game then return end
@@ -995,7 +1078,7 @@ function love.update(dt)
     local i = 0
     while i < iterations do
       i = i + 1
-      local ok, err = coroutine.resume(driverCo, Game)
+      local ok, err = coroutine.resume(driverCo, Game, driverHost)
       if not ok then
         print("driver error: " .. tostring(err))
         love.event.quit(1)
@@ -1316,6 +1399,8 @@ end
 love.handlers = love.handlers or {}
 
 function love.handlers.audiosuspend()
+  local BoxCry = package.loaded["src.box.Cry"]
+  if BoxCry then pcall(BoxCry.setSuspended, true) end
   local ChipAudio = package.loaded["src.core.ChipAudio"]
   if ChipAudio then pcall(ChipAudio.setSuspended, true) end
   local Sound = package.loaded["src.core.Sound"]
@@ -1325,6 +1410,8 @@ function love.handlers.audiosuspend()
 end
 
 function love.handlers.audioreset()
+  local BoxCry = package.loaded["src.box.Cry"]
+  if BoxCry then pcall(BoxCry.setSuspended, false) end
   local ChipAudio = package.loaded["src.core.ChipAudio"]
   if ChipAudio then
     pcall(ChipAudio.setSuspended, false)
@@ -1473,9 +1560,7 @@ function love.mousepressed(x, y, button, istouch)
     -- stacked two SAF pickers (#553). Clicks are polled inside FlexLove from
     -- love.touch / mouse.isDown, so dropping the synthesized istouch press is
     -- safe. A real mouse (DeX, Chromebook, USB) still reaches mousepressed.
-    if istouch and (love.system.getOS() == "Android"
-        or love.system.getOS() == "iOS") then return end
-    return Importer:mousepressed(x, y, button)
+    return Importer:mousepressed(x, y, button, istouch)
   end
   if editorMode and EditorApp.mousepressed then
     -- The editor owns the real touch lifecycle on Android and iOS.
@@ -1505,7 +1590,7 @@ function love.mousereleased(x, y, button, istouch)
     if istouch and (love.system.getOS() == "Android" or love.system.getOS() == "iOS") then return end
     return Studio.mousereleased(x, y, button)
   end
-  if Importer then return end
+  if Importer then return Importer:mousereleased(x, y, button, istouch) end
   if editorMode and EditorApp.mousereleased then
     return EditorApp.mousereleased(x, y, button)
   end
@@ -1527,7 +1612,8 @@ function love.mousemoved(x, y, dx, dy, istouch)
     if istouch and (love.system.getOS() == "Android" or love.system.getOS() == "iOS") then return end
     return Studio.mousemoved(x, y)
   end
-  if editorMode or Importer then return end
+  if Importer then return Importer:mousemoved(x, y, dx, dy, istouch) end
+  if editorMode then return end
   if mouseTouch then
     if Game and love.mouse.isDown(1) then Game:touchmoved("mouse", x, y) end
     return
@@ -1545,12 +1631,6 @@ function love.textinput(text)
   end
 end
 
--- #785: set once love.quit has routed a window close into HostShell.restart,
--- so the follow-up quit event the restart itself raises (quit("restart") on
--- desktop; AppImage and Android relaunch the process instead, #575) falls
--- through to the normal shutdown below instead of restarting forever.
-local quitToLauncher = false
-
 function love.quit()
   if launcherSplash then launcherSplash:release(); launcherSplash = nil end
   if Importer and Importer._themeVideo then
@@ -1560,6 +1640,11 @@ function love.quit()
   if Importer then
     require("src.import.LauncherWindow").observe(0)
     require("src.import.LauncherWindow").flush()
+  end
+  local osName = love.system and love.system.getOS and love.system.getOS()
+  if osName == "NX" then
+    endProcessOnce()
+    return
   end
   if editorMode and EditorApp.quit then
     -- true blocks the quit (unsaved-changes prompt).  A quit that proceeds
@@ -1587,36 +1672,21 @@ function love.quit()
   -- docs/modding.md's core.quit_to_launcher entry) may veto returning to
   -- this Lua launcher via that hook. Vanilla behavior (used when no mod
   -- claims the hook) is exactly the condition below.
-  --
-  -- Android and iOS both tear down LOVE in-process rather than
-  -- love.event.quit("restart"): Android's vendored love.cpp PHYSFS-crashes
-  -- on a second init (#575), and iOS's love.cpp forces DONE_RESTART for
-  -- every quit while warning that leftover threads make that unreliable.
-  -- SessionLifecycle workers (ChipAudio / Fetch / Check) make that warning
-  -- real -- endProcess joins them, then the native restart still blows up.
-  local osName = love.system and love.system.getOS and love.system.getOS()
-  local inProcessReturn = (osName == "Android" or osName == "iOS")
+  local mobile = (osName == "Android" or osName == "iOS")
   local wouldReturnToLauncher = PlatformHooks.quitToLauncher(function()
     return Game and not Importer and not quitToLauncher and not scripted
-      and (inProcessReturn or not launchedIntoGame)
+      and (mobile or not launchedIntoGame)
   end)
   if wouldReturnToLauncher then
-    if inProcessReturn then
+    local HostShell = require("src.core.HostShell")
+    if HostShell.restarting and HostShell.canRestart() then
+      returnToLauncher({ restarting = true })
+    else
       returnToLauncher()
-      return true -- abort this quit; stay in the same LOVE run
+      return true
     end
-    quitToLauncher = true
-    -- Tell the fresh boot to ignore any boot-straight-into-a-game option this
-    -- once, so the restart really does land in the launcher (#887).  A failed
-    -- write only costs that suppression, so it must never block the restart.
-    pcall(love.filesystem.write, RELAUNCH_MARKER, "1")
-    require("src.core.HostShell").restart()
-    return true -- abort this quit; the restart lands back in the launcher
   end
-  pcall(function()
-    require("src.core.DiscordPresence").shutdown()
-  end)
-  SessionLifecycle.endProcess()
+  endProcessOnce()
 end
 
 function love.filedropped(file)
@@ -1645,6 +1715,7 @@ end
 -- Shane #1830 idle render governor (POKEPORT_IDLE_*): drop presentation rate
 -- on static in-game screens; game logic and audio stay at full speed.
 local function idlePresentationCap(idleFor)
+  if Importer then return 30 end
   local after = tonumber(os.getenv("POKEPORT_IDLE_AFTER"))
   local fps = tonumber(os.getenv("POKEPORT_IDLE_FPS"))
   if not after or after <= 0 or not fps or fps <= 0 then return nil end
@@ -1654,6 +1725,7 @@ local function idlePresentationCap(idleFor)
 end
 
 function love.run()
+  _G.POKEPORT_LOOP_RESTART = true
   if love.load then love.load(love.arg.parseGameArguments(arg), arg) end
 
   -- don't let love.load's cost land in the first frame's dt
@@ -1707,7 +1779,7 @@ function love.run()
             -- teardown, so the relaunched task re-enters an activity whose
             -- native main already returned; end the process outright once the
             -- love.quit hook has run (#339)
-            if love.system and love.system.getOS() == "Android" then
+            if a ~= "restart" and love.system and love.system.getOS() == "Android" then
               os.exit(a or 0)
             end
             return a or 0

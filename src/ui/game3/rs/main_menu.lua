@@ -7,8 +7,15 @@ local Constants = require("src.core.game3.constants")
 local Flags = require("src.core.game3.scripting.flags")
 local Chrome = require("src.ui.game3.chrome")
 local Pal = require("src.core.game3.pal_fade")
+local Stack = require("src.ui.game3.stack")
+local Screens = require("src.ui.game3.screens")
+local PixelCanvas = require("src.render.PixelCanvas")
 local Menu = {}
 Menu.__index = Menu
+local function childLayer()
+  local top = Stack.top()
+  if top and top.id ~= "option" and top.mod then return top end
+end
 
 -- pokeruby/src/main_menu.c:45
 Menu.TYPE = { HAS_NO_SAVED_GAME = 0, HAS_SAVED_GAME = 1, HAS_MYSTERY_EVENT = 2 }
@@ -147,8 +154,14 @@ end
 function Menu:update(input, dt)
   if self.state == "events" and self.events then return self.events:update(input,dt) end
   if self.state == "options" and self.options then
-    self.options.handleInput(input)
-    if self.options.update then self.options.update() end
+    local child = childLayer()
+    if child then
+      Screens.handleInput(child.id, child.mod, input)
+      if child.mod.update then child.mod.update() end
+    else
+      self.options.handleInput(input)
+      if self.options.update then self.options.update() end
+    end
   end
   self.step:collect(input)
   return self.step:run(dt, function(inp) return self:frame(inp) end)
@@ -189,7 +202,11 @@ local function composite(img, rect)
 end
 function Menu:draw()
   if self.state == "events" and self.events then return self.events:draw() end
-  if self.state == "options" and self.options then return self.options.draw() end
+  if self.state == "options" and self.options then
+    local child = childLayer()
+    if child then return Screens.draw(child.id, child.mod) end
+    return self.options.draw()
+  end
   local c = self:colors()
   local shade = self.state == "pressed_b" and 1 or 9 / 16
   love.graphics.clear(c.backdrop[1] * shade, c.backdrop[2] * shade, c.backdrop[3] * shade, 1)
@@ -197,7 +214,7 @@ function Menu:draw()
   local error = self.state == "save_error" or self.state == "rtc_error"
   local showMenu = self.state == "highlight" or self.state == "input" or self.state == "pressed_a" or self.state == "pressed_b" or self.state == "options"
   if showMenu then
-    canvas = canvas or love.graphics.newCanvas(240, 160)
+    canvas = canvas or PixelCanvas.new(240, 160)
     canvas:setFilter("nearest", "nearest")
     love.graphics.push("all"); love.graphics.setCanvas(canvas); love.graphics.origin(); love.graphics.clear(0, 0, 0, 0)
     local dy = self.scroll or 0

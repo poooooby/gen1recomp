@@ -118,7 +118,7 @@ function M.word(id)
     local E = require("src.core.game3.easy_chat_text")
     local group = E.group(math.floor(value / 512) % 128)
     if group then
-      for _, word in ipairs(group.words) do if word.id == value then return word.text end end
+      for _, word in ipairs(group.words) do if word.id == value then return E.word(value) end end
     end
     return romText("gOtherText_ThreeQuestions")
   end, id)
@@ -148,7 +148,7 @@ function M.mapName(session, section)
       require("src.core.game3.rse.secret_base")._curId = n(base.secretBaseId)
       local owner = Q.encode(session, base.trainerName or base.playerName, 7)
       table.remove(owner)
-      return Q.text(session, owner) .. romText("gOtherText_PlayersBase")
+      return require("src.core.game3.rse.secret_base").nameWith(Q.text(session, owner))
     end
     if sec < C:require("region_map_sections", "MAPSEC_NONE") then return require("src.ui.game3.rse.mapsec").name(sec) end
     return string.rep(" ", 18)

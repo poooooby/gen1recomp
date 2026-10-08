@@ -1409,6 +1409,7 @@ return {
   [0x2380CC] = 0x2380A8, -- :gMonShinyPaletteTable + 0
   [0x23957C] = 0x239558, -- :gTrainerFrontPicTable + 0
   [0x239A1C] = 0x2399F8, -- :gTrainerFrontPicPaletteTable + 0
+  [0x239F74] = 0x239F50, -- :gTrainerBackAnimsPtrTable + 0
   [0x239FA4] = 0x239F80, -- :gTrainerBackPicTable + 0
   [0x239FD4] = 0x239FB0, -- :gTrainerBackPicPaletteTable + 0
   [0x23E558] = 0x23E534, -- :gTrainerClassNames + 0
@@ -1716,6 +1717,7 @@ return {
   [0x3E2280] = 0x3E20BC, -- naming_screen.o:sTransferredToPCMessages + 0
   [0x3ECED4] = 0x3ECD10, -- easy_chat.o:sEasyChatGroups + 0
   [0x3EDF98] = 0x3EDDD4, -- easy_chat.o:sEasyChatGroupNamePointers + 0
+  [0x3EE008] = 0x3EDE44, -- mon_markings.o:sMonMarkings_Pal + 0
   [0x3EE028] = 0x3EDE64, -- mon_markings.o:sMonMarkings_Gfx + 0
   [0x3EE828] = 0x3EE664, -- mon_markings.o:sJPText_Confirm + 0
   [0x3EEBF8] = 0x3EEA34, -- heal_location.o:sHealLocations + 0
