@@ -8,6 +8,17 @@ data/generated/
 assets/generated/
 yellow/*
 crystal/*
+blue/*
+silver/*
+firered/*
+leafgreen/*
+ruby/*
+sapphire/*
+emerald/*
+launcher-window.cfg
+mod_index_cache.lua
+mod_update_cache.lua
+mod_storage/
 mods/*
 mod_cache/*
 mod_compat/*
