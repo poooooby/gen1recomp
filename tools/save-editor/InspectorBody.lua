@@ -291,6 +291,10 @@ local function drawSection(S, Kit, x, y, w, h, report, issues)
           abilities[#abilities + 1] = { i - 1, Pokemon.abilityName(id) }
         end
       end
+      -- a species with no Gen 3 ability (most of national_dex_gen3's: their
+      -- abilities were added after Gen 3) has an empty list; show it as None
+      -- rather than as an invalid saved value
+      if #abilities == 0 then abilities[1] = { slot, "None" } end
       choice("ability", "Ability", slot, abilities, function(v)
         return Ops.setAbility(S, mon, v)
       end)

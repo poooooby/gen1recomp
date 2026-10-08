@@ -11,8 +11,17 @@ function MonOps.create(data, species, level, gen)
     local SummaryData = require("src.core.game3.summary_data")
     pcall(PokemonG3.install, nil)
 
-    local spId = tonumber(species) or (PokemonG3.speciesFromName and PokemonG3.speciesFromName(tostring(species))) or 1
-    local name = (PokemonG3.name and PokemonG3.name(spId)) or tostring(species)
+    -- the catalog's own record first: a species a mod registered (not in the
+    -- cart's name table, which speciesFromName reads) still carries its slot
+    local def = type(data) == "table" and data.pokemon and data.pokemon[species]
+    local spId = tonumber(species)
+      or (type(def) == "table" and tonumber(def.speciesId))
+      or (PokemonG3.speciesFromName and PokemonG3.speciesFromName(tostring(species))) or 1
+    -- name() raises for a slot the cart has no name for (a mod's), not nil
+    local okName, romName = false, nil
+    if PokemonG3.name then okName, romName = pcall(PokemonG3.name, spId) end
+    local name = (okName and romName)
+      or (type(def) == "table" and def.name) or tostring(species)
 
     local personality = (love and love.math and love.math.random and love.math.random(0, 0xFFFFFFFF))
       or (math.floor(math.random() * 0x100000000) % 0x100000000)
@@ -621,14 +630,24 @@ function MonOps.setSpecies(data, mon, species, gen)
   if isG3 then
     local PokemonG3 = require("src.core.game3.pokemon")
     pcall(PokemonG3.install, nil)
-    local spId = tonumber(species) or (PokemonG3.speciesFromName and PokemonG3.speciesFromName(tostring(species))) or 1
-    local name = (PokemonG3.name and PokemonG3.name(spId)) or tostring(species)
+    -- the catalog's own record first: a species a mod registered (not in the
+    -- cart's name table, which speciesFromName reads) still carries its slot
+    local def = type(data) == "table" and data.pokemon and data.pokemon[species]
+    local spId = tonumber(species)
+      or (type(def) == "table" and tonumber(def.speciesId))
+      or (PokemonG3.speciesFromName and PokemonG3.speciesFromName(tostring(species))) or 1
+    -- name() raises for a slot the cart has no name for (a mod's), not nil
+    local okName, romName = false, nil
+    if PokemonG3.name then okName, romName = pcall(PokemonG3.name, spId) end
+    local name = (okName and romName)
+      or (type(def) == "table" and (def.baseName or def.name)) or tostring(species)
     mon.species = spId
     mon.speciesNumbering = PokemonG3.NUMBERING_INTERNAL
     mon.speciesId = spId
     mon.name = name
     local meta = PokemonG3.speciesMeta and PokemonG3.speciesMeta(spId)
-    mon.growthRate = (meta and tonumber(meta.growthRate)) or 0
+    mon.growthRate = (meta and tonumber(meta.growthRate))
+      or (type(def) == "table" and tonumber(def.growthRate)) or 0
     MonOps.setLevel(data, mon, mon.level or 5, gen)
     return
   end

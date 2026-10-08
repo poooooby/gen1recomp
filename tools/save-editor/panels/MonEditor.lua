@@ -10,18 +10,31 @@ local MonEditor = {}
 -- Front sprites are read straight off the generated cache.  One image per
 -- species, cached for the process: the old panel called newImage every frame,
 -- which re-decoded a PNG sixty times a second.
-local spriteCache = {}
+local spriteCache, spriteCount = {}, 0
+-- A picture a sprite mod supplies (a species or form past the cart's own) can
+-- be a canvas that mod frees after a while, so the cache is bounded and simply
+-- dropped when full; a dropped entry is fetched again on its next draw.
+local function remember(species, img)
+  spriteCount = spriteCount + 1
+  if spriteCount > 300 then spriteCache, spriteCount = {}, 1 end
+  spriteCache[species] = img
+end
 function MonEditor.sprite(S, species)
   if not species then return nil end
   if spriteCache[species] ~= nil then return spriteCache[species] or nil end
   if Gen.ofState(S) == 3 then
     local okP, Pokemon = pcall(require, "src.core.game3.pokemon")
     if okP and Pokemon then
-      local spId = tonumber(species) or (Pokemon.speciesFromName and Pokemon.speciesFromName(tostring(species)))
+      -- the species list's own entry knows its slot (a mod's species and forms
+      -- are not in the cart's name table, which speciesFromName reads)
+      local entry = S.data and S.data.pokemon and S.data.pokemon[species]
+      local spId = tonumber(species)
+        or (type(entry) == "table" and tonumber(entry.speciesId))
+        or (Pokemon.speciesFromName and Pokemon.speciesFromName(tostring(species)))
       if spId then
         local pic = (Pokemon.frontPic and Pokemon.frontPic(spId)) or (Pokemon.icon and Pokemon.icon(spId))
         if pic and pic.image then
-          spriteCache[species] = pic.image
+          remember(species, pic.image)
           return pic.image
         end
       end

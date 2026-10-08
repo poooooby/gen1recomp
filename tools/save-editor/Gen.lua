@@ -167,6 +167,98 @@ function Gen.missingCacheMessage(version)
 end
 
 -- Bind Game 3 (FireRed) data into Data table for Save Editor
+-- Adds species ids first..last to data.pokemon from the running Gen 3 species
+-- tables. The cart's own range is bound before mods load; a mod that registers
+-- species past it (national_dex_gen3 at 451..1089) only has names once its
+-- mod has loaded, so App calls this again for that range afterwards. The dex
+-- number falls back to the slot when the mod's own repair (a game.ready hook
+-- the editor never fires) has not filled in the national table.
+function Gen.addGame3Species(data, first, last)
+  local okP, Pokemon = pcall(require, "src.core.game3.pokemon")
+  if not (okP and Pokemon) then return end
+  data.pokemon = data.pokemon or {}
+  for id = first, last do
+    local okN, name = pcall(Pokemon.name, id)
+    if okN and name and name ~= "??????????" and name ~= "" then
+      local def = {
+        id = name,
+        name = name,
+        species = id,
+        speciesId = id,
+        dex = Pokemon.national(id) or id,
+        growthRate = (Pokemon.speciesMeta and Pokemon.speciesMeta(id) and Pokemon.speciesMeta(id).growthRate) or 0,
+      }
+      data.pokemon[name] = def
+      data.pokemon[id] = def
+    end
+  end
+end
+
+-- Puts the mod loader's moves and pokemon registries onto the live Gen 3
+-- tables by the game's own route: Gen3Compat.applyMerged registers reload
+-- hooks that write each registry onto the species/move tables, and a species
+-- reload (Pokemon.install) fires them. The editor loads mods without starting
+-- a game, so without this a species or move a mod registered has no ability,
+-- learnset, type or stats row, and the editor flags it as invalid. `Data` only
+-- stands in for the game's data table; the loader supplies the registries.
+function Gen.applyGame3Mods(mods, data)
+  if not (mods and mods.content) then return false end
+  local okC, Compat = pcall(require, "src.mods.Gen3Compat")
+  local okP, Pokemon = pcall(require, "src.core.game3.pokemon")
+  if not (okC and okP and Compat.applyMerged and Pokemon.install) then return false end
+  local okA = pcall(Compat.applyMerged, { mods = mods, data = data })
+  if not okA then return false end
+  return (pcall(Pokemon.install, nil))
+end
+
+-- Gen 3 growth rate ids, by the registry's names (include/constants/pokemon.h).
+local GROWTH_ID = { MEDIUM_FAST = 0, ERRATIC = 1, FLUCTUATING = 2,
+                   MEDIUM_SLOW = 3, FAST = 4, SLOW = 5 }
+
+-- Adds the species a mod registered past the cart's own range, read from the
+-- mod loader's pokemon registry (content.pokemon). The editor never fires
+-- game.ready, which is when the engine copies registry species into
+-- Pokemon.name()/national(), so those still answer nil here; the registry
+-- already carries the name, slot (`index`) and national dex number.
+function Gen.addGame3RegistrySpecies(data, registry, minSlot)
+  if not (data and registry and registry.each) then return 0 end
+  data.pokemon = data.pokemon or {}
+  local ok, each = pcall(function() return registry:each() end)
+  if not ok then return 0 end
+  local ids = {}
+  if type(each) == "function" then
+    for id in each do ids[#ids + 1] = id end
+  elseif type(each) == "table" then
+    for _, id in ipairs(each) do ids[#ids + 1] = id end
+  end
+  local added = 0
+  for _, id in ipairs(ids) do
+    local okG, r = pcall(function() return registry:get(id) end)
+    local slot = okG and type(r) == "table" and tonumber(r.index) or nil
+    if slot and slot >= minSlot and not data.pokemon[slot] then
+      local name = tostring(r.name or id)
+      -- An alternate form (a record with baseSpecies + form) shares its base's
+      -- display name, so it is keyed by its own id and labelled with its form,
+      -- or it would replace the base under that name.
+      local key, label = name, name
+      if r.baseSpecies and r.form then
+        key = tostring(id)
+        label = name .. " (" .. (tostring(r.form):gsub("_", " ")) .. ")"
+      end
+      local def = {
+        id = key, name = label, baseName = name, species = slot, speciesId = slot,
+        dex = tonumber(r.baseDex or r.dex) or slot,
+        growthRate = GROWTH_ID[r.growthRate] or 0,
+        baseStats = r.baseStats, types = r.types,
+      }
+      data.pokemon[key] = def
+      data.pokemon[slot] = def
+      added = added + 1
+    end
+  end
+  return added
+end
+
 function Gen.bindGame3Data(data)
   if type(data) ~= "table" then return data end
   local okD, Dataset = pcall(require, "src.core.game3.dataset")
@@ -192,21 +284,7 @@ function Gen.bindGame3Data(data)
   if okP and Pokemon then
     pcall(Pokemon.install, nil)
     data.pokemon = data.pokemon or {}
-    for id = 1, Pokemon.SPECIES_EGG - 1 do
-      local okN, name = pcall(Pokemon.name, id)
-      if okN and name and name ~= "??????????" and name ~= "" then
-        local def = {
-          id = name,
-          name = name,
-          species = id,
-          speciesId = id,
-          dex = Pokemon.national(id) or id,
-          growthRate = (Pokemon.speciesMeta and Pokemon.speciesMeta(id) and Pokemon.speciesMeta(id).growthRate) or 0,
-        }
-        data.pokemon[name] = def
-        data.pokemon[id] = def
-      end
-    end
+    Gen.addGame3Species(data, 1, Pokemon.SPECIES_EGG - 1)
 
     data.moves = data.moves or {}
     local okB, BuiltinMoves = pcall(require, "src.core.game3.battle.builtin_moves")
@@ -311,7 +389,12 @@ function Gen.hydrateMon(data, mon)
       local spId = Pokemon.speciesOf(mon)
       if spId then
         mon.speciesId = spId
-        local name = Pokemon.name(spId)
+        -- name() raises for a slot only a mod registered; the catalog has it
+        local okN, name = pcall(Pokemon.name, spId)
+        if not okN then
+          local def = data and data.pokemon and data.pokemon[spId]
+          name = def and (def.baseName or def.name)
+        end
         if name and name ~= "" and name ~= "??????????" then
           mon.species = spId
           mon.name = mon.name or name

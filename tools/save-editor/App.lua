@@ -230,6 +230,14 @@ function App.load(pathOverride, opts)
     local ModLoader = require("src.mods.Loader")
     mods = ModLoader.new()
     mods:load(Data)
+    if Gen.of(nil, opts.version) == 3 or require("src.core.GameVersion").generation() == 3 then
+      -- the species/move rows a mod registered, onto the live tables (abilities,
+      -- learnsets, stats), as the game does after loading
+      Gen.applyGame3Mods(mods, Data)
+      -- species a mod registered past the cart's own range (national_dex_gen3)
+      Gen.addGame3RegistrySpecies(Data, mods.content and mods.content.pokemon,
+        require("src.core.game3.pokemon").SPECIES_EGG + 1)
+    end
     App.dataVersion = opts.version
   end
   S.mods = mods

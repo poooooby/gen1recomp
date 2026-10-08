@@ -120,7 +120,9 @@ function L.mon(S, mon)
       local slot = mon.abilityNum or (pair[2] and pair[2] ~= 0 and pid % 2 or 0)
       range("ability slot", slot, 0, 1)
       local expected = integer(slot, 0, 1) and pair[slot + 1] or nil
-      if expected == 0 or not expected or (mon.ability and mon.ability ~= expected) then
+      -- no Gen 3 ability at all (see InspectorBody): saved as none, which is valid
+      local noAbility = (pair[1] or 0) == 0 and (pair[2] or 0) == 0 and (mon.ability or 0) == 0
+      if not noAbility and (expected == 0 or not expected or (mon.ability and mon.ability ~= expected)) then
         add("error", "ability", "Ability is unavailable in the selected species slot")
       end
       local bit = require("bit")
