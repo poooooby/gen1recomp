@@ -84,6 +84,41 @@ function MonEditor.sprite(S, species, mon)
   return ok and img or nil
 end
 
+-- Where the creature actually is inside a picture a sprite mod hands over. The engine's own
+-- pictures fill their 64x64 box; a mod's (g9-battle-sprites-gen3) keeps the game's true size,
+-- so a small creature sits in a mostly empty canvas and, fitted to a small editor slot,
+-- came out a speck. Read once per picture, from the pixels, and only for canvases (an
+-- Image has no way to read back): { x, y, w, h } in the texture's own pixels, or false.
+local contentBoxes = setmetatable({}, { __mode = "k" })
+local function contentBox(img)
+  local hit = contentBoxes[img]
+  if hit ~= nil then return hit or nil end
+  local box = false
+  if type(img.newImageData) == "function" then
+    local ok, found = pcall(function()
+      local data = img:newImageData()
+      local pw, ph = data:getDimensions()
+      local x0, y0, x1, y1 = pw, ph, -1, -1
+      for py = 0, ph - 1 do
+        for px = 0, pw - 1 do
+          local _, _, _, a = data:getPixel(px, py)
+          if a > 0.05 then
+            if px < x0 then x0 = px end
+            if px > x1 then x1 = px end
+            if py < y0 then y0 = py end
+            if py > y1 then y1 = py end
+          end
+        end
+      end
+      if x1 < x0 then return false end
+      return { x = x0, y = y0, w = x1 - x0 + 1, h = y1 - y0 + 1, pw = pw, ph = ph }
+    end)
+    if ok and found then box = found end
+  end
+  contentBoxes[img] = box
+  return box or nil
+end
+
 -- Draw a species sprite fitted into a box, or a dashed placeholder when the
 -- cache has no art for it (a modded species, or a headless run).
 function MonEditor.drawSprite(S, Kit, species, x, y, size, mon)
@@ -91,8 +126,21 @@ function MonEditor.drawSprite(S, Kit, species, x, y, size, mon)
   if img and love.graphics.draw and img.getDimensions then
     local iw, ih = img:getDimensions()
     if iw > 0 and ih > 0 then
-      local scale = math.min(size / iw, size / ih)
+      local box = contentBox(img)
       love.graphics.setColor(1, 1, 1, 1)
+      if box then
+        -- the creature only, fitted to the slot: the whole picture is drawn, moved so the
+        -- creature lands in the slot (everything outside it is transparent). `box` is in
+        -- the texture's pixels, which a canvas with a DPI scale shows smaller by that factor
+        local dpi = box.pw / iw
+        local shownW, shownH = box.w / dpi, box.h / dpi
+        local scale = math.min(size / shownW, size / shownH)
+        love.graphics.draw(img,
+          x + (size - shownW * scale) / 2 - (box.x / dpi) * scale,
+          y + (size - shownH * scale) / 2 - (box.y / dpi) * scale, 0, scale, scale)
+        return
+      end
+      local scale = math.min(size / iw, size / ih)
       love.graphics.draw(img, x + (size - iw * scale) / 2,
         y + (size - ih * scale) / 2, 0, scale, scale)
       return
