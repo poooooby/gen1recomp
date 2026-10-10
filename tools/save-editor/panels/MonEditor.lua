@@ -9,22 +9,10 @@ local MonEditor = {}
 -- species, cached for the process: the old panel called newImage every frame,
 -- which re-decoded a PNG sixty times a second.
 local spriteCache = {}
-local spriteCount = 0
 local SPINDA_CACHE_MAX = 16
 local spindaKeys = {}
 
--- A picture a sprite mod supplies (a species or form past the cart's own) can
--- be a canvas that mod frees after a while, so the whole cache is bounded and
--- simply dropped when full; a dropped entry is fetched again on its next draw.
-local SPRITE_CACHE_MAX = 300
-
 local function remember(key, value)
-  if spriteCache[key] == nil then
-    spriteCount = spriteCount + 1
-    if spriteCount > SPRITE_CACHE_MAX then
-      spriteCache, spriteCount, spindaKeys = {}, 1, {}
-    end
-  end
   spriteCache[key] = value
   if type(key) == "string" and key:find("^308:") then
     spindaKeys[#spindaKeys + 1] = key
@@ -53,12 +41,7 @@ function MonEditor.sprite(S, species, mon)
   if Gen.ofState(S) == 3 then
     local okP, Pokemon = pcall(require, "src.core.game3.pokemon")
     if okP and Pokemon then
-      -- the species list's own entry knows its slot (a mod's species and forms
-      -- are not in the cart's name table, which speciesFromName reads)
-      local entry = S.data and S.data.pokemon and S.data.pokemon[species]
-      local spId = tonumber(species)
-        or (type(entry) == "table" and tonumber(entry.speciesId))
-        or (Pokemon.speciesFromName and Pokemon.speciesFromName(tostring(species)))
+      local spId = tonumber(species) or (Pokemon.speciesFromName and Pokemon.speciesFromName(tostring(species)))
       if spId then
         local picId = letter ~= nil and Pokemon.picSpecies(spId, mon.personality) or spId
         local pic = (Pokemon.frontPic and Pokemon.frontPic(picId, nil, nil, mon and mon.personality))

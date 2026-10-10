@@ -344,10 +344,6 @@ local function identityColumn(C, x, y, w)
         abilities[#abilities + 1] = { i - 1, titleCase(Pokemon.abilityName(id)) }
       end
     end
-    -- a species with no Gen 3 ability (most of national_dex_gen3's: their
-    -- abilities were added after Gen 3) has an empty list; show it as None
-    -- rather than as an invalid saved value
-    if #abilities == 0 then abilities[1] = { slot, "None" } end
     local half = w >= 340 * s
     local hw = half and (w - 16 * s) / 2 or w
     local top = cy
