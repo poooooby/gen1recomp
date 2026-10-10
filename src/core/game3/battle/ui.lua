@@ -74,7 +74,7 @@ Ui._partnerAction = nil
 -- pokefirered/src/battle_script_commands.c:5149
 local BATTLE_YESNO = { left = 24, top = 9, style = "battle" }
 
--- pret sBattlerCoords (singles) — CreateSprite CENTER before pic y_offset
+-- pokeemerald/src/battle_anim_mons.c:38
 local ENEMY_MON = { x = 176, y = 40 }
 local PLAYER_MON = { x = 72, y = 80 }
 
@@ -2655,12 +2655,12 @@ local function draw_party_bars(stage)
   local enemy = stage.partyBar.enemy
   if enemy and enemy.visible then
     local pos = m.partyBarOpponent or { x = 104, y = 40 }
-    BattleChrome.drawPartyBar(enemy.x or pos.x, enemy.y or pos.y, enemy.balls, enemy.ox, true)
+    BattleChrome.drawPartyBar(enemy.x or pos.x, enemy.y or pos.y, enemy.balls, enemy.ox, true, enemy)
   end
   local player = stage.partyBar.player
   if player and player.visible then
     local pos = m.partyBarPlayer or { x = 136, y = 96 }
-    BattleChrome.drawPartyBar(pos.x, pos.y, player.balls, player.ox, false)
+    BattleChrome.drawPartyBar(pos.x, pos.y, player.balls, player.ox, false, player)
   end
 end
 
@@ -2797,6 +2797,11 @@ function Ui.draw(w, h)
   Anim.drawParticles(201, 999)
   end
   if Anim.endParticleFrame then Anim.endParticleFrame() end
+  local entry = stage and stage.entry
+  if entry then
+    -- pokeemerald/src/battle_bg.c:1198
+    BattleChrome.drawEntry(entry.key, entry.x, entry.y, entry.alpha)
+  end
   LevelUpStreaks.draw(st)
   draw_intro_ball(stage)
   -- pokefirered/src/pokeball.c:770
@@ -2835,6 +2840,15 @@ function Ui.draw(w, h)
     if st and not dbl and Ui.litHealthboxShown() then
       Healthbox.draw("player", Anim.shownBattler("player", st.player), { oy = Ui.bounceOffset("hb", 0) })
     end
+  end
+
+  -- pokeemerald/src/battle_main.c:631
+  local win0 = stage and stage.win0
+  if win0 then
+    love.graphics.setColor(0, 0, 0, 1)
+    love.graphics.rectangle("fill", 0, 0, w, win0[1])
+    love.graphics.rectangle("fill", 0, win0[2], w, h - win0[2])
+    love.graphics.setColor(1, 1, 1, 1)
   end
 
   local BagMenu = package.loaded["src.ui.game3.bag_menu"]

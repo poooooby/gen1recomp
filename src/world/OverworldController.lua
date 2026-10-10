@@ -648,14 +648,6 @@ function OverworldState:setMap(mapId, x, y, facing, opts)
   if not keepMusic then
     -- ..(home/overworld.asm ln 2346)
     local Music = require("src.core.Music")
-    -- opts.freshBoot: switch instantly instead of cross-fading, like every
-    -- other map's PlayDefaultMusic on real hardware -- set only by
-    -- Game.lua's hard state teleports (onContinue, New Game, F2,
-    -- restoreCheckpointSave). Deliberately separate from opts.via ==
-    -- "boot" itself: dev tooling (src/dev/Console.lua's warp verb,
-    -- src/dev/HotReload.lua's reloadMap) reuses that same default for the
-    -- surf-restore/fresh-npc-pool branches above and must keep the
-    -- ordinary crossfade.
     local fade = Music.MAP_FADE
     if opts and opts.freshBoot then fade = nil end
     Music.playMap(Game.data, mapId, Game.save.onBike, self.player.surfing,
@@ -5214,6 +5206,8 @@ function OverworldState:safariGameOver(text)
     (text or "") .. "\f" .. (t._GameOverText or romText(Game.data, "_GameOverText", "PA: Your SAFARI\nGAME is over!")),
     function()
       local exit_ = FieldDefaults.fieldValue(Game.data, "safari", "exitWarp")
+      -- home/overworld.asm:54
+      self.doorWarp = true
       self:startWarpTo(exit_.map, exit_.x, exit_.y, exit_.facing or "down")
     end))
 end
@@ -5438,7 +5432,7 @@ function OverworldState:warpToHealPoint(onDone, opts)
   else
     map, x, y = self:escapeWarpTarget()
   end
-  self:startWarpTo(map, x, y, "down", onDone)
+  self:startWarpTo(map, x, y, "down", onDone, { healWarp = true })
   -- PrepareForSpecialWarp (engine/overworld/special_warps.asm:1-29) writes the
   self:rememberOutdoor(map, x, y)
 end
@@ -5465,6 +5459,13 @@ function OverworldState:startWarpTo(mapId, x, y, facing, onDone, opts)
   self.doorWarp = nil
   local arriveWarp = self.arriveWarp
   self.arriveWarp = nil
+  -- home/overworld.asm:482 WarpFound2
+  if not doorWarp and not arriveWarp and not opts then
+    local w = self.map:warpAtCell(self.player.cellX, self.player.cellY)
+    local dest = w and w.def.destMap
+    if dest == "LAST_MAP" then dest = self.lastOutdoor and self.lastOutdoor.id end
+    if dest and dest == mapId then doorWarp = true end
+  end
   if self.spinArrive then
     self.spinArrive = nil
     self.player.inputLocked = false

@@ -17,10 +17,13 @@ local Player = {}
 local CELL = 16
 local WALK_FRAMES = 16
 local RUN_FRAMES = 8
+-- pokefirered/src/event_object_movement.c:6163
+local WALK_IN_PLACE_SLOW_FRAMES = 32
 -- pokefirered/src/event_object_movement.c:9029 UpdateRunSlowAnim
 local RUN_SLOW_FRAMES = 11
 local BIKE_FRAMES = 4
-local TURN_FRAMES = 4
+-- pokeemerald/src/event_object_movement.c:5780 MovementAction_WalkInPlaceFastDown_Step0
+local TURN_FRAMES = 8
 -- pokefirered/include/constants/metatile_behaviors.h:128
 local MB_CYCLING_ROAD_PULL_DOWN = 0xD0
 local MB_CYCLING_ROAD_PULL_DOWN_GRASS = 0xD1
@@ -316,6 +319,12 @@ local function walkInPlaceFrames()
   return Player.walkInPlaceFast and RUN_FRAMES or WALK_FRAMES
 end
 
+local function surfBobY()
+  if not (Player.surfing or Player.underwater) then return nil end
+  local FieldEffects = package.loaded["src.core.game3.field_effects"]
+  return FieldEffects and FieldEffects.surfPlayerY2 and FieldEffects.surfPlayerY2() or 0
+end
+
 -- pokefirered/src/field_effect.c:1215 FallWarpEffect_4
 local function warp_owns_sprite()
   local Warp = package.loaded["src.core.game3.warp"]
@@ -396,7 +405,7 @@ local function beginStep(tx, ty, run, ledge)
   Player.targetY = ty
   Player.running = (not ledge) and run and true or false
   Player.jumping = ledge and true or false
-  Player.spriteYOffset = 0
+  Player.spriteYOffset = (not ledge) and surfBobY() or 0
   if Player.surfHopping or Player.dismounting then
     -- pokeemerald/src/event_object_movement.c:8495 DoJumpSpecialSpriteMovement
     Player.stepFrames = JUMP_FRAMES
@@ -532,20 +541,84 @@ function Player.fieldTriggers(game, dir)
     or stepTriggers(game, dir, Player.facing, Player.cellX + d[1], Player.cellY + d[2])
 end
 
+-- pokefirered/src/field_player_avatar.c:1005 PlayCollisionSoundIfNotFacingWarp
+local function playCollisionSoundIfNotFacingWarp(dir)
+  local beh = Collision.behavior(Player.cellX, Player.cellY)
+  if Collision.arrowWarpDir(beh) == dir then return end
+  if Collision.isStairWarpBehavior(beh) and Collision.stairWarpDir(beh) == dir then
+    return
+  end
+  if dir == "up"
+      and Collision.isWarpDoor(Collision.behavior(Player.cellX, Player.cellY - 1)) then
+    return
+  end
+  local Audio = lazyReq("src.core.game3.audio")
+  if Audio.playSe then Audio.playSe(lazyReq("src.core.game3.se_ids").SE_WALL_HIT) end
+end
+
+-- pokefirered/src/field_player_avatar.c:878 PlayerOnBikeCollide
+-- pokefirered/src/field_player_avatar.c:884 PlayerNotOnBikeCollide
+local function playerCollide(dir)
+  playCollisionSoundIfNotFacingWarp(dir)
+  Player.startAction({
+    frames = Player.biking and WALK_FRAMES or WALK_IN_PLACE_SLOW_FRAMES,
+    walk = "normal",
+    interruptible = not Player.biking,
+  })
+end
+
+function Player.cancelAction()
+  if not Player.action then return end
+  Player.action = nil
+  Player.spriteYOffset = 0
+  Player.walkInPlace = false
+  Player.walkInPlaceFast = false
+end
+
+-- pokeemerald/src/field_player_avatar.c:353 TryInterruptObjectEventSpecialAnim
+-- pokefirered/src/field_player_avatar.c:156 TryInterruptObjectEventSpecialAnim
+local function tryInterruptAction(game, dir)
+  local a = Player.action
+  if not (a and a.interruptible and dir) then return false end
+  if dir ~= Player.facing then
+    Player.cancelAction()
+    return true
+  end
+  -- pokeemerald/src/field_player_avatar.c:372
+  local Profile = package.loaded["src.core.game3.profile"] or lazyReq("src.core.game3.profile")
+  if Profile.forSession(nil).id ~= "emerald" then return false end
+  local d = DELTA[dir]
+  local ok = Collision.canEnter(game, Player.cellX + d[1], Player.cellY + d[2], {
+    fromX = Player.cellX,
+    fromY = Player.cellY,
+    dir = dir,
+    surfing = Player.surfing or Player.underwater,
+    elevation = Player.currentElevation,
+  })
+  if ok then
+    Player.cancelAction()
+    return true
+  end
+  return false
+end
+
 function Player.tryMove(dir, game, run)
   if Player.moving or Player.boulderPush then return nil end
   if not DELTA[dir] then return nil end
 
+  -- pokeemerald/src/field_player_avatar.c:353 TryInterruptObjectEventSpecialAnim
+  if Player.turnTimer > 0 then return nil end
   local wasFacing = Player.facing
   if Player.facing ~= dir then
     Player.facing = dir
+    -- pokeemerald/src/field_player_avatar.c:593
     if Player.turnArmed then
-      Player.turnArmed = false
       Player.turnTimer = TURN_FRAMES
       return "turned"
     end
   end
-  if Player.turnTimer > 0 then return nil end
+  -- pokeemerald/src/field_player_avatar.c:595
+  Player.turnArmed = false
 
   local trig = stairTrigger(game, dir)
   if trig then return trig end
@@ -624,6 +697,8 @@ function Player.tryMove(dir, game, run)
         and Collision.tryConnection(game, Player.cellX, Player.cellY, dir, run) then
       return "connection"
     end
+    -- pokefirered/src/field_player_avatar.c:504
+    playerCollide(dir)
     return "blocked", why
   end
   local RG = package.loaded["src.core.game3.rotating_gate"]
@@ -888,6 +963,7 @@ function Player.startAction(opts)
     turnTo = opts.turnTo,
     walk = opts.walk,
     done = opts.done,
+    interruptible = opts.interruptible,
   }
   Player.acroAnim = opts.acroAnim
   if opts.walk then
@@ -1046,28 +1122,29 @@ local function finishStep(game)
   local Field = package.loaded["src.core.game3.field"]
     or lazyReq("src.core.game3.field")
 
-  if not onForcedTile then
-    -- Evaluate Overworld Step Events (Happiness, VS Seeker, Poison, Egg/Daycare, Repel)
-    local StepEvents = package.loaded["src.core.game3.step_events"]
-      or lazyReq("src.core.game3.step_events")
-    if StepEvents and StepEvents.onStepTaken then
-      StepEvents.onStepTaken(session, game)
-    end
-
-    -- Land-on-warp via owned warp table (mapDef.warps).
-    Collision.tryWarpAt(game, Player.cellX, Player.cellY, Player.facing)
-
-    -- Coord events (Oak leave-block, triggers) after landing on the cell.
-    if Field.tryCoordEvents then
-      Field.tryCoordEvents(game, Player.cellX, Player.cellY)
-    end
-  end
-
-  -- pokefirered/src/field_control_avatar.c:209
+  local stepConsumed = false
+  -- pokeemerald/src/field_control_avatar.c:147
   if not Field.locked then
     local okTs, TrainerSight = pcall(lazyReq, "src.core.game3.trainer_sight")
     if okTs and TrainerSight and TrainerSight.check then
-      TrainerSight.check(game)
+      stepConsumed = TrainerSight.check(game) == true
+    end
+  end
+
+  if not onForcedTile and not stepConsumed then
+    -- pokeemerald/src/field_control_avatar.c:485
+    if Field.tryCoordEvents then
+      stepConsumed = Field.tryCoordEvents(game, Player.cellX, Player.cellY) == true
+    end
+    -- pokeemerald/src/field_control_avatar.c:487
+    if not stepConsumed then
+      stepConsumed = Collision.tryWarpAt(game, Player.cellX, Player.cellY, Player.facing) == true
+    end
+    -- pokeemerald/src/field_control_avatar.c:491
+    local StepEvents = package.loaded["src.core.game3.step_events"]
+      or lazyReq("src.core.game3.step_events")
+    if not stepConsumed and StepEvents and StepEvents.onStepTaken then
+      stepConsumed = StepEvents.onStepTaken(session, game) == true
     end
   end
 
@@ -1080,7 +1157,8 @@ local function finishStep(game)
   local onGrass = Collision.isGrass and Collision.isGrass(Player.cellX, Player.cellY)
   local onWater = Player.surfing and (Collision.isWater and Collision.isWater(Player.cellX, Player.cellY))
   local okE, Encounters = pcall(lazyReq, "src.core.game3.encounters")
-  if okE and Encounters and Encounters.onStep and not onForcedTile then
+  -- pokeemerald/src/field_control_avatar.c:160
+  if okE and Encounters and Encounters.onStep and not onForcedTile and not stepConsumed then
     local Battle = package.loaded["src.core.game3.battle"]
     local busy = (Battle and Battle.isActive and Battle.isActive()) or Field.locked
     local Space = package.loaded["src.core.game3.scripting.space"]
@@ -1139,10 +1217,9 @@ function Player.tick(game)
       end
     end
     if Player.action then return tickAction() end
-    if Player.surfing and not Player.jumping then
-      local okFx, FieldEffects = pcall(lazyReq, "src.core.game3.field_effects")
-      local clock = (okFx and FieldEffects and FieldEffects._surfClock) or 0
-      Player.spriteYOffset = (math.floor(clock / 48) % 2 == 1) and -1 or 0
+    local bobY = (not Player.jumping) and surfBobY() or nil
+    if bobY then
+      Player.spriteYOffset = bobY
     elseif not Player.walkInPlace and not warp_owns_sprite() then
       Player.spriteYOffset = 0
     end
@@ -1161,7 +1238,7 @@ function Player.tick(game)
   if Player.jumping then
     Player.spriteYOffset = Player.jumpSpriteY()
   else
-    Player.spriteYOffset = 0
+    Player.spriteYOffset = surfBobY() or 0
   end
   -- pokefirered/src/data/object_events/object_event_anims.h:556
   if Player.spinning then
@@ -1171,6 +1248,8 @@ function Player.tick(game)
   end
   if Player.progress >= frames then
     finishStep(game)
+    local bobY = (not Player.moving) and surfBobY() or nil
+    if bobY then Player.spriteYOffset = bobY end
     return true
   end
   return false
@@ -1226,7 +1305,7 @@ function Player.update(game, input)
     if BikeRse then BikeRse.historyUpdate(input) end
   end
   if Player.moving then return end
-  if Player.action then return end
+  if Player.action and not tryInterruptAction(game, dirs_from_input(input)) then return end
   if Player.biking then
     local BikeRse = rseBike()
     -- pokeemerald/src/field_player_avatar.c:393 MovePlayerAvatarUsingKeypadInput
