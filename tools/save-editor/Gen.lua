@@ -306,23 +306,6 @@ function Gen.bindGame3Data(data)
     end
   end
 
-  -- What Game3:_exposeModData hands the mod loader besides the species module: the move
-  -- and item modules. Without them the loader's moves and items registries are empty
-  -- when a mod registers its species, so a modded species cannot resolve its learnset,
-  -- egg moves, TM list or evolution items (an empty move list in the editor).
-  local okMv, Moves = pcall(require, "src.core.game3.battle.moves")
-  if okMv and type(Moves) == "table" then
-    if not Moves._romLoaded and Moves.loadRomPack and okD and Dataset then
-      pcall(Moves.loadRomPack, Dataset.cache())
-    end
-    data.gen3Moves = data.gen3Moves or Moves
-  end
-  local okIt, ItemMod = pcall(require, "src.core.game3.items_data")
-  if okIt and type(ItemMod) == "table" then
-    if ItemMod.ensureLoaded then pcall(ItemMod.ensureLoaded) end
-    data.gen3Items = data.gen3Items or ItemMod
-  end
-
   local okI, ItemsData = pcall(require, "src.core.game3.items_data")
   if okI and ItemsData then
     data.items = data.items or {}
