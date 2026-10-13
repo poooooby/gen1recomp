@@ -43,7 +43,7 @@ Versions.ROM_SIZE = 16777216
 -- v115: LeafGreen profiles, edition-specific title assets and Deoxys stats.
 -- v121: chrome/fonts/japanese_{normal,small}_* and japanese_widths.lua, the
 --       cart's Japanese fonts, for text a Japanese translation mod prints.
-Versions.CACHE_VERSION = 134
+Versions.CACHE_VERSION = 138
 Versions.NATIVE_VERSION = 6
 Versions.OW_VERSION = 3
 Versions.ANIM_VERSION = 1
@@ -115,6 +115,10 @@ Versions.MON_ICON_PAL_INDICES = 0x3D3E80  -- gMonIconPaletteIndices
 Versions.MON_ICON_PALETTES = 0x3D3740     -- gMonIconPalettes (16 colors × N)
 Versions.MON_ICON_PAL_COUNT = 6
 Versions.MON_ICON_BYTES = 0x400           -- 32×64 4bpp (2 frames)
+-- pokefirered/src/decompress.c:108
+Versions.MON_PIC_DUPLICATE_DEOXYS = true
+-- pokefirered/src/pokemon_icon.c:1112
+Versions.MON_ICON_DEOXYS_OFFSET = 0x400
 Versions.MON_ICON_W = 32
 Versions.MON_ICON_H = 32                  -- first frame only
 -- sSpeciesToNationalPokedexNum[NUM_SPECIES-1]; SpeciesToNational uses [species-1].
@@ -250,7 +254,12 @@ Versions.STORAGE_SHEETS = {
   waveform = { off = 0x3CE810, size = 448 },
   scrollingBg = { off = 0x3CE438, lz = true },
   menu = { off = 0xE9C438, lz = true },
+  -- src/pokemon_storage_system_menu.c:659-660
+  chooseBoxCenter = { off = 0x3CDAB8, size = 2048 },
+  chooseBoxSides = { off = 0x3CE2B8, size = 384 },
 }
+-- src/roamer.c:36
+Versions.ROAMER_LOCATIONS = { off = 0x466C58, size = 182, stride = 7, mapGroup = 3 }
 Versions.STORAGE_TILEMAPS = {
   menu = { off = 0x3CE5FC, lz = true, w = 32, h = 20 },
   pkmnData = { off = 0x3CE6F8, w = 8, h = 4 },
@@ -388,8 +397,9 @@ Versions.MOVES_COUNT = 355 -- MOVE_NONE .. last Gen3 move id inclusive span
 
 -- Battle anim IR pack: ROM-native bytecode extraction (FireRed USA 1.0).
 -- Addresses verified by structural scan of the ROM.
-Versions.BATTLE_ANIMS_VERSION = 5
+Versions.BATTLE_ANIMS_VERSION = 6
 Versions.BATTLE_ANIMS = {
+  quiet_bgm_moves = 0x1C68EC,
   -- gBattleAnims_Moves: 355 GBA pointers to bytecode scripts (one per move id 0..354).
   moves_table   = 0x1C68F4,
   move_count    = 355,
@@ -1613,6 +1623,8 @@ Versions.BAG_LIST_TILES_H = 12
 Versions.BAG_LIST_BLANK_TILE = 0x02D             -- src/item_menu.c:1163
 Versions.RED_ARROW_PAL = 0x463308               -- sRedArrowPal (raw 32 bytes)
 Versions.RED_ARROW_OTHER_GFX = 0x463328         -- sRedArrowOtherGfx (LZ 4bpp 16x32)
+Versions.BAG_SELECT_BUTTON = 0x452F7C           -- src/item_menu.c:301 sBlit_SelectButton
+Versions.BAG_WINDOW_PAL = 0x453098              -- src/bag.c:11 sBagWindowPalF
 Versions.ITEM_PC_TILES = 0xE85090
 Versions.ITEM_PC_BG_PALS = 0xE85408
 Versions.ITEM_PC_TILEMAP = 0xE85458
